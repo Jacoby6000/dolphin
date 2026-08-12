@@ -23,6 +23,7 @@
 #include <unistd.h>
 #endif
 
+#include "../DWARF/DwarfTestFixture.h"
 #include "Common/CommonTypes.h"
 #include "Common/SymbolDB.h"
 #include "Core/Core.h"
@@ -37,7 +38,6 @@
 #include "Core/PowerPC/PPCSymbolDB.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
-#include "../DWARF/DwarfTestFixture.h"
 
 #ifndef _WIN32
 namespace
@@ -233,6 +233,114 @@ TEST_F(DapSessionTest, InitializeAdvertisesCapabilities)
   EXPECT_TRUE(caps.at("supportsExceptionInfoRequest").get<bool>());
   EXPECT_TRUE(caps.at("supportsLoadedSourcesRequest").get<bool>());
   EXPECT_TRUE(caps.at("supportsRestartRequest").get<bool>());
+  EXPECT_TRUE(caps.at("supportsDolphinMemoryRegions").get<bool>());
+  EXPECT_TRUE(caps.at("supportsDolphinMemoryScan").get<bool>());
+}
+
+TEST_F(DapSessionTest, MemoryRegionsReportsMem1)
+{
+  TestClient client(m_client_fd());
+  Handshake(client);
+
+  client.Send(R"({"seq":20,"type":"request","command":"dolphin_memoryRegions"})");
+  const auto response = client.Receive();
+  ASSERT_TRUE(response.has_value());
+  ASSERT_TRUE(response->at("success").get<bool>());
+  const auto& body = response->at("body").get<picojson::object>();
+  EXPECT_EQ(body.at("byteOrder").to_str(), "big");
+  EXPECT_EQ(body.at("pointerSize").get<double>(), 4.0);
+  const auto& regions = body.at("regions").get<picojson::array>();
+  ASSERT_FALSE(regions.empty());
+  const auto& mem1 = regions.front().get<picojson::object>();
+  EXPECT_EQ(mem1.at("id").to_str(), "mem1");
+  EXPECT_EQ(mem1.at("baseAddress").to_str(), "0x80000000");
+}
+
+TEST_F(DapSessionTest, MemoryScanCompletesByEventAndReturnsResults)
+{
+  TestClient client(m_client_fd());
+  Handshake(client);
+
+  client.Send(R"({
+    "seq":21,"type":"request","command":"dolphin_memoryScanStart",
+    "arguments":{
+      "regions":["mem1"],
+      "ranges":[{"start":"0x80004000","end":"0x80004004"}],
+      "dataType":"u32","filter":"exact","value":"3735928559",
+      "pauseDuringScan":true
+    }
+  })");
+  const auto accepted = client.Receive();
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_TRUE(accepted->at("success").get<bool>());
+  const auto& accepted_body = accepted->at("body").get<picojson::object>();
+  const int scan_id = static_cast<int>(accepted_body.at("scanId").get<double>());
+  EXPECT_TRUE(accepted_body.at("pauseDuringScan").get<bool>());
+
+  const auto completed = client.Receive();
+  ASSERT_TRUE(completed.has_value());
+  EXPECT_EQ(completed->at("event").to_str(), "dolphin_memoryScanCompleted");
+  const auto& completed_body = completed->at("body").get<picojson::object>();
+  EXPECT_EQ(static_cast<int>(completed_body.at("scanId").get<double>()), scan_id);
+  EXPECT_EQ(completed_body.at("generation").get<double>(), 1.0);
+  EXPECT_EQ(completed_body.at("resultCount").get<double>(), 1.0);
+
+  client.Send(fmt::format(
+      R"({{"seq":22,"type":"request","command":"dolphin_memoryScanResults",
+           "arguments":{{"scanId":{},"start":0,"count":10}}}})",
+      scan_id));
+  const auto results_response = client.Receive();
+  ASSERT_TRUE(results_response.has_value());
+  ASSERT_TRUE(results_response->at("success").get<bool>());
+  const auto& results_body = results_response->at("body").get<picojson::object>();
+  EXPECT_EQ(results_body.at("totalResults").get<double>(), 1.0);
+  const auto& results = results_body.at("results").get<picojson::array>();
+  ASSERT_EQ(results.size(), 1u);
+  const auto& result = results.front().get<picojson::object>();
+  EXPECT_EQ(result.at("address").to_str(), "0x80004000");
+  EXPECT_EQ(result.at("scannedValue").to_str(), "3735928559");
+  EXPECT_EQ(result.at("raw").to_str(), "3q2+7w==");
+}
+
+TEST_F(DapSessionTest, MemoryScanRefineNotifiesWithoutStatusPolling)
+{
+  TestClient client(m_client_fd());
+  Handshake(client);
+
+  client.Send(R"({
+    "seq":23,"type":"request","command":"dolphin_memoryScanStart",
+    "arguments":{
+      "ranges":[{"start":"0x80004000","end":"0x80004004"}],
+      "dataType":"u32","filter":"unknown","pauseDuringScan":true
+    }
+  })");
+  const auto accepted = client.Receive();
+  ASSERT_TRUE(accepted.has_value());
+  const int scan_id =
+      static_cast<int>(accepted->at("body").get<picojson::object>().at("scanId").get<double>());
+  const auto first_completed = client.Receive();
+  ASSERT_TRUE(first_completed.has_value());
+  EXPECT_EQ(first_completed->at("event").to_str(), "dolphin_memoryScanCompleted");
+
+  const std::array<u8, 4> changed{{0xde, 0xad, 0xbe, 0xee}};
+  Core::System::GetInstance().GetMemory().CopyToEmu(DATA_ADDRESS, changed.data(), changed.size());
+
+  client.Send(fmt::format(
+      R"({{"seq":24,"type":"request","command":"dolphin_memoryScanRefine",
+           "arguments":{{"scanId":{},"filter":"changed"}}}})",
+      scan_id));
+  const auto refine_accepted = client.Receive();
+  ASSERT_TRUE(refine_accepted.has_value());
+  EXPECT_TRUE(refine_accepted->at("success").get<bool>());
+  EXPECT_TRUE(
+      refine_accepted->at("body").get<picojson::object>().at("pauseDuringScan").get<bool>());
+
+  const auto refined = client.Receive();
+  ASSERT_TRUE(refined.has_value());
+  EXPECT_EQ(refined->at("event").to_str(), "dolphin_memoryScanCompleted");
+  const auto& body = refined->at("body").get<picojson::object>();
+  EXPECT_EQ(body.at("generation").get<double>(), 2.0);
+  EXPECT_EQ(body.at("resultCount").get<double>(), 1.0);
 }
 
 TEST_F(DapSessionTest, SetBreakpointsResolvesAgainstSourceBase)
@@ -433,8 +541,7 @@ TEST_F(DapSessionTest, FreezeAndUnfreezeRemovesMemcheck)
   const auto freeze = client.Receive();
   ASSERT_TRUE(freeze.has_value());
   ASSERT_TRUE(freeze->at("success").get<bool>());
-  const double watch_id =
-      freeze->at("body").get<picojson::object>().at("watchId").get<double>();
+  const double watch_id = freeze->at("body").get<picojson::object>().at("watchId").get<double>();
   EXPECT_GT(watch_id, 0.0);
   // Freeze memcheck is installed.
   EXPECT_TRUE(Core::System::GetInstance().GetPowerPC().GetMemChecks().HasAny());
@@ -478,8 +585,7 @@ TEST_F(DapSessionTest, CancelFrozenWatchRemovesFreezeMemcheck)
   const auto freeze = client.Receive();
   ASSERT_TRUE(freeze.has_value());
   ASSERT_TRUE(freeze->at("success").get<bool>());
-  const double watch_id =
-      freeze->at("body").get<picojson::object>().at("watchId").get<double>();
+  const double watch_id = freeze->at("body").get<picojson::object>().at("watchId").get<double>();
   EXPECT_TRUE(Core::System::GetInstance().GetPowerPC().GetMemChecks().HasAny());
 
   // Cancel the frozen watch — should remove the freeze memcheck.
@@ -521,8 +627,7 @@ TEST_F(DapSessionTest, ReFreezeSameWatchDoesNotLeakMemcheck)
   const auto freeze1 = client.Receive();
   ASSERT_TRUE(freeze1.has_value());
   ASSERT_TRUE(freeze1->at("success").get<bool>());
-  const double watch_id =
-      freeze1->at("body").get<picojson::object>().at("watchId").get<double>();
+  const double watch_id = freeze1->at("body").get<picojson::object>().at("watchId").get<double>();
 
   // Re-freeze with a different value — should not leak the old memcheck.
   client.Send(std::string(R"({
@@ -602,8 +707,7 @@ TEST_F(DapSessionTest, SetDataBreakpointsClearsFreezeAndSampler)
             nullptr);
 
   // Unfreeze should still succeed (idempotent — sampler was already unfrozen).
-  const double watch_id =
-      freeze->at("body").get<picojson::object>().at("watchId").get<double>();
+  const double watch_id = freeze->at("body").get<picojson::object>().at("watchId").get<double>();
   client.Send(std::string(R"({
     "seq": 5,
     "type": "request",
@@ -1221,10 +1325,9 @@ TEST_F(DapSessionTest, LoadedSourcesReturnsDwarfFileAfterImport)
 {
   {
     Core::CPUThreadGuard guard(Core::System::GetInstance());
-    ASSERT_TRUE(Core::Debug::ImportDwarf(guard,
-                                        Core::System::GetInstance().GetPowerPC().GetSymbolDB(),
-                                        DwarfTestFixture::kDebugSection,
-                                        DwarfTestFixture::kLineSection));
+    ASSERT_TRUE(
+        Core::Debug::ImportDwarf(guard, Core::System::GetInstance().GetPowerPC().GetSymbolDB(),
+                                 DwarfTestFixture::kDebugSection, DwarfTestFixture::kLineSection));
   }
 
   TestClient client(m_client_fd());
@@ -1257,10 +1360,9 @@ TEST_F(DapSessionTest, BreakpointLocationsWithDwarfSourceReference)
 {
   {
     Core::CPUThreadGuard guard(Core::System::GetInstance());
-    ASSERT_TRUE(Core::Debug::ImportDwarf(guard,
-                                        Core::System::GetInstance().GetPowerPC().GetSymbolDB(),
-                                        DwarfTestFixture::kDebugSection,
-                                        DwarfTestFixture::kLineSection));
+    ASSERT_TRUE(
+        Core::Debug::ImportDwarf(guard, Core::System::GetInstance().GetPowerPC().GetSymbolDB(),
+                                 DwarfTestFixture::kDebugSection, DwarfTestFixture::kLineSection));
   }
 
   TestClient client(m_client_fd());
@@ -1297,10 +1399,9 @@ TEST_F(DapSessionTest, SetBreakpointsWithDwarfSourceReference)
 {
   {
     Core::CPUThreadGuard guard(Core::System::GetInstance());
-    ASSERT_TRUE(Core::Debug::ImportDwarf(guard,
-                                        Core::System::GetInstance().GetPowerPC().GetSymbolDB(),
-                                        DwarfTestFixture::kDebugSection,
-                                        DwarfTestFixture::kLineSection));
+    ASSERT_TRUE(
+        Core::Debug::ImportDwarf(guard, Core::System::GetInstance().GetPowerPC().GetSymbolDB(),
+                                 DwarfTestFixture::kDebugSection, DwarfTestFixture::kLineSection));
   }
 
   TestClient client(m_client_fd());
@@ -1338,10 +1439,9 @@ TEST_F(DapSessionTest, StackTraceWithDwarfSourceLine)
 {
   {
     Core::CPUThreadGuard guard(Core::System::GetInstance());
-    ASSERT_TRUE(Core::Debug::ImportDwarf(guard,
-                                        Core::System::GetInstance().GetPowerPC().GetSymbolDB(),
-                                        DwarfTestFixture::kDebugSection,
-                                        DwarfTestFixture::kLineSection));
+    ASSERT_TRUE(
+        Core::Debug::ImportDwarf(guard, Core::System::GetInstance().GetPowerPC().GetSymbolDB(),
+                                 DwarfTestFixture::kDebugSection, DwarfTestFixture::kLineSection));
     Core::System::GetInstance().GetPPCState().pc = DwarfTestFixture::kLineTwoAddress;
     LR(Core::System::GetInstance().GetPPCState()) = 0;
   }
@@ -1785,8 +1885,7 @@ TEST_F(DapSessionTest, InjectCodeAtExplicitAddressWritesBytes)
   const auto read_resp = client.Receive();
   ASSERT_TRUE(read_resp.has_value());
   ASSERT_TRUE(read_resp->at("success").get<bool>());
-  const std::string data_str =
-      read_resp->at("body").get<picojson::object>().at("data").to_str();
+  const std::string data_str = read_resp->at("body").get<picojson::object>().at("data").to_str();
   EXPECT_EQ(data_str, "AAAAAQ==");
 
   client.Send(R"({
@@ -1856,8 +1955,7 @@ TEST_F(DapSessionTest, DetourPatchesTargetAndReturnsAddresses)
   })");
   const auto resp = client.Receive();
   ASSERT_TRUE(resp.has_value());
-  ASSERT_TRUE(resp->at("success").get<bool>())
-      << resp->at("message").to_str();
+  ASSERT_TRUE(resp->at("success").get<bool>()) << resp->at("message").to_str();
   const auto& body = resp->at("body").get<picojson::object>();
   EXPECT_EQ(body.at("targetAddress").to_str(), "0x00008000");
   EXPECT_EQ(body.at("detourAddress").to_str(), "0x0000c000");
@@ -1909,8 +2007,7 @@ TEST_F(DapSessionTest, FindFreeMemoryReturnsCanonicalAlignedAddress)
   })");
   const auto resp = client.Receive();
   ASSERT_TRUE(resp.has_value());
-  ASSERT_TRUE(resp->at("success").get<bool>())
-      << resp->at("message").to_str();
+  ASSERT_TRUE(resp->at("success").get<bool>()) << resp->at("message").to_str();
   const auto& body = resp->at("body").get<picojson::object>();
   // Parse the returned hex string and verify it's canonical + aligned.
   const std::string addr_str = body.at("address").to_str();

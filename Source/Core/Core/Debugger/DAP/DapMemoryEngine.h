@@ -1,0 +1,254 @@
+// Copyright 2026 Dolphin Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <atomic>
+#include <cstddef>
+#include <expected>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "Common/CommonTypes.h"
+
+namespace Core
+{
+class System;
+}
+
+namespace DAP
+{
+enum class MemoryScanDataType
+{
+  U8,
+  U16,
+  U32,
+  U64,
+  S8,
+  S16,
+  S32,
+  S64,
+  F32,
+  F64,
+};
+
+enum class MemoryScanFilter
+{
+  Exact,
+  NotEqual,
+  Between,
+  GreaterThan,
+  GreaterOrEqual,
+  LessThan,
+  LessOrEqual,
+  Unknown,
+  Changed,
+  Unchanged,
+  Increased,
+  Decreased,
+  IncreasedBy,
+  DecreasedBy,
+};
+
+struct MemoryScanRange
+{
+  u32 start = 0;
+  u32 end = 0;  // Exclusive.
+};
+
+struct MemoryScanStartConfig
+{
+  std::vector<std::string> regions;
+  std::vector<MemoryScanRange> ranges;
+  MemoryScanDataType data_type = MemoryScanDataType::U8;
+  MemoryScanFilter filter = MemoryScanFilter::Unknown;
+  std::optional<std::string> value;
+  std::optional<std::string> value2;
+  bool aligned = true;
+  bool pause_during_scan = false;
+};
+
+struct MemoryScanRefineConfig
+{
+  int scan_id = 0;
+  MemoryScanFilter filter = MemoryScanFilter::Changed;
+  std::optional<std::string> value;
+  std::optional<std::string> value2;
+  std::optional<bool> pause_during_scan;
+};
+
+struct MemoryRegionInfo
+{
+  std::string id;
+  std::string name;
+  u32 base_address = 0;
+  u32 size = 0;
+};
+
+struct MemoryScanJobAccepted
+{
+  int scan_id = 0;
+  int job_id = 0;
+  bool pause_during_scan = false;
+};
+
+struct MemoryScanStatus
+{
+  int scan_id = 0;
+  int job_id = 0;
+  u64 generation = 0;
+  std::string state;
+  std::string phase;
+  bool pause_during_scan = false;
+  bool emulation_paused = false;
+  u64 result_count = 0;
+};
+
+struct MemoryScanResult
+{
+  u32 address = 0;
+  std::string scanned_value;
+  std::vector<u8> raw;
+};
+
+struct MemoryScanResultPage
+{
+  int scan_id = 0;
+  u64 generation = 0;
+  u64 total_results = 0;
+  u64 start = 0;
+  std::vector<MemoryScanResult> results;
+};
+
+struct MemoryScanTerminalEvent
+{
+  std::string event;
+  int scan_id = 0;
+  int job_id = 0;
+  u64 generation = 0;
+  u64 result_count = 0;
+  u64 duration_ms = 0;
+  bool pause_during_scan = false;
+  std::string message;
+};
+
+class DapMemoryEngine
+{
+public:
+  using TerminalCallback = std::function<void(MemoryScanTerminalEvent)>;
+
+  DapMemoryEngine(Core::System& system, TerminalCallback terminal_callback);
+  ~DapMemoryEngine();
+
+  DapMemoryEngine(const DapMemoryEngine&) = delete;
+  DapMemoryEngine& operator=(const DapMemoryEngine&) = delete;
+
+  std::vector<MemoryRegionInfo> GetMemoryRegions() const;
+
+  std::expected<MemoryScanJobAccepted, std::string> StartScan(const MemoryScanStartConfig& config);
+  std::expected<MemoryScanJobAccepted, std::string>
+  RefineScan(const MemoryScanRefineConfig& config);
+  std::optional<MemoryScanStatus> GetStatus(int scan_id) const;
+  std::expected<MemoryScanResultPage, std::string> GetResults(int scan_id, u64 start,
+                                                              u32 count) const;
+  bool Cancel(int scan_id);
+  bool Dispose(int scan_id);
+
+  bool HasActiveJob() const;
+  static std::unique_lock<std::mutex> TryLockCoreScan();
+
+private:
+  struct SnapshotRange
+  {
+    u32 start = 0;
+    std::vector<u8> bytes;
+    u64 first_candidate = 0;
+    u64 candidate_count = 0;
+    u32 candidate_offset = 0;
+  };
+
+  struct Generation
+  {
+    u64 number = 0;
+    std::vector<SnapshotRange> ranges;
+    std::vector<u8> candidates;
+    u64 result_count = 0;
+  };
+
+  struct Scan
+  {
+    int id = 0;
+    MemoryScanStartConfig config;
+    mutable std::mutex mutex;
+    int current_job_id = 0;
+    std::string state = "created";
+    std::string phase = "waiting";
+    bool job_pause_during_scan = false;
+    bool emulation_paused = false;
+    bool disposed = false;
+    std::shared_ptr<const Generation> generation;
+  };
+
+  struct ResolvedRange
+  {
+    u32 start = 0;
+    u32 size = 0;
+    std::string region_id;
+  };
+
+  using NumericValue = std::variant<u8, u16, u32, u64, s8, s16, s32, s64, float, double>;
+
+  std::expected<std::vector<ResolvedRange>, std::string>
+  ResolveRanges(const MemoryScanStartConfig& config) const;
+  std::expected<std::vector<SnapshotRange>, std::string>
+  CaptureSnapshot(const std::vector<ResolvedRange>& ranges, std::atomic<bool>& cancelled) const;
+  std::expected<std::shared_ptr<Generation>, std::string>
+  BuildGeneration(const Scan& scan, std::vector<SnapshotRange> snapshot,
+                  const std::shared_ptr<const Generation>& previous, MemoryScanFilter filter,
+                  const std::optional<std::string>& value, const std::optional<std::string>& value2,
+                  std::atomic<bool>& cancelled) const;
+
+  void StartWorker(std::shared_ptr<Scan> scan, int job_id, MemoryScanFilter filter,
+                   std::optional<std::string> value, std::optional<std::string> value2,
+                   bool pause_during_scan, std::shared_ptr<const Generation> previous);
+  void RunWorker(std::shared_ptr<Scan> scan, int job_id, MemoryScanFilter filter,
+                 std::optional<std::string> value, std::optional<std::string> value2,
+                 bool pause_during_scan, std::shared_ptr<const Generation> previous);
+  void FinishWorker(const std::shared_ptr<Scan>& scan, int job_id,
+                     MemoryScanTerminalEvent terminal);
+  void ReapWorker();
+  u64 CalculateRetainedBytesLocked() const;
+  u64 CalculateGenerationBytes(const MemoryScanStartConfig& config,
+                               const std::vector<ResolvedRange>& ranges) const;
+
+  static u32 DataTypeSize(MemoryScanDataType data_type);
+  static std::optional<NumericValue> ParseValue(MemoryScanDataType data_type,
+                                                std::string_view value);
+  static std::optional<std::string> ValidateFilter(MemoryScanDataType data_type,
+                                                   MemoryScanFilter filter,
+                                                   const std::optional<std::string>& value,
+                                                   const std::optional<std::string>& value2,
+                                                   bool has_previous);
+  static std::string FormatValue(MemoryScanDataType data_type, const u8* bytes);
+
+  Core::System& m_system;
+  TerminalCallback m_terminal_callback;
+  mutable std::mutex m_mutex;
+  std::map<int, std::shared_ptr<Scan>> m_scans;
+  std::thread m_worker;
+  std::atomic<bool> m_cancelled{false};
+  bool m_job_active = false;
+  int m_active_scan_id = 0;
+  int m_next_scan_id = 1;
+  int m_next_job_id = 1;
+};
+}  // namespace DAP

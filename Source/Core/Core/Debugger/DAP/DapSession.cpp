@@ -33,6 +33,7 @@
 #include "Core/Core.h"
 #include "Core/Debugger/DAP/DapDebugController.h"
 #include "Core/Debugger/DAP/DapJson.h"
+#include "Core/Debugger/DAP/DapMemoryEngine.h"
 #include "Core/Debugger/DAP/DapProtocol.h"
 #include "Core/Debugger/DAP/DapRealtimeWatch.h"
 #include "Core/Debugger/DAP/DapTransport.h"
@@ -80,8 +81,7 @@ const picojson::object* GetObject(const picojson::object& obj, const std::string
   return &it->second.get<picojson::object>();
 }
 
-std::optional<std::string> ReadSourceString(const picojson::object& source,
-                                            const std::string& key)
+std::optional<std::string> ReadSourceString(const picojson::object& source, const std::string& key)
 {
   if (const std::optional<std::string> value = ReadStringFromJson(source, key))
   {
@@ -243,8 +243,7 @@ public:
     auto self = shared_from_this();
     m_watch_sampler = std::make_unique<RealtimeWatchSampler>(
         m_system,
-        [weak = std::weak_ptr<Session>(self)](
-            const std::vector<RealtimeWatchChange>& changes) {
+        [weak = std::weak_ptr<Session>(self)](const std::vector<RealtimeWatchChange>& changes) {
           if (auto sp = weak.lock())
           {
             for (const RealtimeWatchChange& change : changes)
@@ -256,6 +255,23 @@ public:
               body.emplace("data", Json::Base64Encode(change.bytes));
               sp->QueueEvent("dolphin_memoryChanged", std::move(body));
             }
+          }
+        });
+
+    m_memory_engine = std::make_unique<DapMemoryEngine>(
+        m_system, [weak = std::weak_ptr<Session>(self)](MemoryScanTerminalEvent terminal) {
+          if (auto sp = weak.lock())
+          {
+            picojson::object body;
+            body.emplace("scanId", static_cast<double>(terminal.scan_id));
+            body.emplace("jobId", static_cast<double>(terminal.job_id));
+            body.emplace("generation", static_cast<double>(terminal.generation));
+            body.emplace("resultCount", static_cast<double>(terminal.result_count));
+            body.emplace("durationMilliseconds", static_cast<double>(terminal.duration_ms));
+            body.emplace("pauseDuringScan", terminal.pause_during_scan);
+            if (!terminal.message.empty())
+              body.emplace("message", std::move(terminal.message));
+            sp->QueueEvent(terminal.event, std::move(body));
           }
         });
 
@@ -278,6 +294,14 @@ public:
       HandleMessage(*message);
     }
 
+    // Stop and join the scan worker before tearing down the event queue. The
+    // peer has gone away, so suppress the terminal cancellation event.
+    {
+      std::lock_guard lock(m_event_mutex);
+      m_accept_events = false;
+      m_pending_events.clear();
+    }
+    m_memory_engine.reset();
     // Tear down the sampler before the rest of the Session so its
     // vi_end_field_event hook is unregistered (no further Tick() will fire)
     // before the transport/event-queue members are destroyed.
@@ -329,27 +353,28 @@ public:
       for (const auto& [watch_id, freeze_id] : m_watch_to_freeze)
         m_controller.RemoveFreeze(freeze_id);
     }
-    FlushEvents();
   }
 
 private:
   void QueueEvent(std::string_view event, picojson::object body)
   {
     std::lock_guard lock(m_event_mutex);
-    m_pending_events.push_back(
-        Protocol::Serialize(Protocol::MakeEvent(m_next_seq++, event, std::move(body))));
+    if (!m_accept_events)
+      return;
+    m_pending_events.emplace_back(std::string(event), std::move(body));
   }
 
   void FlushEvents()
   {
-    std::vector<std::string> events;
+    std::vector<std::pair<std::string, picojson::object>> events;
     {
       std::lock_guard lock(m_event_mutex);
       events.swap(m_pending_events);
     }
 
-    for (const std::string& event : events)
-      m_transport.WriteMessage(event);
+    for (auto& [event, body] : events)
+      m_transport.WriteMessage(
+          Protocol::Serialize(Protocol::MakeEvent(m_next_seq++, event, std::move(body))));
   }
 
   void SendStoppedEvent(std::string_view reason)
@@ -594,6 +619,15 @@ private:
 
   void PollBreakpointStop()
   {
+    auto core_scan_lock = DapMemoryEngine::TryLockCoreScan();
+    if (!core_scan_lock.owns_lock())
+    {
+      // CPUThreadGuard temporarily puts the CPU in stepping state while a scan
+      // snapshot is captured (and for the whole job with pauseDuringScan).
+      // That is not a debugger-visible stop.
+      FlushEvents();
+      return;
+    }
     // Async step-out completion: the worker signals via m_step_out_done once
     // DapDebugController::StepOut has returned. Join and emit the appropriate
     // stopped event here, on the session thread, so the client still sees it
@@ -727,6 +761,8 @@ private:
     capabilities.emplace("supportsDolphinFindFreeMemory", true);
     capabilities.emplace("supportsDolphinInjectCode", true);
     capabilities.emplace("supportsDolphinDetour", true);
+    capabilities.emplace("supportsDolphinMemoryRegions", true);
+    capabilities.emplace("supportsDolphinMemoryScan", true);
 
     picojson::object server_info;
     server_info.emplace("name", std::string("Dolphin DAP"));
@@ -757,6 +793,20 @@ private:
     {
       m_running = false;
       Respond(request->seq, command, picojson::object{});
+      return;
+    }
+
+    // A full-pause scan worker owns CPUThreadGuard through filtering and commit.
+    // Reject operations that could acquire the same core lock so the session
+    // remains able to receive cancellation and disconnect requests.
+    const bool scan_safe_command =
+        command == "dolphin_memoryRegions" || command == "dolphin_memoryScanStatus" ||
+        command == "dolphin_memoryScanResults" || command == "dolphin_memoryScanCancel" ||
+        command == "dolphin_memoryScanDispose";
+    auto core_scan_lock = DapMemoryEngine::TryLockCoreScan();
+    if (!scan_safe_command && !core_scan_lock.owns_lock())
+    {
+      RespondError(request->seq, command, "memory scan pause is active");
       return;
     }
 
@@ -1180,8 +1230,200 @@ private:
       return;
     }
 
+    if (command == "dolphin_memoryRegions")
+    {
+      HandleMemoryRegions(*request);
+      return;
+    }
+
+    if (command == "dolphin_memoryScanStart")
+    {
+      HandleMemoryScanStart(*request);
+      return;
+    }
+
+    if (command == "dolphin_memoryScanRefine")
+    {
+      HandleMemoryScanRefine(*request);
+      return;
+    }
+
+    if (command == "dolphin_memoryScanStatus")
+    {
+      HandleMemoryScanStatus(*request);
+      return;
+    }
+
+    if (command == "dolphin_memoryScanResults")
+    {
+      HandleMemoryScanResults(*request);
+      return;
+    }
+
+    if (command == "dolphin_memoryScanCancel")
+    {
+      HandleMemoryScanCancel(*request);
+      return;
+    }
+
+    if (command == "dolphin_memoryScanDispose")
+    {
+      HandleMemoryScanDispose(*request);
+      return;
+    }
+
     WARN_LOG_FMT(CONSOLE, "DAP: unhandled command {}", command);
     RespondError(request->seq, command, "unsupported");
+  }
+
+  void HandleMemoryRegions(const Protocol::Request& request)
+  {
+    picojson::array regions;
+    for (const MemoryRegionInfo& region : m_memory_engine->GetMemoryRegions())
+    {
+      picojson::object entry;
+      entry.emplace("id", region.id);
+      entry.emplace("name", region.name);
+      entry.emplace("baseAddress", Json::FormatAddress(region.base_address));
+      entry.emplace("size", static_cast<double>(region.size));
+      entry.emplace("readable", true);
+      entry.emplace("writable", true);
+      entry.emplace("scannable", true);
+      regions.emplace_back(std::move(entry));
+    }
+    picojson::object body;
+    body.emplace("platform", std::string(m_system.IsWii() ? "wii" : "gamecube"));
+    body.emplace("pointerSize", 4.0);
+    body.emplace("byteOrder", std::string("big"));
+    body.emplace("regions", std::move(regions));
+    Respond(request.seq, request.command, std::move(body));
+  }
+
+  void HandleMemoryScanStart(const Protocol::Request& request)
+  {
+    const std::optional<MemoryScanStartConfig> arguments =
+        Protocol::ParseMemoryScanStart(request.arguments);
+    if (!arguments)
+    {
+      RespondError(request.seq, request.command, "invalid memory scan arguments");
+      return;
+    }
+    const auto accepted = m_memory_engine->StartScan(*arguments);
+    if (!accepted)
+    {
+      RespondError(request.seq, request.command, accepted.error());
+      return;
+    }
+    picojson::object body;
+    body.emplace("scanId", static_cast<double>(accepted->scan_id));
+    body.emplace("jobId", static_cast<double>(accepted->job_id));
+    body.emplace("state", std::string("running"));
+    body.emplace("pauseDuringScan", accepted->pause_during_scan);
+    Respond(request.seq, request.command, std::move(body));
+  }
+
+  void HandleMemoryScanRefine(const Protocol::Request& request)
+  {
+    const std::optional<MemoryScanRefineConfig> arguments =
+        Protocol::ParseMemoryScanRefine(request.arguments);
+    if (!arguments)
+    {
+      RespondError(request.seq, request.command, "invalid memory scan refinement arguments");
+      return;
+    }
+    const auto accepted = m_memory_engine->RefineScan(*arguments);
+    if (!accepted)
+    {
+      RespondError(request.seq, request.command, accepted.error());
+      return;
+    }
+    picojson::object body;
+    body.emplace("scanId", static_cast<double>(accepted->scan_id));
+    body.emplace("jobId", static_cast<double>(accepted->job_id));
+    body.emplace("state", std::string("running"));
+    body.emplace("pauseDuringScan", accepted->pause_during_scan);
+    Respond(request.seq, request.command, std::move(body));
+  }
+
+  void HandleMemoryScanStatus(const Protocol::Request& request)
+  {
+    const auto arguments = Protocol::ParseMemoryScanStatus(request.arguments);
+    if (!arguments)
+    {
+      RespondError(request.seq, request.command, "invalid memory scan status arguments");
+      return;
+    }
+    const std::optional<MemoryScanStatus> status = m_memory_engine->GetStatus(arguments->scan_id);
+    if (!status)
+    {
+      RespondError(request.seq, request.command, "no such memory scan");
+      return;
+    }
+    picojson::object body;
+    body.emplace("scanId", static_cast<double>(status->scan_id));
+    body.emplace("jobId", static_cast<double>(status->job_id));
+    body.emplace("generation", static_cast<double>(status->generation));
+    body.emplace("state", status->state);
+    body.emplace("phase", status->phase);
+    body.emplace("pauseDuringScan", status->pause_during_scan);
+    body.emplace("emulationPaused", status->emulation_paused);
+    body.emplace("resultCount", static_cast<double>(status->result_count));
+    Respond(request.seq, request.command, std::move(body));
+  }
+
+  void HandleMemoryScanResults(const Protocol::Request& request)
+  {
+    const auto arguments = Protocol::ParseMemoryScanResults(request.arguments);
+    if (!arguments)
+    {
+      RespondError(request.seq, request.command, "invalid memory scan result arguments");
+      return;
+    }
+    const auto page =
+        m_memory_engine->GetResults(arguments->scan_id, arguments->start, arguments->count);
+    if (!page)
+    {
+      RespondError(request.seq, request.command, page.error());
+      return;
+    }
+    picojson::array results;
+    for (const MemoryScanResult& result : page->results)
+    {
+      picojson::object entry;
+      entry.emplace("address", Json::FormatAddress(result.address));
+      entry.emplace("scannedValue", result.scanned_value);
+      entry.emplace("raw", Json::Base64Encode(result.raw));
+      results.emplace_back(std::move(entry));
+    }
+    picojson::object body;
+    body.emplace("scanId", static_cast<double>(page->scan_id));
+    body.emplace("generation", static_cast<double>(page->generation));
+    body.emplace("totalResults", static_cast<double>(page->total_results));
+    body.emplace("start", static_cast<double>(page->start));
+    body.emplace("results", std::move(results));
+    Respond(request.seq, request.command, std::move(body));
+  }
+
+  void HandleMemoryScanCancel(const Protocol::Request& request)
+  {
+    const auto arguments = Protocol::ParseMemoryScanStatus(request.arguments);
+    if (!arguments || !m_memory_engine->Cancel(arguments->scan_id))
+    {
+      RespondError(request.seq, request.command, "no active job for that memory scan");
+      return;
+    }
+    Respond(request.seq, request.command, picojson::object{});
+  }
+
+  void HandleMemoryScanDispose(const Protocol::Request& request)
+  {
+    const auto arguments = Protocol::ParseMemoryScanStatus(request.arguments);
+    if (!arguments || !m_memory_engine->Dispose(arguments->scan_id))
+    {
+      RespondError(request.seq, request.command, "no such memory scan");
+      return;
+    }
+    Respond(request.seq, request.command, picojson::object{});
   }
 
   void HandleSetBreakpoints(const Protocol::Request& request)
@@ -1217,7 +1459,8 @@ private:
 
     if (specs.empty())
     {
-      const Protocol::SetBreakpointsArguments legacy = Protocol::ParseSetBreakpoints(request.arguments);
+      const Protocol::SetBreakpointsArguments legacy =
+          Protocol::ParseSetBreakpoints(request.arguments);
       if (legacy.base)
       {
         SourceBreakpointSpec spec;
@@ -1712,8 +1955,8 @@ private:
     }
     // `instructionOffset` is a signed instruction-word count; fold it in s64
     // so a negative offset (backwards disassembly) can't wrap past 0.
-    const s64 effective = static_cast<s64>(*base) +
-                          static_cast<s64>(arguments->instruction_offset) * 4;
+    const s64 effective =
+        static_cast<s64>(*base) + static_cast<s64>(arguments->instruction_offset) * 4;
     if (effective < 0 || effective > static_cast<s64>(std::numeric_limits<u32>::max()))
     {
       RespondError(request.seq, "disassemble", "instruction offset out of range");
@@ -1850,8 +2093,7 @@ private:
       watch_id = *arguments->watch_id;
       if (!m_watch_sampler->Freeze(watch_id, arguments->value))
       {
-        RespondError(request.seq, "dolphin_freeze",
-                     "no such watch_id or value size mismatch");
+        RespondError(request.seq, "dolphin_freeze", "no such watch_id or value size mismatch");
         return;
       }
       // Get the subscription's address/count to install the MMU memcheck.
@@ -1905,8 +2147,7 @@ private:
     // the freeze memcheck). Bugbot-safe: Freeze already wrote the canon
     // to RAM (in RealtimeWatchSampler::Freeze), and InstallFreeze writes
     // it again via HostWrite — double-write is harmless.
-    const u32 freeze_id =
-        m_controller.InstallFreeze(address, count, arguments->value);
+    const u32 freeze_id = m_controller.InstallFreeze(address, count, arguments->value);
     if (freeze_id == 0)
     {
       // MMU memcheck install failed — roll back the sampler freeze so
@@ -2141,12 +2382,13 @@ private:
   Core::System& m_system;
   Common::EventHook m_state_hook;
   std::unique_ptr<RealtimeWatchSampler> m_watch_sampler;
+  std::unique_ptr<DapMemoryEngine> m_memory_engine;
   // DESNOTE(jbarber, 2026-07-22): Maps watch_id → freeze_id returned by
   // DapDebugController::InstallFreeze, so HandleUnfreeze can call
   // RemoveFreeze to tear down the MMU-level `is_freeze` memcheck that
   // suppresses CPU writes to the frozen range.
   std::map<int, u32> m_watch_to_freeze;
-   std::atomic<bool> m_running{true};
+  std::atomic<bool> m_running{true};
   // DESNOTE(jbarber, 2026-07-22): Set just before this session calls
   // m_controller.Continue(); the state hook consumes it via exchange so
   // only the initiating session emits `continued`. Without this gate, every
@@ -2201,7 +2443,8 @@ private:
   std::optional<StopInfo> m_pending_stop_info;
 
   std::mutex m_event_mutex;
-  std::vector<std::string> m_pending_events;
+  std::vector<std::pair<std::string, picojson::object>> m_pending_events;
+  bool m_accept_events = true;
 
   // DESNOTE(jbarber, 2026-07-21): DAP `hitBreakpointIds` in a stopped event
   // must echo the stable `id` the client received in its

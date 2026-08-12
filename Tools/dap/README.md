@@ -70,6 +70,13 @@ Each operation below links to its detailed reference section in
 | [`dolphin_findFreeMemory`](capabilities.md#dolphin_findfreememory) | Locate the smallest 4-byte-aligned zero-run ≥ `count` bytes in MEM1. |
 | [`dolphin_injectCode`](capabilities.md#dolphin_injectcode) | Write raw PPC machine code (base64) at an explicit or server-allocated address. iCache + JIT invalidated. |
 | [`dolphin_detour`](capabilities.md#dolphin_detour) | Install a transparent detour at a 4-byte instruction target: detour body + trampoline that replays the original instruction. |
+| [`dolphin_memoryRegions`](capabilities.md#dolphin_memoryregions) | Enumerate scannable MEM1/MEM2/ARAM regions and target metadata. |
+| [`dolphin_memoryScanStart`](capabilities.md#dolphin_memoryscanstart) | Start an asynchronous typed numeric memory scan from a consistent snapshot. |
+| [`dolphin_memoryScanRefine`](capabilities.md#dolphin_memoryscanrefine) | Refine a completed scan against a new value or its previous snapshot. |
+| [`dolphin_memoryScanStatus`](capabilities.md#dolphin_memoryscanstatus) | Query scan/job state for diagnostics or recovery; normal clients rely on terminal events. |
+| [`dolphin_memoryScanResults`](capabilities.md#dolphin_memoryscanresults) | Read a paginated committed result generation. |
+| [`dolphin_memoryScanCancel`](capabilities.md#dolphin_memoryscancancel) | Request cancellation of a running scan job. |
+| [`dolphin_memoryScanDispose`](capabilities.md#dolphin_memoryscandispose) | Release a scan and its snapshots/results. |
 
 ## Running the server
 

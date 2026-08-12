@@ -36,6 +36,13 @@ the server for responses/events.
   - [`dolphin_findFreeMemory`](#dolphin_findfreememory)
   - [`dolphin_injectCode`](#dolphin_injectcode)
   - [`dolphin_detour`](#dolphin_detour)
+  - [`dolphin_memoryRegions`](#dolphin_memoryregions)
+  - [`dolphin_memoryScanStart`](#dolphin_memoryscanstart)
+  - [`dolphin_memoryScanRefine`](#dolphin_memoryscanrefine)
+  - [`dolphin_memoryScanStatus`](#dolphin_memoryscanstatus)
+  - [`dolphin_memoryScanResults`](#dolphin_memoryscanresults)
+  - [`dolphin_memoryScanCancel`](#dolphin_memoryscancancel)
+  - [`dolphin_memoryScanDispose`](#dolphin_memoryscandispose)
 
 # Standard requests
 
@@ -69,7 +76,9 @@ Dolphin-specific extensions it supports.
    "supportsDolphinFreeze": true,
    "supportsDolphinFindFreeMemory": true,
    "supportsDolphinInjectCode": true,
-   "supportsDolphinDetour": true
+   "supportsDolphinDetour": true,
+   "supportsDolphinMemoryRegions": true,
+   "supportsDolphinMemoryScan": true
   }}}
 
 // ← then an "initialized" event (means "ready for setBreakpoints / launch")
@@ -593,3 +602,126 @@ the body reads, writes, or calls — is up to the PPC code you supply. The body
 or another `dolphin_detour` call that touches the same regions; the patched
 bytes don't survive PPC reset, and the rollback on a failed detour only
 restores regions touched by *that* detour.
+
+## `dolphin_memoryRegions`
+
+Returns target metadata and the canonical regions accepted by memory scans.
+GameCube exposes MEM1 and ARAM; Wii exposes MEM1 and MEM2 when initialized.
+
+```jsonc
+{"command":"dolphin_memoryRegions"}
+// -> {"platform":"gamecube", "pointerSize":4,
+//     "byteOrder":"big", "regions":[
+//       {"id":"mem1", "name":"MEM1", "baseAddress":"0x80000000",
+//        "size":25165824, "readable":true, "writable":true, "scannable":true}
+//     ]}
+```
+
+## `dolphin_memoryScanStart`
+
+Starts an asynchronous typed numeric scan. Supported `dataType` values are
+`u8`, `u16`, `u32`, `u64`, `s8`, `s16`, `s32`, `s64`, `f32`, and `f64`.
+Initial filters are `exact`, `notEqual`, `between`, `greaterThan`,
+`greaterOrEqual`, `lessThan`, `lessOrEqual`, and `unknown`.
+Ranges are half-open (`[start,end)`). Omitted or empty `regions` selects MEM1;
+explicit ranges must be wholly contained in one of the selected regions.
+
+```jsonc
+{"command":"dolphin_memoryScanStart", "arguments":{
+  "regions":["mem1"],
+  "ranges":[{"start":"0x80000000", "end":"0x81800000"}],
+  "dataType":"u32", "filter":"exact", "value":"100",
+  "aligned":true, "pauseDuringScan":false
+}}
+// -> {"scanId":1, "jobId":1, "state":"running", "pauseDuringScan":false}
+```
+
+Every scan pauses CPU, DSP, and FIFO while all requested ranges are copied into
+one consistent snapshot. With `pauseDuringScan:false` (the default), emulation
+resumes before the immutable snapshot is filtered. With `true`, execution stays
+paused through filtering and atomic result commit. A core that was already
+paused remains paused.
+While a `pauseDuringScan:true` job owns the core, requests other than memory
+region, scan status/results/cancel/dispose, and disconnect are rejected.
+
+The accepted response is followed by exactly one terminal event. Clients do
+not need to poll status:
+
+```jsonc
+{"event":"dolphin_memoryScanCompleted", "body":{
+  "scanId":1, "jobId":1, "generation":1, "resultCount":42,
+  "durationMilliseconds":183, "pauseDuringScan":false
+}}
+```
+
+Failures emit `dolphin_memoryScanFailed` with `message`; cancellation emits
+`dolphin_memoryScanCancelled`. Failed or cancelled refinements leave the last
+committed generation available.
+
+## `dolphin_memoryScanRefine`
+
+Filters a completed generation using a fresh consistent snapshot. In addition
+to value filters, refinement supports `changed`, `unchanged`, `increased`,
+`decreased`, `increasedBy`, and `decreasedBy`.
+
+```jsonc
+{"command":"dolphin_memoryScanRefine", "arguments":{
+  "scanId":1, "filter":"decreased"
+}}
+```
+
+Omitting `pauseDuringScan` inherits the value from `dolphin_memoryScanStart`;
+an explicit boolean overrides it for that refinement job.
+
+## `dolphin_memoryScanStatus`
+
+Optional diagnostics/recovery request. Normal clients should wait for terminal
+events instead.
+
+```jsonc
+{"command":"dolphin_memoryScanStatus", "arguments":{"scanId":1}}
+// -> {"scanId":1, "jobId":2, "generation":1, "state":"running",
+//     "phase":"filtering", "pauseDuringScan":true,
+//     "emulationPaused":true, "resultCount":42}
+```
+
+Phases are `waiting`, `capturing`, `filtering`, `committing`, `completed`,
+`cancelled`, or `failed`.
+
+## `dolphin_memoryScanResults`
+
+Returns up to 4096 committed results. Results remain readable while a refinement
+builds the next generation privately.
+
+```jsonc
+{"command":"dolphin_memoryScanResults", "arguments":{
+  "scanId":1, "start":0, "count":256
+}}
+// -> {"scanId":1, "generation":1, "totalResults":42, "start":0,
+//     "results":[{"address":"0x80401234", "scannedValue":"100",
+//                  "raw":"AAAAZA=="}]}
+```
+
+## `dolphin_memoryScanCancel`
+
+```jsonc
+{"command":"dolphin_memoryScanCancel", "arguments":{"scanId":1}}
+```
+
+Cancellation is cooperative. The original job still emits its mandatory
+`dolphin_memoryScanCancelled` terminal event once it has released any scan-owned
+pause.
+
+## `dolphin_memoryScanDispose`
+
+```jsonc
+{"command":"dolphin_memoryScanDispose", "arguments":{"scanId":1}}
+```
+
+Releases retained snapshots and results. Disposing an active scan requests
+cancellation; its worker still emits a terminal event. Completion can win if
+the generation has already entered its atomic commit.
+
+Limits: one active scan job per DAP session, eight retained scans, 256 MiB of
+snapshot plus candidate state per session, 256 MiB of snapshot input per job,
+non-overlapping ranges, and 4096 results per page.
