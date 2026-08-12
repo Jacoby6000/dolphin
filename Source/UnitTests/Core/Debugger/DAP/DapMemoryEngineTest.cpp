@@ -239,4 +239,42 @@ TEST_F(DapMemoryEngineTest, AlignmentAndResultPagingUseAbsoluteAddresses)
   ASSERT_EQ(page->results.size(), 1u);
   EXPECT_EQ(page->results[0].address, SCAN_ADDRESS + 8);
 }
+
+TEST_F(DapMemoryEngineTest, RemoveResultsAndUndoPreserveImmutableGenerations)
+{
+  const std::vector<u8> bytes{1, 2, 3, 4};
+  WriteBytes(DATA_ADDRESS, bytes);
+  auto config = MakeConfig(DAP::MemoryScanDataType::U8, SCAN_ADDRESS, 4, "0");
+  config.filter = DAP::MemoryScanFilter::Unknown;
+  config.value.reset();
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_TRUE(WaitForEvent(0).has_value());
+
+  const auto removed =
+      m_engine->RemoveResults(accepted->scan_id, {SCAN_ADDRESS + 1, SCAN_ADDRESS + 1,
+                                                  SCAN_ADDRESS + 20});
+  ASSERT_TRUE(removed.has_value());
+  EXPECT_EQ(removed->generation, 2u);
+  EXPECT_EQ(removed->result_count, 3u);
+  EXPECT_EQ(removed->removed_count, 1u);
+  EXPECT_TRUE(removed->can_undo);
+
+  const auto no_change = m_engine->RemoveResults(accepted->scan_id, {SCAN_ADDRESS + 1});
+  ASSERT_TRUE(no_change.has_value());
+  EXPECT_EQ(no_change->generation, 2u);
+  EXPECT_EQ(no_change->removed_count, 0u);
+
+  const auto undone = m_engine->Undo(accepted->scan_id);
+  ASSERT_TRUE(undone.has_value());
+  EXPECT_EQ(undone->generation, 1u);
+  EXPECT_EQ(undone->result_count, 4u);
+  EXPECT_FALSE(undone->can_undo);
+  EXPECT_FALSE(m_engine->Undo(accepted->scan_id).has_value());
+
+  const auto removed_again = m_engine->RemoveResults(accepted->scan_id, {SCAN_ADDRESS + 2});
+  ASSERT_TRUE(removed_again.has_value());
+  EXPECT_EQ(removed_again->generation, 3u);
+  EXPECT_EQ(removed_again->result_count, 3u);
+}
 }  // namespace

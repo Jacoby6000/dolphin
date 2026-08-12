@@ -293,10 +293,18 @@ struct MemoryScanResultsArguments
   u32 count = 0;
 };
 
+struct MemoryScanRemoveResultsArguments
+{
+  int scan_id = 0;
+  std::vector<u32> addresses;
+};
+
 std::optional<MemoryScanStartConfig> ParseMemoryScanStart(const picojson::object& arguments);
 std::optional<MemoryScanRefineConfig> ParseMemoryScanRefine(const picojson::object& arguments);
 std::optional<MemoryScanStatusArguments> ParseMemoryScanStatus(const picojson::object& arguments);
 std::optional<MemoryScanResultsArguments> ParseMemoryScanResults(const picojson::object& arguments);
+std::optional<MemoryScanRemoveResultsArguments>
+ParseMemoryScanRemoveResults(const picojson::object& arguments);
 
 // Arguments of a `launch`/`attach` request. `stop_on_entry` is nullopt when
 // the client omitted the field; the session resolves the effective policy

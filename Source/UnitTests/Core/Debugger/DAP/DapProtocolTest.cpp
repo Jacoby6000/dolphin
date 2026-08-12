@@ -150,7 +150,35 @@ TEST(DapProtocol, ParseMemoryScanRejectsMalformedOptionalFields)
           .has_value());
   EXPECT_FALSE(Protocol::ParseMemoryScanResults(
                    ParseObjectOrDie(R"({"scanId":1,"start":18446744073709551616,"count":2})"))
+          .has_value());
+}
+
+TEST(DapProtocol, ParseMemoryScanRemoveResults)
+{
+  const auto arguments = Protocol::ParseMemoryScanRemoveResults(ParseObjectOrDie(
+      R"({"scanId":3,"addresses":["0x80004000","80004004"]})"));
+  ASSERT_TRUE(arguments.has_value());
+  EXPECT_EQ(arguments->scan_id, 3);
+  EXPECT_EQ(arguments->addresses, (std::vector<u32>{0x80004000, 0x80004004}));
+}
+
+TEST(DapProtocol, ParseMemoryScanRemoveResultsRejectsMalformedArguments)
+{
+  EXPECT_FALSE(Protocol::ParseMemoryScanRemoveResults(
+                   ParseObjectOrDie(R"({"scanId":1,"addresses":[]})"))
                    .has_value());
+  EXPECT_FALSE(Protocol::ParseMemoryScanRemoveResults(
+                   ParseObjectOrDie(R"({"scanId":1,"addresses":[1]})"))
+                   .has_value());
+  EXPECT_FALSE(Protocol::ParseMemoryScanRemoveResults(
+                   ParseObjectOrDie(R"({"scanId":1,"addresses":["not-hex"]})"))
+                   .has_value());
+
+  picojson::array addresses(4097, picojson::value(std::string("0")));
+  picojson::object too_many;
+  too_many.emplace("scanId", 1.0);
+  too_many.emplace("addresses", std::move(addresses));
+  EXPECT_FALSE(Protocol::ParseMemoryScanRemoveResults(too_many).has_value());
 }
 
 TEST(DapProtocol, ParseResolvePointerChain)

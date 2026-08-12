@@ -77,6 +77,8 @@ Each operation below links to its detailed reference section in
 | [`dolphin_memoryScanResults`](capabilities.md#dolphin_memoryscanresults) | Read a paginated committed result generation. |
 | [`dolphin_memoryScanCancel`](capabilities.md#dolphin_memoryscancancel) | Request cancellation of a running scan job. |
 | [`dolphin_memoryScanDispose`](capabilities.md#dolphin_memoryscandispose) | Release a scan and its snapshots/results. |
+| [`dolphin_memoryScanUndo`](capabilities.md#dolphin_memoryscanundo) | Restore the previous retained result generation. |
+| [`dolphin_memoryScanRemoveResults`](capabilities.md#dolphin_memoryscanremoveresults) | Remove explicit result addresses into a new immutable generation. |
 | [`dolphin_resolvePointerChain`](capabilities.md#dolphin_resolvepointerchain) | Resolve a big-endian 32-bit pointer chain under one emulation pause. |
 
 ## Running the server

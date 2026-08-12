@@ -803,7 +803,8 @@ private:
     const bool scan_safe_command =
         command == "dolphin_memoryRegions" || command == "dolphin_memoryScanStatus" ||
         command == "dolphin_memoryScanResults" || command == "dolphin_memoryScanCancel" ||
-        command == "dolphin_memoryScanDispose";
+        command == "dolphin_memoryScanDispose" || command == "dolphin_memoryScanUndo" ||
+        command == "dolphin_memoryScanRemoveResults";
     auto core_scan_lock = DapMemoryEngine::TryLockCoreScan();
     if (!scan_safe_command && !core_scan_lock.owns_lock())
     {
@@ -1273,6 +1274,18 @@ private:
       return;
     }
 
+    if (command == "dolphin_memoryScanUndo")
+    {
+      HandleMemoryScanUndo(*request);
+      return;
+    }
+
+    if (command == "dolphin_memoryScanRemoveResults")
+    {
+      HandleMemoryScanRemoveResults(*request);
+      return;
+    }
+
     if (command == "dolphin_resolvePointerChain")
     {
       HandleResolvePointerChain(*request);
@@ -1463,6 +1476,54 @@ private:
       return;
     }
     Respond(request.seq, request.command, picojson::object{});
+  }
+
+  void RespondMemoryScanMutation(const Protocol::Request& request,
+                                 const MemoryScanMutationResult& result)
+  {
+    FlushEvents();
+    picojson::object body;
+    body.emplace("scanId", static_cast<double>(result.scan_id));
+    body.emplace("generation", static_cast<double>(result.generation));
+    body.emplace("resultCount", static_cast<double>(result.result_count));
+    body.emplace("removedCount", static_cast<double>(result.removed_count));
+    body.emplace("canUndo", result.can_undo);
+    Respond(request.seq, request.command, std::move(body));
+  }
+
+  void HandleMemoryScanUndo(const Protocol::Request& request)
+  {
+    const auto arguments = Protocol::ParseMemoryScanStatus(request.arguments);
+    if (!arguments)
+    {
+      RespondError(request.seq, request.command, "invalid memory scan undo arguments");
+      return;
+    }
+    const auto result = m_memory_engine->Undo(arguments->scan_id);
+    if (!result)
+    {
+      RespondError(request.seq, request.command, result.error());
+      return;
+    }
+    RespondMemoryScanMutation(request, *result);
+  }
+
+  void HandleMemoryScanRemoveResults(const Protocol::Request& request)
+  {
+    const auto arguments = Protocol::ParseMemoryScanRemoveResults(request.arguments);
+    if (!arguments)
+    {
+      RespondError(request.seq, request.command, "invalid memory scan result-removal arguments");
+      return;
+    }
+    const auto result =
+        m_memory_engine->RemoveResults(arguments->scan_id, arguments->addresses);
+    if (!result)
+    {
+      RespondError(request.seq, request.command, result.error());
+      return;
+    }
+    RespondMemoryScanMutation(request, *result);
   }
 
   void HandleSetBreakpoints(const Protocol::Request& request)

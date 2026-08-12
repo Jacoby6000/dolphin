@@ -345,6 +345,31 @@ TEST_F(DapSessionTest, MemoryScanCompletesByEventAndReturnsResults)
   EXPECT_EQ(result.at("address").to_str(), "0x80004000");
   EXPECT_EQ(result.at("scannedValue").to_str(), "3735928559");
   EXPECT_EQ(result.at("raw").to_str(), "3q2+7w==");
+
+  client.Send(fmt::format(
+      R"({{"seq":25,"type":"request","command":"dolphin_memoryScanRemoveResults",
+           "arguments":{{"scanId":{},"addresses":["0x80004000"]}}}})",
+      scan_id));
+  const auto removed = client.Receive();
+  ASSERT_TRUE(removed.has_value());
+  ASSERT_TRUE(removed->at("success").get<bool>());
+  const auto& removed_body = removed->at("body").get<picojson::object>();
+  EXPECT_EQ(removed_body.at("generation").get<double>(), 2.0);
+  EXPECT_EQ(removed_body.at("resultCount").get<double>(), 0.0);
+  EXPECT_EQ(removed_body.at("removedCount").get<double>(), 1.0);
+  EXPECT_TRUE(removed_body.at("canUndo").get<bool>());
+
+  client.Send(fmt::format(
+      R"({{"seq":26,"type":"request","command":"dolphin_memoryScanUndo",
+           "arguments":{{"scanId":{}}}}})",
+      scan_id));
+  const auto undone = client.Receive();
+  ASSERT_TRUE(undone.has_value());
+  ASSERT_TRUE(undone->at("success").get<bool>());
+  const auto& undone_body = undone->at("body").get<picojson::object>();
+  EXPECT_EQ(undone_body.at("generation").get<double>(), 1.0);
+  EXPECT_EQ(undone_body.at("resultCount").get<double>(), 1.0);
+  EXPECT_FALSE(undone_body.at("canUndo").get<bool>());
 }
 
 TEST_F(DapSessionTest, MemoryScanRefineNotifiesWithoutStatusPolling)

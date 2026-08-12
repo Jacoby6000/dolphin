@@ -129,6 +129,15 @@ struct MemoryScanResultPage
   std::vector<MemoryScanResult> results;
 };
 
+struct MemoryScanMutationResult
+{
+  int scan_id = 0;
+  u64 generation = 0;
+  u64 result_count = 0;
+  u64 removed_count = 0;
+  bool can_undo = false;
+};
+
 struct MemoryScanTerminalEvent
 {
   std::string event;
@@ -160,6 +169,9 @@ public:
   std::optional<MemoryScanStatus> GetStatus(int scan_id) const;
   std::expected<MemoryScanResultPage, std::string> GetResults(int scan_id, u64 start,
                                                               u32 count) const;
+  std::expected<MemoryScanMutationResult, std::string> Undo(int scan_id);
+  std::expected<MemoryScanMutationResult, std::string>
+  RemoveResults(int scan_id, const std::vector<u32>& addresses);
   bool Cancel(int scan_id);
   bool Dispose(int scan_id);
 
@@ -179,7 +191,7 @@ private:
   struct Generation
   {
     u64 number = 0;
-    std::vector<SnapshotRange> ranges;
+    std::shared_ptr<const std::vector<SnapshotRange>> ranges;
     std::vector<u8> candidates;
     u64 result_count = 0;
   };
@@ -196,6 +208,8 @@ private:
     bool emulation_paused = false;
     bool disposed = false;
     std::shared_ptr<const Generation> generation;
+    std::vector<std::shared_ptr<const Generation>> undo_generations;
+    u64 next_generation_number = 1;
   };
 
   struct ResolvedRange
@@ -226,7 +240,7 @@ private:
   void FinishWorker(const std::shared_ptr<Scan>& scan, int job_id,
                      MemoryScanTerminalEvent terminal);
   void ReapWorker();
-  u64 CalculateRetainedBytesLocked() const;
+  u64 CalculateRetainedBytesLocked(const Generation* excluded_generation = nullptr) const;
   u64 CalculateGenerationBytes(const MemoryScanStartConfig& config,
                                const std::vector<ResolvedRange>& ranges) const;
 

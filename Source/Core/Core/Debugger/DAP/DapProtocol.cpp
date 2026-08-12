@@ -862,6 +862,32 @@ std::optional<MemoryScanResultsArguments> ParseMemoryScanResults(const picojson:
   return result;
 }
 
+std::optional<MemoryScanRemoveResultsArguments>
+ParseMemoryScanRemoveResults(const picojson::object& arguments)
+{
+  const std::optional<int> scan_id = ReadStrictUnsignedInteger<int>(arguments, "scanId");
+  const picojson::array* addresses = GetArray(arguments, "addresses");
+  if (!scan_id || *scan_id <= 0 || addresses == nullptr || addresses->empty() ||
+      addresses->size() > 4096)
+  {
+    return std::nullopt;
+  }
+
+  MemoryScanRemoveResultsArguments result;
+  result.scan_id = *scan_id;
+  result.addresses.reserve(addresses->size());
+  for (const picojson::value& input : *addresses)
+  {
+    if (!input.is<std::string>())
+      return std::nullopt;
+    const std::optional<u32> address = Json::ParseHexAddress(input.get<std::string>());
+    if (!address)
+      return std::nullopt;
+    result.addresses.push_back(*address);
+  }
+  return result;
+}
+
 std::optional<LaunchArguments> ParseLaunch(const picojson::object& arguments)
 {
   // DESNOTE(jbarber, 2026-07-21): `stopOnEntry` is optional; nullopt means

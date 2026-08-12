@@ -43,6 +43,8 @@ the server for responses/events.
   - [`dolphin_memoryScanResults`](#dolphin_memoryscanresults)
   - [`dolphin_memoryScanCancel`](#dolphin_memoryscancancel)
   - [`dolphin_memoryScanDispose`](#dolphin_memoryscandispose)
+  - [`dolphin_memoryScanUndo`](#dolphin_memoryscanundo)
+  - [`dolphin_memoryScanRemoveResults`](#dolphin_memoryscanremoveresults)
   - [`dolphin_resolvePointerChain`](#dolphin_resolvepointerchain)
 
 # Standard requests
@@ -644,7 +646,9 @@ resumes before the immutable snapshot is filtered. With `true`, execution stays
 paused through filtering and atomic result commit. A core that was already
 paused remains paused.
 While a `pauseDuringScan:true` job owns the core, requests other than memory
-region, scan status/results/cancel/dispose, and disconnect are rejected.
+region, scan status/results/cancel/dispose/undo/result-removal, and disconnect
+are rejected. Undo and result removal remain safe to receive but reject while
+the job is active.
 
 The accepted response is followed by exactly one terminal event. Clients do
 not need to poll status:
@@ -727,6 +731,39 @@ the generation has already entered its atomic commit.
 Limits: one active scan job per DAP session, eight retained scans, 256 MiB of
 snapshot plus candidate state per session, 256 MiB of snapshot input per job,
 non-overlapping ranges, and 4096 results per page.
+
+## `dolphin_memoryScanUndo`
+
+Restores the previous committed result generation. Successful refinements and
+result removals retain up to 16 undo generations. Undo is synchronous, emits no
+terminal event, and is rejected while any scan job in the session is active.
+
+```jsonc
+{"command":"dolphin_memoryScanUndo", "arguments":{"scanId":1}}
+// -> {"scanId":1, "generation":1, "resultCount":42,
+//     "removedCount":0, "canUndo":false}
+```
+
+Generation numbers identify immutable states and are not reused. Undo restores
+the original generation number; the next refinement or removal receives a new,
+larger number. Refinement generations retain their snapshots and candidate
+bitmaps; removal generations share snapshots but retain their own bitmaps.
+Budget admission uses the retained set after any 16-generation history eviction.
+
+## `dolphin_memoryScanRemoveResults`
+
+Removes up to 4096 explicit result addresses. A successful removal creates a
+new immutable generation without copying the retained snapshot. Duplicate,
+unknown, unaligned, and already-removed addresses are ignored. If no supplied
+address is an active result, no generation is created.
+
+```jsonc
+{"command":"dolphin_memoryScanRemoveResults", "arguments":{
+  "scanId":1, "addresses":["0x80401234","0x80405678"]
+}}
+// -> {"scanId":1, "generation":3, "resultCount":40,
+//     "removedCount":2, "canUndo":true}
+```
 
 ## `dolphin_resolvePointerChain`
 
