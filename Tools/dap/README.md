@@ -77,6 +77,7 @@ Each operation below links to its detailed reference section in
 | [`dolphin_memoryScanResults`](capabilities.md#dolphin_memoryscanresults) | Read a paginated committed result generation. |
 | [`dolphin_memoryScanCancel`](capabilities.md#dolphin_memoryscancancel) | Request cancellation of a running scan job. |
 | [`dolphin_memoryScanDispose`](capabilities.md#dolphin_memoryscandispose) | Release a scan and its snapshots/results. |
+| [`dolphin_resolvePointerChain`](capabilities.md#dolphin_resolvepointerchain) | Resolve a big-endian 32-bit pointer chain under one emulation pause. |
 
 ## Running the server
 

@@ -235,6 +235,7 @@ TEST_F(DapSessionTest, InitializeAdvertisesCapabilities)
   EXPECT_TRUE(caps.at("supportsRestartRequest").get<bool>());
   EXPECT_TRUE(caps.at("supportsDolphinMemoryRegions").get<bool>());
   EXPECT_TRUE(caps.at("supportsDolphinMemoryScan").get<bool>());
+  EXPECT_TRUE(caps.at("supportsDolphinPointerChain").get<bool>());
 }
 
 TEST_F(DapSessionTest, MemoryRegionsReportsMem1)
@@ -254,6 +255,50 @@ TEST_F(DapSessionTest, MemoryRegionsReportsMem1)
   const auto& mem1 = regions.front().get<picojson::object>();
   EXPECT_EQ(mem1.at("id").to_str(), "mem1");
   EXPECT_EQ(mem1.at("baseAddress").to_str(), "0x80000000");
+}
+
+TEST_F(DapSessionTest, ResolvePointerChainReturnsSteps)
+{
+  const std::array<u8, 4> first{{0x00, 0x00, 0x40, 0x20}};
+  const std::array<u8, 4> second{{0x00, 0x00, 0x50, 0x20}};
+  auto& memory = Core::System::GetInstance().GetMemory();
+  memory.CopyToEmu(0x4000, first.data(), first.size());
+  memory.CopyToEmu(0x4030, second.data(), second.size());
+
+  TestClient client(m_client_fd());
+  Handshake(client);
+  client.Send(R"({
+    "seq":20,"type":"request","command":"dolphin_resolvePointerChain",
+    "arguments":{"baseAddress":"0x00004000","offsets":[16,-4]}
+  })");
+  const auto response = client.Receive();
+  ASSERT_TRUE(response.has_value());
+  ASSERT_TRUE(response->at("success").get<bool>());
+  const auto& body = response->at("body").get<picojson::object>();
+  EXPECT_EQ(body.at("finalAddress").to_str(), "0x0000501c");
+  const auto& steps = body.at("steps").get<picojson::array>();
+  ASSERT_EQ(steps.size(), 2u);
+  const auto& first_step = steps[0].get<picojson::object>();
+  EXPECT_EQ(first_step.at("address").to_str(), "0x00004000");
+  EXPECT_EQ(first_step.at("pointerValue").to_str(), "0x00004020");
+  EXPECT_EQ(first_step.at("offset").get<double>(), 16.0);
+  EXPECT_EQ(first_step.at("resultAddress").to_str(), "0x00004030");
+  const auto& second_step = steps[1].get<picojson::object>();
+  EXPECT_EQ(second_step.at("offset").get<double>(), -4.0);
+}
+
+TEST_F(DapSessionTest, ResolvePointerChainReportsUnreadablePointer)
+{
+  TestClient client(m_client_fd());
+  Handshake(client);
+  client.Send(R"({
+    "seq":20,"type":"request","command":"dolphin_resolvePointerChain",
+    "arguments":{"baseAddress":"0x0c000000","offsets":[0]}
+  })");
+  const auto response = client.Receive();
+  ASSERT_TRUE(response.has_value());
+  EXPECT_FALSE(response->at("success").get<bool>());
+  EXPECT_NE(response->at("message").to_str().find("cannot read pointer"), std::string::npos);
 }
 
 TEST_F(DapSessionTest, MemoryScanCompletesByEventAndReturnsResults)

@@ -49,6 +49,21 @@ std::optional<T> ReadStrictUnsignedInteger(const picojson::object& obj, const st
   return static_cast<T>(value);
 }
 
+template <typename T>
+std::optional<T> ReadStrictSignedInteger(const picojson::value& input)
+{
+  if (!input.is<double>())
+    return std::nullopt;
+  const double value = input.get<double>();
+  if (!std::isfinite(value) || std::floor(value) != value ||
+      value < static_cast<double>(std::numeric_limits<T>::min()) ||
+      value > static_cast<double>(std::numeric_limits<T>::max()))
+  {
+    return std::nullopt;
+  }
+  return static_cast<T>(value);
+}
+
 bool HasInvalidOptionalString(const picojson::object& obj, const std::string& key)
 {
   const auto it = obj.find(key);
@@ -696,6 +711,30 @@ std::optional<DetourArguments> ParseDetour(const picojson::object& arguments)
     result.detour_address = *parsed;
   }
   result.detour_body = std::move(*decoded);
+  return result;
+}
+
+std::optional<ResolvePointerChainArguments>
+ParseResolvePointerChain(const picojson::object& arguments)
+{
+  const std::optional<std::string> base = ReadStringFromJson(arguments, "baseAddress");
+  const picojson::array* offsets = GetArray(arguments, "offsets");
+  if (!base || offsets == nullptr || offsets->empty() || offsets->size() > 64)
+    return std::nullopt;
+  const std::optional<u32> parsed_base = Json::ParseHexAddress(*base);
+  if (!parsed_base)
+    return std::nullopt;
+
+  ResolvePointerChainArguments result;
+  result.base_address = *parsed_base;
+  result.offsets.reserve(offsets->size());
+  for (const picojson::value& input : *offsets)
+  {
+    const std::optional<s32> offset = ReadStrictSignedInteger<s32>(input);
+    if (!offset)
+      return std::nullopt;
+    result.offsets.push_back(*offset);
+  }
   return result;
 }
 

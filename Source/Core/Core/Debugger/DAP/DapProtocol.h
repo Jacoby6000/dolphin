@@ -272,6 +272,15 @@ struct DetourArguments
 
 std::optional<DetourArguments> ParseDetour(const picojson::object& arguments);
 
+struct ResolvePointerChainArguments
+{
+  u32 base_address = 0;
+  std::vector<s32> offsets;
+};
+
+std::optional<ResolvePointerChainArguments>
+ParseResolvePointerChain(const picojson::object& arguments);
+
 struct MemoryScanStatusArguments
 {
   int scan_id = 0;

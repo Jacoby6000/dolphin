@@ -763,6 +763,7 @@ private:
     capabilities.emplace("supportsDolphinDetour", true);
     capabilities.emplace("supportsDolphinMemoryRegions", true);
     capabilities.emplace("supportsDolphinMemoryScan", true);
+    capabilities.emplace("supportsDolphinPointerChain", true);
 
     picojson::object server_info;
     server_info.emplace("name", std::string("Dolphin DAP"));
@@ -1272,6 +1273,12 @@ private:
       return;
     }
 
+    if (command == "dolphin_resolvePointerChain")
+    {
+      HandleResolvePointerChain(*request);
+      return;
+    }
+
     WARN_LOG_FMT(CONSOLE, "DAP: unhandled command {}", command);
     RespondError(request->seq, command, "unsupported");
   }
@@ -1296,6 +1303,38 @@ private:
     body.emplace("pointerSize", 4.0);
     body.emplace("byteOrder", std::string("big"));
     body.emplace("regions", std::move(regions));
+    Respond(request.seq, request.command, std::move(body));
+  }
+
+  void HandleResolvePointerChain(const Protocol::Request& request)
+  {
+    const auto arguments = Protocol::ParseResolvePointerChain(request.arguments);
+    if (!arguments)
+    {
+      RespondError(request.seq, request.command, "invalid pointer chain arguments");
+      return;
+    }
+    const auto resolved =
+        m_controller.ResolvePointerChain(arguments->base_address, arguments->offsets);
+    if (!resolved)
+    {
+      RespondError(request.seq, request.command, resolved.error());
+      return;
+    }
+
+    picojson::array steps;
+    for (const PointerChainStep& step : resolved->steps)
+    {
+      picojson::object entry;
+      entry.emplace("address", Json::FormatAddress(step.address));
+      entry.emplace("pointerValue", Json::FormatAddress(step.pointer_value));
+      entry.emplace("offset", static_cast<double>(step.offset));
+      entry.emplace("resultAddress", Json::FormatAddress(step.result_address));
+      steps.emplace_back(std::move(entry));
+    }
+    picojson::object body;
+    body.emplace("finalAddress", Json::FormatAddress(resolved->final_address));
+    body.emplace("steps", std::move(steps));
     Respond(request.seq, request.command, std::move(body));
   }
 

@@ -43,6 +43,7 @@ the server for responses/events.
   - [`dolphin_memoryScanResults`](#dolphin_memoryscanresults)
   - [`dolphin_memoryScanCancel`](#dolphin_memoryscancancel)
   - [`dolphin_memoryScanDispose`](#dolphin_memoryscandispose)
+  - [`dolphin_resolvePointerChain`](#dolphin_resolvepointerchain)
 
 # Standard requests
 
@@ -78,7 +79,8 @@ Dolphin-specific extensions it supports.
    "supportsDolphinInjectCode": true,
    "supportsDolphinDetour": true,
    "supportsDolphinMemoryRegions": true,
-   "supportsDolphinMemoryScan": true
+   "supportsDolphinMemoryScan": true,
+   "supportsDolphinPointerChain": true
   }}}
 
 // ← then an "initialized" event (means "ready for setBreakpoints / launch")
@@ -725,3 +727,28 @@ the generation has already entered its atomic commit.
 Limits: one active scan job per DAP session, eight retained scans, 256 MiB of
 snapshot plus candidate state per session, 256 MiB of snapshot input per job,
 non-overlapping ranges, and 4096 results per page.
+
+## `dolphin_resolvePointerChain`
+
+Resolves up to 64 big-endian 32-bit pointer dereferences while CPU, DSP, and
+FIFO are paused by one `CPUThreadGuard`. `offsets` must contain one to 64 JSON
+integers in `[-2147483648, 2147483647]`. Each entry causes one dereference:
+Dolphin reads the pointer at the current address and computes
+`next = pointer + offset`.
+
+```jsonc
+{"command":"dolphin_resolvePointerChain", "arguments":{
+  "baseAddress":"0x80004000", "offsets":[16,-4]
+}}
+// -> {"finalAddress":"0x8000601c", "steps":[
+//   {"address":"0x80004000", "pointerValue":"0x80005000",
+//    "offset":16, "resultAddress":"0x80005010"},
+//   {"address":"0x80005010", "pointerValue":"0x80006020",
+//    "offset":-4, "resultAddress":"0x8000601c"}
+// ]}
+```
+
+The request fails if any four-byte pointer is unreadable, an offset leaves the
+32-bit address space, the offset list is empty, or it exceeds 64 entries. The
+final address is range-checked but not dereferenced or otherwise required to be
+readable.

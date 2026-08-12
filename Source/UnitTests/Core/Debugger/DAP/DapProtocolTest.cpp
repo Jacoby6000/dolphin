@@ -1,6 +1,7 @@
 // Copyright 2026 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -150,6 +151,44 @@ TEST(DapProtocol, ParseMemoryScanRejectsMalformedOptionalFields)
   EXPECT_FALSE(Protocol::ParseMemoryScanResults(
                    ParseObjectOrDie(R"({"scanId":1,"start":18446744073709551616,"count":2})"))
                    .has_value());
+}
+
+TEST(DapProtocol, ParseResolvePointerChain)
+{
+  const auto arguments = Protocol::ParseResolvePointerChain(
+      ParseObjectOrDie(R"({"baseAddress":"0x80004000","offsets":[16,-4,0]})"));
+  ASSERT_TRUE(arguments.has_value());
+  EXPECT_EQ(arguments->base_address, 0x80004000u);
+  EXPECT_EQ(arguments->offsets, (std::vector<s32>{16, -4, 0}));
+
+  const auto boundaries = Protocol::ParseResolvePointerChain(ParseObjectOrDie(
+      R"({"baseAddress":"0","offsets":[-2147483648,2147483647]})"));
+  ASSERT_TRUE(boundaries.has_value());
+  EXPECT_EQ(boundaries->offsets,
+            (std::vector<s32>{std::numeric_limits<s32>::min(),
+                              std::numeric_limits<s32>::max()}));
+}
+
+TEST(DapProtocol, ParseResolvePointerChainRejectsMalformedArguments)
+{
+  EXPECT_FALSE(Protocol::ParseResolvePointerChain(
+                   ParseObjectOrDie(R"({"baseAddress":"0x80004000","offsets":[]})"))
+                   .has_value());
+  EXPECT_FALSE(Protocol::ParseResolvePointerChain(
+                   ParseObjectOrDie(R"({"baseAddress":"not-hex","offsets":[0]})"))
+                   .has_value());
+  EXPECT_FALSE(Protocol::ParseResolvePointerChain(
+                   ParseObjectOrDie(R"({"baseAddress":"0x80004000","offsets":[1.5]})"))
+                   .has_value());
+  EXPECT_FALSE(Protocol::ParseResolvePointerChain(
+                   ParseObjectOrDie(R"({"baseAddress":"0x80004000","offsets":[2147483648]})"))
+                   .has_value());
+
+  picojson::array offsets(65, picojson::value(0.0));
+  picojson::object too_deep;
+  too_deep.emplace("baseAddress", std::string("0x80004000"));
+  too_deep.emplace("offsets", std::move(offsets));
+  EXPECT_FALSE(Protocol::ParseResolvePointerChain(too_deep).has_value());
 }
 
 TEST(DapProtocol, ParseReadMemoryResolvesFields)
