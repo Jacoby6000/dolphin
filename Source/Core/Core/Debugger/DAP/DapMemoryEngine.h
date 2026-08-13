@@ -208,6 +208,7 @@ private:
     u64 number = 0;
     std::shared_ptr<const std::vector<SnapshotRange>> ranges;
     std::vector<u8> candidates;
+    std::vector<u64> result_index;
     u64 result_count = 0;
   };
 
@@ -254,7 +255,7 @@ private:
                  bool pause_during_scan, std::shared_ptr<const Generation> previous);
   void FinishWorker(const std::shared_ptr<Scan>& scan, int job_id,
                     MemoryScanTerminalEvent terminal);
-  void ReapWorker();
+  bool ReapWorker();
   u64 CalculateRetainedBytesLocked(const Generation* excluded_generation = nullptr) const;
   u64 CalculateGenerationBytes(const MemoryScanStartConfig& config,
                                const std::vector<ResolvedRange>& ranges) const;
@@ -268,11 +269,13 @@ private:
                                                    const std::optional<std::string>& value2,
                                                    bool has_previous);
   static std::string FormatValue(MemoryScanDataType data_type, const u8* bytes);
+  static void BuildResultIndex(Generation* generation);
 
   Core::System& m_system;
   TerminalCallback m_terminal_callback;
   mutable std::mutex m_mutex;
   std::map<int, std::shared_ptr<Scan>> m_scans;
+  std::mutex m_worker_mutex;
   std::thread m_worker;
   std::atomic<bool> m_cancelled{false};
   bool m_job_active = false;

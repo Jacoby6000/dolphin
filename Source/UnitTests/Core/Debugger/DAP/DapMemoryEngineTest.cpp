@@ -238,6 +238,111 @@ TEST_F(DapMemoryEngineTest, AlignmentAndResultPagingUseAbsoluteAddresses)
   EXPECT_EQ(page->results[0].address, SCAN_ADDRESS + 8);
 }
 
+TEST_F(DapMemoryEngineTest, AdjacentRangesPreserveCrossBoundaryCandidates)
+{
+  const std::vector<u8> bytes{0x12, 0x34, 0x56, 0x78};
+  WriteBytes(DATA_ADDRESS, bytes);
+  auto config = MakeConfig(DAP::MemoryScanDataType::U32, SCAN_ADDRESS, 4, "0x12345678");
+  config.ranges = {{SCAN_ADDRESS, SCAN_ADDRESS + 1}, {SCAN_ADDRESS + 1, SCAN_ADDRESS + 4}};
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_TRUE(accepted.has_value());
+  const auto terminal = WaitForEvent(0);
+  ASSERT_TRUE(terminal.has_value());
+  EXPECT_EQ(terminal->result_count, 1u);
+}
+
+TEST_F(DapMemoryEngineTest, TerminalCallbackObservesInactiveEngine)
+{
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool callback_ran = false;
+  bool active_in_callback = true;
+  bool refine_accepted_in_callback = true;
+  m_engine = std::make_unique<DAP::DapMemoryEngine>(
+      Core::System::GetInstance(), [&](DAP::MemoryScanTerminalEvent) {
+        active_in_callback = m_engine->HasActiveJob();
+        DAP::MemoryScanRefineConfig refine;
+        refine.scan_id = 1;
+        refine.filter = DAP::MemoryScanFilter::Unchanged;
+        refine_accepted_in_callback = m_engine->RefineScan(refine).has_value();
+        {
+          std::lock_guard lock(mutex);
+          callback_ran = true;
+        }
+        condition.notify_one();
+      });
+  const std::vector<u8> bytes{1};
+  WriteBytes(DATA_ADDRESS, bytes);
+  ASSERT_TRUE(m_engine->StartScan(MakeConfig(DAP::MemoryScanDataType::U8, SCAN_ADDRESS, 1, "1"))
+                  .has_value());
+  std::unique_lock lock(mutex);
+  ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(5), [&] { return callback_ran; }));
+  EXPECT_FALSE(active_in_callback);
+  EXPECT_FALSE(refine_accepted_in_callback);
+}
+
+TEST_F(DapMemoryEngineTest, NumericFiltersRejectIgnoredArguments)
+{
+  const std::vector<u8> bytes{1};
+  WriteBytes(DATA_ADDRESS, bytes);
+  auto config = MakeConfig(DAP::MemoryScanDataType::U8, SCAN_ADDRESS, 1, "1");
+  config.value2 = "2";
+  EXPECT_FALSE(m_engine->StartScan(config).has_value());
+
+  config.filter = DAP::MemoryScanFilter::Unknown;
+  config.value = "1";
+  config.value2.reset();
+  EXPECT_FALSE(m_engine->StartScan(config).has_value());
+}
+
+TEST_F(DapMemoryEngineTest, FloatChangedTreatsNaNsAsStableValues)
+{
+  const std::vector<u8> nan{0x7f, 0xc0, 0x00, 0x00};
+  WriteBytes(DATA_ADDRESS, nan);
+  auto config = MakeConfig(DAP::MemoryScanDataType::F32, SCAN_ADDRESS, 4, "0");
+  config.filter = DAP::MemoryScanFilter::Unknown;
+  config.value.reset();
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_TRUE(WaitForEvent(0).has_value());
+
+  DAP::MemoryScanRefineConfig refine;
+  refine.scan_id = accepted->scan_id;
+  refine.filter = DAP::MemoryScanFilter::Unchanged;
+  ASSERT_TRUE(m_engine->RefineScan(refine).has_value());
+  const auto terminal = WaitForEvent(1);
+  ASSERT_TRUE(terminal.has_value());
+  EXPECT_EQ(terminal->result_count, 1u);
+}
+
+TEST_F(DapMemoryEngineTest, FloatParsingRejectsLocaleAndUnderflowForms)
+{
+  const std::vector<u8> zero{0, 0, 0, 0};
+  WriteBytes(DATA_ADDRESS, zero);
+  EXPECT_FALSE(m_engine->StartScan(MakeConfig(DAP::MemoryScanDataType::F32, SCAN_ADDRESS, 4, "1,5"))
+                   .has_value());
+  EXPECT_FALSE(
+      m_engine->StartScan(MakeConfig(DAP::MemoryScanDataType::F32, SCAN_ADDRESS, 4, "1e-50"))
+          .has_value());
+}
+
+TEST_F(DapMemoryEngineTest, DeepResultPageUsesBitmapIndex)
+{
+  constexpr u32 size = 1u << 20;
+  std::vector<u8> bytes(size, 1);
+  WriteBytes(DATA_ADDRESS, bytes);
+  auto config = MakeConfig(DAP::MemoryScanDataType::U8, SCAN_ADDRESS, size, "0");
+  config.filter = DAP::MemoryScanFilter::Unknown;
+  config.value.reset();
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_TRUE(WaitForEvent(0).has_value());
+  const auto page = m_engine->GetResults(accepted->scan_id, size - 1, 1);
+  ASSERT_TRUE(page.has_value());
+  ASSERT_EQ(page->results.size(), 1u);
+  EXPECT_EQ(page->results[0].address, SCAN_ADDRESS + size - 1);
+}
+
 TEST_F(DapMemoryEngineTest, RemoveResultsAndUndoPreserveImmutableGenerations)
 {
   const std::vector<u8> bytes{1, 2, 3, 4};
@@ -479,6 +584,15 @@ TEST_F(DapMemoryEngineTest, NumericScanRejectsPpcOnlyFilter)
   auto config = MakeConfig(DAP::MemoryScanDataType::U32, SCAN_ADDRESS, 4, "0");
   config.filter = DAP::MemoryScanFilter::ValidInstruction;
   config.value.reset();
+  EXPECT_FALSE(m_engine->StartScan(config).has_value());
+}
+
+TEST_F(DapMemoryEngineTest, PpcMnemonicScanRejectsExcessiveDecodingWork)
+{
+  DAP::MemoryScanStartConfig config;
+  config.data_type = DAP::MemoryScanDataType::PpcInstruction;
+  config.filter = DAP::MemoryScanFilter::Mnemonic;
+  config.value = "nop";
   EXPECT_FALSE(m_engine->StartScan(config).has_value());
 }
 

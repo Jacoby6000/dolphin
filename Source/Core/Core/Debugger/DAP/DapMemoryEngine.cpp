@@ -9,7 +9,6 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -37,10 +36,16 @@ constexpr u64 MAX_RESULT_PAGE_RAW_BYTES = 1ull << 20;
 constexpr u64 MAX_SNAPSHOT_BYTES = 256ull << 20;
 constexpr u64 MAX_RETAINED_BYTES = 256ull << 20;
 constexpr u64 MAX_BYTE_COMPARISON_WORK = 1ull << 30;
+constexpr u64 MAX_PPC_DISASSEMBLY_WORK = 1ull << 22;
+constexpr size_t MAX_SCAN_RANGES = 1024;
+constexpr size_t MAX_SCAN_REGIONS = 3;
+constexpr size_t MAX_NUMERIC_VALUE_LENGTH = 128;
+constexpr size_t RESULT_INDEX_BLOCK_BYTES = 4096;
 constexpr int MAX_SCANS = 8;
 constexpr size_t MAX_UNDO_GENERATIONS = 16;
 
 std::mutex s_core_scan_mutex;
+thread_local const DapMemoryEngine* s_memory_scan_worker = nullptr;
 
 template <typename T>
 T ReadBigEndian(const u8* bytes)
@@ -71,14 +76,15 @@ std::optional<T> ParseNumeric(std::string_view text)
 {
   if constexpr (std::is_floating_point_v<T>)
   {
-    std::string copy(text);
-    if (copy.empty())
+    if (text.starts_with('+'))
+      text.remove_prefix(1);
+    if (text.empty())
       return std::nullopt;
-    char* end = nullptr;
-    const double parsed = std::strtod(copy.c_str(), &end);
-    if (end == copy.c_str() || end != copy.c_str() + copy.size())
+    T result = 0;
+    const auto [ptr, error] =
+        std::from_chars(text.data(), text.data() + text.size(), result, std::chars_format::general);
+    if (error != std::errc{} || ptr != text.data() + text.size())
       return std::nullopt;
-    const T result = static_cast<T>(parsed);
     if (!std::isfinite(result))
       return std::nullopt;
     return result;
@@ -178,9 +184,29 @@ bool MatchesFilter(MemoryScanFilter filter, T current, T previous, T value, T va
   case MemoryScanFilter::Unknown:
     return true;
   case MemoryScanFilter::Changed:
-    return current != previous;
+    if constexpr (std::is_floating_point_v<T>)
+    {
+      if (std::isnan(current) || std::isnan(previous))
+      {
+        using U = std::conditional_t<sizeof(T) == 4, u32, u64>;
+        return std::bit_cast<U>(current) != std::bit_cast<U>(previous);
+      }
+      return current != previous;
+    }
+    else
+      return current != previous;
   case MemoryScanFilter::Unchanged:
-    return current == previous;
+    if constexpr (std::is_floating_point_v<T>)
+    {
+      if (std::isnan(current) || std::isnan(previous))
+      {
+        using U = std::conditional_t<sizeof(T) == 4, u32, u64>;
+        return std::bit_cast<U>(current) == std::bit_cast<U>(previous);
+      }
+      return current == previous;
+    }
+    else
+      return current == previous;
   case MemoryScanFilter::Increased:
     return current > previous;
   case MemoryScanFilter::Decreased:
@@ -251,8 +277,14 @@ DapMemoryEngine::DapMemoryEngine(Core::System& system, TerminalCallback terminal
 DapMemoryEngine::~DapMemoryEngine()
 {
   m_cancelled.store(true);
+  std::lock_guard lock(m_worker_mutex);
   if (m_worker.joinable())
-    m_worker.join();
+  {
+    if (s_memory_scan_worker == this)
+      m_worker.detach();
+    else
+      m_worker.join();
+  }
 }
 
 std::vector<MemoryRegionInfo> DapMemoryEngine::GetMemoryRegions() const
@@ -276,6 +308,10 @@ std::vector<MemoryRegionInfo> DapMemoryEngine::GetMemoryRegions() const
 std::expected<std::vector<DapMemoryEngine::ResolvedRange>, std::string>
 DapMemoryEngine::ResolveRanges(const MemoryScanStartConfig& config) const
 {
+  if (config.regions.size() > MAX_SCAN_REGIONS)
+    return std::unexpected("too many memory regions");
+  if (config.ranges.size() > MAX_SCAN_RANGES)
+    return std::unexpected("too many scan ranges");
   const std::vector<MemoryRegionInfo> available = GetMemoryRegions();
   if (available.empty())
     return std::unexpected("no emulated memory regions are available");
@@ -283,6 +319,9 @@ DapMemoryEngine::ResolveRanges(const MemoryScanStartConfig& config) const
   std::vector<std::string> selected = config.regions;
   if (selected.empty())
     selected.emplace_back("mem1");
+  std::ranges::sort(selected);
+  if (std::adjacent_find(selected.begin(), selected.end()) != selected.end())
+    return std::unexpected("memory regions must not be duplicated");
 
   auto find_region = [&](std::string_view id) -> const MemoryRegionInfo* {
     const auto it = std::ranges::find(available, id, &MemoryRegionInfo::id);
@@ -329,16 +368,32 @@ DapMemoryEngine::ResolveRanges(const MemoryScanStartConfig& config) const
   }
 
   std::ranges::sort(ranges, {}, &ResolvedRange::start);
+  std::vector<ResolvedRange> normalized;
+  normalized.reserve(ranges.size());
   u64 total_size = 0;
-  for (size_t i = 0; i < ranges.size(); ++i)
+  for (ResolvedRange& range : ranges)
   {
-    total_size += ranges[i].size;
+    if (!normalized.empty())
+    {
+      ResolvedRange& previous = normalized.back();
+      const u64 previous_end = static_cast<u64>(previous.start) + previous.size;
+      if (previous_end > range.start)
+        return std::unexpected("scan ranges must not overlap");
+      if (previous_end == range.start && previous.region_id == range.region_id)
+      {
+        previous.size += range.size;
+        total_size += range.size;
+        if (total_size > MAX_SNAPSHOT_BYTES)
+          return std::unexpected("requested snapshot exceeds the 256 MiB limit");
+        continue;
+      }
+    }
+    total_size += range.size;
     if (total_size > MAX_SNAPSHOT_BYTES)
       return std::unexpected("requested snapshot exceeds the 256 MiB limit");
-    if (i != 0 && static_cast<u64>(ranges[i - 1].start) + ranges[i - 1].size > ranges[i].start)
-      return std::unexpected("scan ranges must not overlap");
+    normalized.emplace_back(std::move(range));
   }
-  return ranges;
+  return normalized;
 }
 
 std::expected<std::vector<DapMemoryEngine::SnapshotRange>, std::string>
@@ -488,6 +543,8 @@ std::optional<std::string> DapMemoryEngine::ValidateFilter(MemoryScanDataType da
       return "PPC instruction scans do not support value2";
     if (filter == MemoryScanFilter::Exact && !ParseValue(data_type, *value))
       return "invalid PPC instruction word";
+    if (filter == MemoryScanFilter::Exact && value->size() > MAX_NUMERIC_VALUE_LENGTH)
+      return "numeric scan value is too long";
     if (filter == MemoryScanFilter::Mnemonic &&
         (value->empty() || value->size() > 32 || !std::ranges::all_of(*value, [](unsigned char c) {
            return std::isalnum(c) || c == '_' || c == '.' || c == '+' || c == '-';
@@ -501,8 +558,17 @@ std::optional<std::string> DapMemoryEngine::ValidateFilter(MemoryScanDataType da
     return "this filter requires a PPC instruction scan";
   if (NeedsValue(filter) && !value)
     return "this filter requires value";
+  if (!NeedsValue(filter) && value)
+    return "this filter does not accept value";
   if (filter == MemoryScanFilter::Between && !value2)
     return "between requires value2";
+  if (filter != MemoryScanFilter::Between && value2)
+    return "only between accepts value2";
+  if ((value && value->size() > MAX_NUMERIC_VALUE_LENGTH) ||
+      (value2 && value2->size() > MAX_NUMERIC_VALUE_LENGTH))
+  {
+    return "numeric scan value is too long";
+  }
   if (value && !ParseValue(data_type, *value))
     return "invalid numeric scan value";
   if (value2 && !ParseValue(data_type, *value2))
@@ -783,12 +849,20 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
   }
   if (!result)
     return std::unexpected(result.error());
+  BuildResultIndex(generation.get());
   return generation;
 }
 
 std::expected<MemoryScanJobAccepted, std::string>
 DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
 {
+  {
+    std::lock_guard lock(m_mutex);
+    if (m_job_active)
+      return std::unexpected("another memory scan job is active");
+  }
+  if (!ReapWorker())
+    return std::unexpected("memory scans cannot be started from a terminal callback");
   if (config.data_type == MemoryScanDataType::PpcInstruction && !config.aligned)
     return std::unexpected("PPC instruction scans require 4-byte alignment");
   if ((config.data_type == MemoryScanDataType::Bytes ||
@@ -832,15 +906,30 @@ DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
       config.data_type == MemoryScanDataType::String)
   {
     const u64 width = DataTypeSize(config);
-    const u64 candidate_bytes = requested_bytes - [&] {
-      u64 snapshot_bytes = 0;
-      for (const ResolvedRange& range : *ranges)
-        snapshot_bytes += range.size;
-      return snapshot_bytes;
-    }();
-    const u64 candidate_count = candidate_bytes * 8;
+    const u64 stride = config.aligned ? width : 1;
+    u64 candidate_count = 0;
+    for (const ResolvedRange& range : *ranges)
+    {
+      const u64 offset = config.aligned ? (width - (range.start % width)) % width : 0;
+      if (range.size >= offset + width)
+        candidate_count += (range.size - offset - width) / stride + 1;
+    }
     if (candidate_count > MAX_BYTE_COMPARISON_WORK / width)
       return std::unexpected("byte-pattern scan exceeds the comparison-work limit");
+  }
+  if (config.data_type == MemoryScanDataType::PpcInstruction &&
+      (config.filter == MemoryScanFilter::Mnemonic ||
+       config.filter == MemoryScanFilter::ValidInstruction))
+  {
+    u64 candidate_count = 0;
+    for (const ResolvedRange& range : *ranges)
+    {
+      const u32 offset = (4 - (range.start % 4)) % 4;
+      if (range.size >= offset + 4)
+        candidate_count += (range.size - offset - 4) / 4 + 1;
+    }
+    if (candidate_count > MAX_PPC_DISASSEMBLY_WORK)
+      return std::unexpected("PPC instruction scan exceeds the decoding-work limit");
   }
 
   std::shared_ptr<Scan> scan;
@@ -855,9 +944,6 @@ DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
     if (retained_bytes > MAX_RETAINED_BYTES ||
         requested_bytes > MAX_RETAINED_BYTES - retained_bytes)
       return std::unexpected("memory scan retained-state budget exceeded");
-    if (m_worker.joinable())
-      m_worker.join();
-
     scan = std::make_shared<Scan>();
     scan->id = m_next_scan_id++;
     scan->config = config;
@@ -879,6 +965,14 @@ DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
 std::expected<MemoryScanJobAccepted, std::string>
 DapMemoryEngine::RefineScan(const MemoryScanRefineConfig& config)
 {
+  {
+    std::lock_guard lock(m_mutex);
+    if (m_job_active)
+      return std::unexpected("another memory scan job is active");
+  }
+  if (!ReapWorker())
+    return std::unexpected("memory scans cannot be refined from a terminal callback");
+
   std::shared_ptr<Scan> scan;
   std::shared_ptr<const Generation> previous;
   int job_id = 0;
@@ -891,8 +985,6 @@ DapMemoryEngine::RefineScan(const MemoryScanRefineConfig& config)
     const auto it = m_scans.find(config.scan_id);
     if (it == m_scans.end())
       return std::unexpected("no such memory scan");
-    if (m_worker.joinable())
-      m_worker.join();
     scan = it->second;
     {
       std::lock_guard scan_lock(scan->mutex);
@@ -902,6 +994,13 @@ DapMemoryEngine::RefineScan(const MemoryScanRefineConfig& config)
       if (const std::optional<std::string> error = ValidateFilter(
               scan->config.data_type, config.filter, config.value, config.value2, true))
         return std::unexpected(*error);
+      if (scan->config.data_type == MemoryScanDataType::PpcInstruction &&
+          (config.filter == MemoryScanFilter::Mnemonic ||
+           config.filter == MemoryScanFilter::ValidInstruction) &&
+          previous->result_count > MAX_PPC_DISASSEMBLY_WORK)
+      {
+        return std::unexpected("PPC instruction scan exceeds the decoding-work limit");
+      }
       if (scan->config.data_type == MemoryScanDataType::Bytes &&
           (config.filter == MemoryScanFilter::Exact || config.filter == MemoryScanFilter::NotEqual))
       {
@@ -934,13 +1033,7 @@ DapMemoryEngine::RefineScan(const MemoryScanRefineConfig& config)
     if (!ranges)
       return std::unexpected(ranges.error());
     const u64 requested_bytes = CalculateGenerationBytes(scan->config, *ranges);
-    const Generation* evicted_generation = nullptr;
-    {
-      std::lock_guard scan_lock(scan->mutex);
-      if (scan->undo_generations.size() == MAX_UNDO_GENERATIONS)
-        evicted_generation = scan->undo_generations.front().get();
-    }
-    const u64 retained_bytes = CalculateRetainedBytesLocked(evicted_generation);
+    const u64 retained_bytes = CalculateRetainedBytesLocked();
     if (retained_bytes > MAX_RETAINED_BYTES ||
         requested_bytes > MAX_RETAINED_BYTES - retained_bytes)
       return std::unexpected("memory scan retained-state budget exceeded");
@@ -966,9 +1059,11 @@ void DapMemoryEngine::StartWorker(std::shared_ptr<Scan> scan, int job_id, Memory
                                   std::optional<std::string> value2, bool pause_during_scan,
                                   std::shared_ptr<const Generation> previous)
 {
+  std::lock_guard lock(m_worker_mutex);
   m_worker = std::thread([this, scan = std::move(scan), job_id, filter, value = std::move(value),
                           value2 = std::move(value2), pause_during_scan,
                           previous = std::move(previous)]() mutable {
+    s_memory_scan_worker = this;
     RunWorker(std::move(scan), job_id, filter, std::move(value), std::move(value2),
               pause_during_scan, std::move(previous));
   });
@@ -1141,7 +1236,6 @@ void DapMemoryEngine::FinishWorker(const std::shared_ptr<Scan>& scan, int job_id
       scan->phase = "failed";
     }
   }
-  m_terminal_callback(std::move(terminal));
   {
     std::lock_guard lock(m_mutex);
     if (m_active_scan_id == scan->id && scan->current_job_id == job_id)
@@ -1150,6 +1244,8 @@ void DapMemoryEngine::FinishWorker(const std::shared_ptr<Scan>& scan, int job_id
       m_active_scan_id = 0;
     }
   }
+  TerminalCallback callback = m_terminal_callback;
+  callback(std::move(terminal));
 }
 
 std::optional<MemoryScanStatus> DapMemoryEngine::GetStatus(int scan_id) const
@@ -1214,36 +1310,52 @@ std::expected<MemoryScanResultPage, std::string> DapMemoryEngine::GetResults(int
   count =
       std::min<u32>(count, static_cast<u32>(std::max<u64>(1, MAX_RESULT_PAGE_RAW_BYTES / width)));
   const u32 stride = aligned ? width : 1;
-  u64 seen = 0;
-  for (const SnapshotRange& range : *generation->ranges)
+  const auto block_it =
+      std::upper_bound(generation->result_index.begin(), generation->result_index.end(), start);
+  const size_t block = static_cast<size_t>(std::prev(block_it) - generation->result_index.begin());
+  u64 seen = generation->result_index[block];
+  u64 global = static_cast<u64>(block) * RESULT_INDEX_BLOCK_BYTES * 8;
+  size_t range_index = 0;
+  while (range_index < generation->ranges->size() &&
+         global >= (*generation->ranges)[range_index].first_candidate +
+                       (*generation->ranges)[range_index].candidate_count)
   {
-    for (u64 local = 0; local < range.candidate_count; ++local)
+    ++range_index;
+  }
+  for (; global < generation->candidates.size() * 8; ++global)
+  {
+    if (!GetBit(generation->candidates, global))
+      continue;
+    if (seen++ < start)
+      continue;
+    while (range_index < generation->ranges->size() &&
+           global >= (*generation->ranges)[range_index].first_candidate +
+                         (*generation->ranges)[range_index].candidate_count)
     {
-      const u64 global = range.first_candidate + local;
-      if (!GetBit(generation->candidates, global))
-        continue;
-      if (seen++ < start)
-        continue;
-
-      const size_t offset = range.candidate_offset + static_cast<size_t>(local * stride);
-      MemoryScanResult& result = page.results.emplace_back();
-      result.address = range.start + static_cast<u32>(offset);
-      if (data_type != MemoryScanDataType::Bytes && data_type != MemoryScanDataType::String)
-        result.scanned_value = FormatValue(data_type, range.bytes.data() + offset);
-      result.raw.assign(range.bytes.begin() + offset, range.bytes.begin() + offset + width);
-      if (data_type == MemoryScanDataType::Bytes)
-        result.scanned_value = Json::Base64Encode(result.raw);
-      else if (data_type == MemoryScanDataType::String)
-        result.scanned_value = UTF16ToUTF8(UTF8ToUTF16(
-            std::string_view(reinterpret_cast<const char*>(result.raw.data()), result.raw.size())));
-      else if (data_type == MemoryScanDataType::PpcInstruction)
-      {
-        result.disassembly = Common::GekkoDisassembler::Disassemble(
-            ReadBigEndian<u32>(result.raw.data()), result.address);
-      }
-      if (page.results.size() == count)
-        return page;
+      ++range_index;
     }
+    if (range_index == generation->ranges->size())
+      break;
+    const SnapshotRange& range = (*generation->ranges)[range_index];
+    const u64 local = global - range.first_candidate;
+    const size_t offset = range.candidate_offset + static_cast<size_t>(local * stride);
+    MemoryScanResult& result = page.results.emplace_back();
+    result.address = range.start + static_cast<u32>(offset);
+    if (data_type != MemoryScanDataType::Bytes && data_type != MemoryScanDataType::String)
+      result.scanned_value = FormatValue(data_type, range.bytes.data() + offset);
+    result.raw.assign(range.bytes.begin() + offset, range.bytes.begin() + offset + width);
+    if (data_type == MemoryScanDataType::Bytes)
+      result.scanned_value = Json::Base64Encode(result.raw);
+    else if (data_type == MemoryScanDataType::String)
+      result.scanned_value = UTF16ToUTF8(UTF8ToUTF16(
+          std::string_view(reinterpret_cast<const char*>(result.raw.data()), result.raw.size())));
+    else if (data_type == MemoryScanDataType::PpcInstruction)
+    {
+      result.disassembly = Common::GekkoDisassembler::Disassemble(
+          ReadBigEndian<u32>(result.raw.data()), result.address);
+    }
+    if (page.results.size() == count)
+      return page;
   }
   return page;
 }
@@ -1324,14 +1436,15 @@ DapMemoryEngine::RemoveResults(int scan_id, const std::vector<u32>& addresses)
                                     !scan->undo_generations.empty()};
   }
 
-  const Generation* evicted_generation = scan->undo_generations.size() == MAX_UNDO_GENERATIONS ?
-                                             scan->undo_generations.front().get() :
-                                             nullptr;
   scan_lock.unlock();
-  const u64 retained_bytes = CalculateRetainedBytesLocked(evicted_generation);
+  const u64 retained_bytes = CalculateRetainedBytesLocked();
   scan_lock.lock();
   const u64 candidate_bytes = scan->generation->candidates.size();
-  if (retained_bytes > MAX_RETAINED_BYTES || candidate_bytes > MAX_RETAINED_BYTES - retained_bytes)
+  const u64 index_bytes =
+      ((candidate_bytes + RESULT_INDEX_BLOCK_BYTES - 1) / RESULT_INDEX_BLOCK_BYTES + 1) *
+      sizeof(u64);
+  const u64 generation_bytes = candidate_bytes + index_bytes;
+  if (retained_bytes > MAX_RETAINED_BYTES || generation_bytes > MAX_RETAINED_BYTES - retained_bytes)
   {
     return std::unexpected("memory scan retained-state budget exceeded");
   }
@@ -1343,6 +1456,7 @@ DapMemoryEngine::RemoveResults(int scan_id, const std::vector<u32>& addresses)
   for (const u64 global : candidates_to_remove)
     ClearBit(generation->candidates, global);
   generation->result_count -= candidates_to_remove.size();
+  BuildResultIndex(generation.get());
   const u64 removed_count = candidates_to_remove.size();
   generation->number = scan->next_generation_number++;
   if (scan->undo_generations.size() == MAX_UNDO_GENERATIONS)
@@ -1414,7 +1528,11 @@ u64 DapMemoryEngine::CalculateGenerationBytes(const MemoryScanStartConfig& confi
     if (range.size >= offset + width)
       candidate_count += (range.size - offset - width) / stride + 1;
   }
-  return snapshot_bytes + (candidate_count + 7) / 8;
+  const u64 candidate_bytes = (candidate_count + 7) / 8;
+  const u64 index_bytes =
+      ((candidate_bytes + RESULT_INDEX_BLOCK_BYTES - 1) / RESULT_INDEX_BLOCK_BYTES + 1) *
+      sizeof(u64);
+  return snapshot_bytes + candidate_bytes + index_bytes;
 }
 
 u64 DapMemoryEngine::CalculateRetainedBytesLocked(const Generation* excluded_generation) const
@@ -1430,6 +1548,7 @@ u64 DapMemoryEngine::CalculateRetainedBytesLocked(const Generation* excluded_gen
           !generations.insert(generation.get()).second)
         return;
       retained_bytes += generation->candidates.size();
+      retained_bytes += generation->result_index.size() * sizeof(u64);
       if (generation->ranges && snapshots.insert(generation->ranges.get()).second)
       {
         for (const SnapshotRange& range : *generation->ranges)
@@ -1443,9 +1562,30 @@ u64 DapMemoryEngine::CalculateRetainedBytesLocked(const Generation* excluded_gen
   return retained_bytes;
 }
 
-void DapMemoryEngine::ReapWorker()
+void DapMemoryEngine::BuildResultIndex(Generation* generation)
 {
-  if (m_worker.joinable() && !HasActiveJob())
+  const size_t block_count =
+      (generation->candidates.size() + RESULT_INDEX_BLOCK_BYTES - 1) / RESULT_INDEX_BLOCK_BYTES;
+  generation->result_index.assign(block_count + 1, 0);
+  u64 count = 0;
+  for (size_t block = 0; block < block_count; ++block)
+  {
+    generation->result_index[block] = count;
+    const size_t begin = block * RESULT_INDEX_BLOCK_BYTES;
+    const size_t end = std::min(begin + RESULT_INDEX_BLOCK_BYTES, generation->candidates.size());
+    for (size_t i = begin; i < end; ++i)
+      count += std::popcount(generation->candidates[i]);
+  }
+  generation->result_index[block_count] = count;
+}
+
+bool DapMemoryEngine::ReapWorker()
+{
+  if (s_memory_scan_worker == this)
+    return false;
+  std::lock_guard lock(m_worker_mutex);
+  if (m_worker.joinable())
     m_worker.join();
+  return true;
 }
 }  // namespace DAP

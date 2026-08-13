@@ -19,6 +19,9 @@ using DAP::MemoryScanFilter;
 
 constexpr size_t MAX_BYTE_PATTERN_SIZE = 4096;
 constexpr size_t MAX_ENCODED_BYTE_PATTERN_SIZE = ((MAX_BYTE_PATTERN_SIZE + 2) / 3) * 4;
+constexpr size_t MAX_SCAN_RANGES = 1024;
+constexpr size_t MAX_SCAN_REGIONS = 3;
+constexpr size_t MAX_NUMERIC_VALUE_LENGTH = 128;
 
 std::optional<std::vector<u8>> DecodeBytePattern(std::string_view value)
 {
@@ -789,6 +792,13 @@ std::optional<MemoryScanStartConfig> ParseMemoryScanStart(const picojson::object
   result.filter = *filter;
   result.value = ReadStringFromJson(arguments, "value");
   result.value2 = ReadStringFromJson(arguments, "value2");
+  if (((result.data_type != MemoryScanDataType::Bytes &&
+        result.data_type != MemoryScanDataType::String) &&
+       result.value && result.value->size() > MAX_NUMERIC_VALUE_LENGTH) ||
+      (result.value2 && result.value2->size() > MAX_NUMERIC_VALUE_LENGTH))
+  {
+    return std::nullopt;
+  }
   result.aligned = ReadBoolFromJson(arguments, "aligned").value_or(true);
   result.pause_during_scan = ReadBoolFromJson(arguments, "pauseDuringScan").value_or(false);
   if (result.data_type != MemoryScanDataType::String &&
@@ -830,6 +840,8 @@ std::optional<MemoryScanStartConfig> ParseMemoryScanStart(const picojson::object
     return std::nullopt;
   if (regions != nullptr)
   {
+    if (regions->size() > MAX_SCAN_REGIONS)
+      return std::nullopt;
     for (const picojson::value& region : *regions)
     {
       if (!region.is<std::string>())
@@ -843,6 +855,8 @@ std::optional<MemoryScanStartConfig> ParseMemoryScanStart(const picojson::object
     return std::nullopt;
   if (ranges != nullptr)
   {
+    if (ranges->size() > MAX_SCAN_RANGES)
+      return std::nullopt;
     for (const picojson::value& range_value : *ranges)
     {
       if (!range_value.is<picojson::object>())
@@ -883,6 +897,11 @@ std::optional<MemoryScanRefineConfig> ParseMemoryScanRefine(const picojson::obje
   result.filter = *filter;
   result.value = ReadStringFromJson(arguments, "value");
   result.value2 = ReadStringFromJson(arguments, "value2");
+  if ((result.value && result.value->size() > MAX_ENCODED_BYTE_PATTERN_SIZE) ||
+      (result.value2 && result.value2->size() > MAX_ENCODED_BYTE_PATTERN_SIZE))
+  {
+    return std::nullopt;
+  }
   result.pause_during_scan = ReadBoolFromJson(arguments, "pauseDuringScan");
   return result;
 }

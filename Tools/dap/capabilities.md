@@ -630,6 +630,8 @@ Initial filters are `exact`, `notEqual`, `between`, `greaterThan`,
 `greaterOrEqual`, `lessThan`, `lessOrEqual`, and `unknown`.
 Ranges are half-open (`[start,end)`). Omitted or empty `regions` selects MEM1;
 explicit ranges must be wholly contained in one of the selected regions.
+Adjacent ranges in the same region are treated as one continuous range, and
+requests are limited to 1024 ranges and three unique region IDs.
 
 `dataType:"bytes"` performs a fixed-width raw pattern scan. `value` is canonical
 base64 containing 1 to 4096 bytes. Initial filters are `exact` and `notEqual`;
@@ -657,6 +659,7 @@ Gekko execution tables and accepted by the canonical disassembler). Refinements
 also support raw-word `changed` and `unchanged`. Results include the word as
 `scannedValue`, exact bytes in `raw`, and canonical address-aware Gekko
 `disassembly`. The type always enforces 4-byte alignment.
+Mnemonic and validity scans are limited to 4,194,304 instruction candidates.
 
 ```jsonc
 {"command":"dolphin_memoryScanStart", "arguments":{
@@ -759,8 +762,9 @@ the generation has already entered its atomic commit.
 Limits: one active scan job per DAP session, eight retained scans, 256 MiB of
 snapshot plus candidate state per session, 256 MiB of snapshot input per job,
 non-overlapping ranges, at most 1 GiB of estimated byte-pattern comparison
-work, and 4096 results per page. Wide byte-pattern result pages are reduced to
-at most 1 MiB of raw result bytes, so fewer than the requested count may return.
+work, 128-byte numeric literals, and 4096 results per page. Wide byte-pattern
+result pages are reduced to at most 1 MiB of raw result bytes, so fewer than the
+requested count may return.
 
 ## `dolphin_memoryScanUndo`
 
@@ -778,7 +782,8 @@ Generation numbers identify immutable states and are not reused. Undo restores
 the original generation number; the next refinement or removal receives a new,
 larger number. Refinement generations retain their snapshots and candidate
 bitmaps; removal generations share snapshots but retain their own bitmaps.
-Budget admission uses the retained set after any 16-generation history eviction.
+Budget admission counts the complete live retained set plus the in-flight
+generation, before any 16-generation history eviction.
 
 ## `dolphin_memoryScanRemoveResults`
 

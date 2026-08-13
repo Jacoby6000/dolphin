@@ -377,6 +377,35 @@ private:
           Protocol::Serialize(Protocol::MakeEvent(m_next_seq++, event, std::move(body))));
   }
 
+  void FlushEventsThroughPriorMemoryScanTerminal(int job_id)
+  {
+    std::vector<std::pair<std::string, picojson::object>> events;
+    {
+      std::lock_guard lock(m_event_mutex);
+      size_t count = 0;
+      for (size_t i = 0; i < m_pending_events.size(); ++i)
+      {
+        const auto& [event, body] = m_pending_events[i];
+        const bool terminal = event == "dolphin_memoryScanCompleted" ||
+                              event == "dolphin_memoryScanFailed" ||
+                              event == "dolphin_memoryScanCancelled";
+        const auto body_job = body.find("jobId");
+        if (terminal && body_job != body.end() && body_job->second.is<double>() &&
+            body_job->second.get<double>() < job_id)
+        {
+          count = i + 1;
+        }
+      }
+      events.reserve(count);
+      for (size_t i = 0; i < count; ++i)
+        events.emplace_back(std::move(m_pending_events[i]));
+      m_pending_events.erase(m_pending_events.begin(), m_pending_events.begin() + count);
+    }
+    for (auto& [event, body] : events)
+      m_transport.WriteMessage(
+          Protocol::Serialize(Protocol::MakeEvent(m_next_seq++, event, std::move(body))));
+  }
+
   void SendStoppedEvent(std::string_view reason)
   {
     // DESNOTE(jbarber, 2026-07-21): Drop any stashed stop reason so a later
@@ -1357,12 +1386,14 @@ private:
         Protocol::ParseMemoryScanStart(request.arguments);
     if (!arguments)
     {
+      FlushEvents();
       RespondError(request.seq, request.command, "invalid memory scan arguments");
       return;
     }
     const auto accepted = m_memory_engine->StartScan(*arguments);
     if (!accepted)
     {
+      FlushEvents();
       RespondError(request.seq, request.command, accepted.error());
       return;
     }
@@ -1371,6 +1402,7 @@ private:
     body.emplace("jobId", static_cast<double>(accepted->job_id));
     body.emplace("state", std::string("running"));
     body.emplace("pauseDuringScan", accepted->pause_during_scan);
+    FlushEventsThroughPriorMemoryScanTerminal(accepted->job_id);
     Respond(request.seq, request.command, std::move(body));
   }
 
@@ -1380,12 +1412,14 @@ private:
         Protocol::ParseMemoryScanRefine(request.arguments);
     if (!arguments)
     {
+      FlushEvents();
       RespondError(request.seq, request.command, "invalid memory scan refinement arguments");
       return;
     }
     const auto accepted = m_memory_engine->RefineScan(*arguments);
     if (!accepted)
     {
+      FlushEvents();
       RespondError(request.seq, request.command, accepted.error());
       return;
     }
@@ -1394,6 +1428,7 @@ private:
     body.emplace("jobId", static_cast<double>(accepted->job_id));
     body.emplace("state", std::string("running"));
     body.emplace("pauseDuringScan", accepted->pause_during_scan);
+    FlushEventsThroughPriorMemoryScanTerminal(accepted->job_id);
     Respond(request.seq, request.command, std::move(body));
   }
 

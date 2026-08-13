@@ -413,6 +413,35 @@ TEST_F(DapSessionTest, MemoryScanRefineNotifiesWithoutStatusPolling)
   EXPECT_EQ(body.at("resultCount").get<double>(), 1.0);
 }
 
+TEST_F(DapSessionTest, MemoryScanTerminalEventPrecedesNextJobResponse)
+{
+  TestClient client(m_client_fd());
+  Handshake(client);
+  client.Send(R"({
+    "seq":33,"type":"request","command":"dolphin_memoryScanStart",
+    "arguments":{"ranges":[{"start":"0x80004000","end":"0x80004004"}],
+      "dataType":"u32","filter":"unknown","pauseDuringScan":true}
+  })");
+  const auto accepted = client.Receive();
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_TRUE(accepted->at("success").get<bool>());
+  const int scan_id =
+      static_cast<int>(accepted->at("body").get<picojson::object>().at("scanId").get<double>());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  client.Send(fmt::format(
+      R"({{"seq":34,"type":"request","command":"dolphin_memoryScanRefine",
+           "arguments":{{"scanId":{},"filter":"unchanged"}}}})",
+      scan_id));
+  const auto completed = client.Receive();
+  ASSERT_TRUE(completed.has_value());
+  EXPECT_EQ(completed->at("event").to_str(), "dolphin_memoryScanCompleted");
+  const auto refined = client.Receive();
+  ASSERT_TRUE(refined.has_value());
+  EXPECT_EQ(refined->at("type").to_str(), "response");
+  EXPECT_TRUE(refined->at("success").get<bool>());
+}
+
 TEST_F(DapSessionTest, MemoryScanReturnsBytePatternResult)
 {
   TestClient client(m_client_fd());

@@ -219,6 +219,26 @@ TEST(DapProtocol, ParseMemoryScanRejectsMalformedOptionalFields)
                    .has_value());
 }
 
+TEST(DapProtocol, ParseMemoryScanCapsMetadata)
+{
+  picojson::object arguments =
+      ParseObjectOrDie(R"({"dataType":"u8","filter":"exact","value":"1"})");
+  arguments["value"] = picojson::value(std::string(129, '1'));
+  EXPECT_FALSE(Protocol::ParseMemoryScanStart(arguments).has_value());
+
+  arguments = ParseObjectOrDie(R"({"dataType":"u8","filter":"unknown"})");
+  picojson::array ranges;
+  const picojson::object range = ParseObjectOrDie(R"({"start":"0x80004000","end":"0x80004001"})");
+  for (size_t i = 0; i < 1025; ++i)
+    ranges.emplace_back(range);
+  arguments["ranges"] = picojson::value(std::move(ranges));
+  EXPECT_FALSE(Protocol::ParseMemoryScanStart(arguments).has_value());
+
+  picojson::object refine = ParseObjectOrDie(R"({"scanId":1,"filter":"exact","value":"1"})");
+  refine["value"] = picojson::value(std::string(5465, '1'));
+  EXPECT_FALSE(Protocol::ParseMemoryScanRefine(refine).has_value());
+}
+
 TEST(DapProtocol, ParseMemoryScanRemoveResults)
 {
   const auto arguments = Protocol::ParseMemoryScanRemoveResults(
