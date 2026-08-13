@@ -17,6 +17,22 @@ namespace
 using DAP::MemoryScanDataType;
 using DAP::MemoryScanFilter;
 
+constexpr size_t MAX_BYTE_PATTERN_SIZE = 4096;
+constexpr size_t MAX_ENCODED_BYTE_PATTERN_SIZE = ((MAX_BYTE_PATTERN_SIZE + 2) / 3) * 4;
+
+std::optional<std::vector<u8>> DecodeBytePattern(std::string_view value)
+{
+  if (value.empty() || value.size() > MAX_ENCODED_BYTE_PATTERN_SIZE)
+    return std::nullopt;
+  const std::optional<std::vector<u8>> decoded = Json::Base64Decode(value);
+  if (!decoded || decoded->empty() || decoded->size() > MAX_BYTE_PATTERN_SIZE ||
+      Json::Base64Encode(*decoded) != value)
+  {
+    return std::nullopt;
+  }
+  return decoded;
+}
+
 const picojson::object* GetObject(const picojson::object& obj, const std::string& key)
 {
   const auto it = obj.find(key);
@@ -144,6 +160,8 @@ std::optional<DAP::MemoryScanDataType> ParseMemoryScanDataType(std::string_view 
     return MemoryScanDataType::F32;
   if (type == "f64")
     return MemoryScanDataType::F64;
+  if (type == "bytes")
+    return MemoryScanDataType::Bytes;
   return std::nullopt;
 }
 
@@ -763,6 +781,15 @@ std::optional<MemoryScanStartConfig> ParseMemoryScanStart(const picojson::object
   result.value2 = ReadStringFromJson(arguments, "value2");
   result.aligned = ReadBoolFromJson(arguments, "aligned").value_or(true);
   result.pause_during_scan = ReadBoolFromJson(arguments, "pauseDuringScan").value_or(false);
+  if (result.data_type == MemoryScanDataType::Bytes)
+  {
+    if (!result.value)
+      return std::nullopt;
+    const std::optional<std::vector<u8>> decoded = DecodeBytePattern(*result.value);
+    if (!decoded)
+      return std::nullopt;
+    result.byte_value = *decoded;
+  }
 
   const picojson::array* regions = GetArray(arguments, "regions");
   if (arguments.contains("regions") && regions == nullptr)
@@ -823,6 +850,12 @@ std::optional<MemoryScanRefineConfig> ParseMemoryScanRefine(const picojson::obje
   result.value = ReadStringFromJson(arguments, "value");
   result.value2 = ReadStringFromJson(arguments, "value2");
   result.pause_during_scan = ReadBoolFromJson(arguments, "pauseDuringScan");
+  if (result.value)
+  {
+    const std::optional<std::vector<u8>> decoded = DecodeBytePattern(*result.value);
+    if (decoded)
+      result.byte_value = *decoded;
+  }
   return result;
 }
 

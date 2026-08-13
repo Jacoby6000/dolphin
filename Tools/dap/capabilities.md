@@ -623,12 +623,21 @@ GameCube exposes MEM1 and ARAM; Wii exposes MEM1 and MEM2 when initialized.
 
 ## `dolphin_memoryScanStart`
 
-Starts an asynchronous typed numeric scan. Supported `dataType` values are
-`u8`, `u16`, `u32`, `u64`, `s8`, `s16`, `s32`, `s64`, `f32`, and `f64`.
+Starts an asynchronous typed scan. Supported `dataType` values are `u8`, `u16`,
+`u32`, `u64`, `s8`, `s16`, `s32`, `s64`, `f32`, `f64`, and `bytes`.
 Initial filters are `exact`, `notEqual`, `between`, `greaterThan`,
 `greaterOrEqual`, `lessThan`, `lessOrEqual`, and `unknown`.
 Ranges are half-open (`[start,end)`). Omitted or empty `regions` selects MEM1;
 explicit ranges must be wholly contained in one of the selected regions.
+
+`dataType:"bytes"` performs a fixed-width raw pattern scan. `value` is canonical
+base64 containing 1 to 4096 bytes. Initial filters are `exact` and `notEqual`;
+refinements also support `changed` and `unchanged`. Exact/not-equal refinements
+must provide a base64 value with the original width. With `aligned:true`, the
+pattern width is the stride; with `false`, overlapping matches are possible.
+Byte results return the current pattern as base64 in both `scannedValue` and
+`raw`. Aligned candidates are anchored to absolute addresses where
+`address % width == 0`. A changed byte can affect multiple overlapping windows.
 
 ```jsonc
 {"command":"dolphin_memoryScanStart", "arguments":{
@@ -730,7 +739,9 @@ the generation has already entered its atomic commit.
 
 Limits: one active scan job per DAP session, eight retained scans, 256 MiB of
 snapshot plus candidate state per session, 256 MiB of snapshot input per job,
-non-overlapping ranges, and 4096 results per page.
+non-overlapping ranges, at most 1 GiB of estimated byte-pattern comparison
+work, and 4096 results per page. Wide byte-pattern result pages are reduced to
+at most 1 MiB of raw result bytes, so fewer than the requested count may return.
 
 ## `dolphin_memoryScanUndo`
 

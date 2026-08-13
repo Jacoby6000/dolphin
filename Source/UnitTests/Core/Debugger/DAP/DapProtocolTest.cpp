@@ -97,6 +97,31 @@ TEST(DapProtocol, ParseMemoryScanStartDefaultsPauseAndAlignment)
   EXPECT_TRUE(scan->regions.empty());
 }
 
+TEST(DapProtocol, ParseMemoryScanBytesDecodesPattern)
+{
+  const auto scan = Protocol::ParseMemoryScanStart(ParseObjectOrDie(
+      R"({"dataType":"bytes","filter":"exact","value":"3q2+7w=="})"));
+  ASSERT_TRUE(scan.has_value());
+  EXPECT_EQ(scan->data_type, MemoryScanDataType::Bytes);
+  EXPECT_EQ(scan->byte_value, (std::vector<u8>{0xde, 0xad, 0xbe, 0xef}));
+
+  EXPECT_FALSE(Protocol::ParseMemoryScanStart(
+                   ParseObjectOrDie(R"({"dataType":"bytes","filter":"exact"})"))
+                   .has_value());
+  EXPECT_FALSE(Protocol::ParseMemoryScanStart(ParseObjectOrDie(
+                   R"({"dataType":"bytes","filter":"exact","value":"bad"})"))
+                   .has_value());
+  EXPECT_FALSE(Protocol::ParseMemoryScanStart(ParseObjectOrDie(
+                   R"({"dataType":"bytes","filter":"exact","value":"3q2+7w== "})"))
+                   .has_value());
+
+  const auto refine = Protocol::ParseMemoryScanRefine(
+      ParseObjectOrDie(R"({"scanId":1,"filter":"exact","value":"qrs="})"));
+  ASSERT_TRUE(refine.has_value());
+  ASSERT_TRUE(refine->byte_value.has_value());
+  EXPECT_EQ(*refine->byte_value, (std::vector<u8>{0xaa, 0xbb}));
+}
+
 TEST(DapProtocol, ParseMemoryScanStartRejectsUnknownTypeOrFilter)
 {
   EXPECT_FALSE(

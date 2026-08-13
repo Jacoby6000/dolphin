@@ -39,6 +39,7 @@ enum class MemoryScanDataType
   S64,
   F32,
   F64,
+  Bytes,
 };
 
 enum class MemoryScanFilter
@@ -73,6 +74,7 @@ struct MemoryScanStartConfig
   MemoryScanFilter filter = MemoryScanFilter::Unknown;
   std::optional<std::string> value;
   std::optional<std::string> value2;
+  std::vector<u8> byte_value;
   bool aligned = true;
   bool pause_during_scan = false;
 };
@@ -83,6 +85,7 @@ struct MemoryScanRefineConfig
   MemoryScanFilter filter = MemoryScanFilter::Changed;
   std::optional<std::string> value;
   std::optional<std::string> value2;
+  std::optional<std::vector<u8>> byte_value;
   std::optional<bool> pause_during_scan;
 };
 
@@ -244,7 +247,7 @@ private:
   u64 CalculateGenerationBytes(const MemoryScanStartConfig& config,
                                const std::vector<ResolvedRange>& ranges) const;
 
-  static u32 DataTypeSize(MemoryScanDataType data_type);
+  static u32 DataTypeSize(const MemoryScanStartConfig& config);
   static std::optional<NumericValue> ParseValue(MemoryScanDataType data_type,
                                                 std::string_view value);
   static std::optional<std::string> ValidateFilter(MemoryScanDataType data_type,

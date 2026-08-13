@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 
 #include "Core/Core.h"
+#include "Core/Debugger/DAP/DapJson.h"
 #include "Core/HW/DSP.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
@@ -27,8 +28,10 @@ namespace
 {
 constexpr u32 ARAM_BASE_ADDRESS = 0x7e000000;
 constexpr u32 MAX_RESULT_PAGE_SIZE = 4096;
+constexpr u64 MAX_RESULT_PAGE_RAW_BYTES = 1ull << 20;
 constexpr u64 MAX_SNAPSHOT_BYTES = 256ull << 20;
 constexpr u64 MAX_RETAINED_BYTES = 256ull << 20;
+constexpr u64 MAX_BYTE_COMPARISON_WORK = 1ull << 30;
 constexpr int MAX_SCANS = 8;
 constexpr size_t MAX_UNDO_GENERATIONS = 16;
 
@@ -373,9 +376,9 @@ DapMemoryEngine::CaptureSnapshot(const std::vector<ResolvedRange>& ranges,
   return snapshot;
 }
 
-u32 DapMemoryEngine::DataTypeSize(MemoryScanDataType data_type)
+u32 DapMemoryEngine::DataTypeSize(const MemoryScanStartConfig& config)
 {
-  switch (data_type)
+  switch (config.data_type)
   {
   case MemoryScanDataType::U8:
   case MemoryScanDataType::S8:
@@ -391,6 +394,8 @@ u32 DapMemoryEngine::DataTypeSize(MemoryScanDataType data_type)
   case MemoryScanDataType::S64:
   case MemoryScanDataType::F64:
     return 8;
+  case MemoryScanDataType::Bytes:
+    return static_cast<u32>(config.byte_value.size());
   }
   return 1;
 }
@@ -415,6 +420,8 @@ DapMemoryEngine::ParseValue(MemoryScanDataType data_type, std::string_view value
     PARSE_CASE(S64, s64);
     PARSE_CASE(F32, float);
     PARSE_CASE(F64, double);
+  case MemoryScanDataType::Bytes:
+    return std::nullopt;
   }
 #undef PARSE_CASE
   return std::nullopt;
@@ -428,6 +435,21 @@ std::optional<std::string> DapMemoryEngine::ValidateFilter(MemoryScanDataType da
 {
   if (!has_previous && IsPreviousValueFilter(filter))
     return "this filter requires a previous scan generation";
+  if (data_type == MemoryScanDataType::Bytes)
+  {
+    if (filter != MemoryScanFilter::Exact && filter != MemoryScanFilter::NotEqual &&
+        filter != MemoryScanFilter::Changed && filter != MemoryScanFilter::Unchanged)
+    {
+      return "this filter is unsupported for byte-pattern scans";
+    }
+    if ((filter == MemoryScanFilter::Exact || filter == MemoryScanFilter::NotEqual) && !value)
+      return "this byte-pattern filter requires value";
+    if ((filter == MemoryScanFilter::Changed || filter == MemoryScanFilter::Unchanged) && value)
+      return "this byte-pattern filter does not accept value";
+    if (value2)
+      return "byte-pattern scans do not support value2";
+    return std::nullopt;
+  }
   if (NeedsValue(filter) && !value)
     return "this filter requires value";
   if (filter == MemoryScanFilter::Between && !value2)
@@ -456,6 +478,8 @@ std::string DapMemoryEngine::FormatValue(MemoryScanDataType data_type, const u8*
     FORMAT_CASE(S64, s64);
     FORMAT_CASE(F32, float);
     FORMAT_CASE(F64, double);
+  case MemoryScanDataType::Bytes:
+    return {};
   }
 #undef FORMAT_CASE
   return {};
@@ -472,14 +496,35 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
           ValidateFilter(scan.config.data_type, filter, value, value2, previous != nullptr))
     return std::unexpected(*error);
 
-  const std::optional<NumericValue> parsed_value =
-      value ? ParseValue(scan.config.data_type, *value) : NumericValue{u8{0}};
-  const std::optional<NumericValue> parsed_value2 =
-      value2 ? ParseValue(scan.config.data_type, *value2) : NumericValue{u8{0}};
-  if (!parsed_value || !parsed_value2)
-    return std::unexpected("invalid numeric scan value");
+  std::optional<NumericValue> parsed_value;
+  std::optional<NumericValue> parsed_value2;
+  if (scan.config.data_type != MemoryScanDataType::Bytes)
+  {
+    parsed_value = value ? ParseValue(scan.config.data_type, *value) : NumericValue{u8{0}};
+    parsed_value2 = value2 ? ParseValue(scan.config.data_type, *value2) : NumericValue{u8{0}};
+    if (!parsed_value || !parsed_value2)
+      return std::unexpected("invalid numeric scan value");
+  }
 
-  const u32 width = DataTypeSize(scan.config.data_type);
+  std::vector<u8> byte_target;
+  if (scan.config.data_type == MemoryScanDataType::Bytes &&
+      (filter == MemoryScanFilter::Exact || filter == MemoryScanFilter::NotEqual))
+  {
+    if (previous)
+    {
+      const std::optional<std::vector<u8>> decoded =
+          value ? Json::Base64Decode(*value) : std::nullopt;
+      if (!decoded || decoded->size() != scan.config.byte_value.size())
+        return std::unexpected("byte-pattern scan value must match the original pattern width");
+      byte_target = *decoded;
+    }
+    else
+    {
+      byte_target = scan.config.byte_value;
+    }
+  }
+
+  const u32 width = DataTypeSize(scan.config);
   const u32 stride = scan.config.aligned ? width : 1;
   auto generation = std::make_shared<Generation>();
   auto generation_ranges = std::make_shared<std::vector<SnapshotRange>>(std::move(snapshot));
@@ -527,6 +572,45 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
     return {};
   };
 
+  auto process_bytes = [&]() -> std::expected<void, std::string> {
+    const u64 cancellation_interval = std::max<u64>(1, (1u << 20) / width);
+    for (size_t range_index = 0; range_index < generation->ranges->size(); ++range_index)
+    {
+      const SnapshotRange& current_range = (*generation->ranges)[range_index];
+      const SnapshotRange* previous_range = previous ? &(*previous->ranges)[range_index] : nullptr;
+      for (u64 local = 0; local < current_range.candidate_count; ++local)
+      {
+        const u64 global = current_range.first_candidate + local;
+        if (local % cancellation_interval == 0 && cancelled.load())
+          return std::unexpected("cancelled");
+        if (previous && !GetBit(previous->candidates, global))
+          continue;
+        const size_t offset = current_range.candidate_offset + static_cast<size_t>(local * stride);
+        const u8* current = current_range.bytes.data() + offset;
+        bool matches = false;
+        if (filter == MemoryScanFilter::Exact || filter == MemoryScanFilter::NotEqual)
+        {
+          matches = std::ranges::equal(std::span(current, width), byte_target);
+          if (filter == MemoryScanFilter::NotEqual)
+            matches = !matches;
+        }
+        else
+        {
+          const u8* old = previous_range->bytes.data() + offset;
+          matches = std::ranges::equal(std::span(current, width), std::span(old, width));
+          if (filter == MemoryScanFilter::Changed)
+            matches = !matches;
+        }
+        if (matches)
+        {
+          SetBit(generation->candidates, global);
+          ++generation->result_count;
+        }
+      }
+    }
+    return {};
+  };
+
   std::expected<void, std::string> result;
   switch (scan.config.data_type)
   {
@@ -560,6 +644,9 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
   case MemoryScanDataType::F64:
     result = process.template operator()<double>();
     break;
+  case MemoryScanDataType::Bytes:
+    result = process_bytes();
+    break;
   }
   if (!result)
     return std::unexpected(result.error());
@@ -569,6 +656,16 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
 std::expected<MemoryScanJobAccepted, std::string>
 DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
 {
+  if (config.data_type == MemoryScanDataType::Bytes &&
+      (config.byte_value.empty() || config.byte_value.size() > 4096))
+  {
+    return std::unexpected("byte-pattern scan value must contain 1 to 4096 bytes");
+  }
+  if (config.data_type == MemoryScanDataType::Bytes &&
+      (!config.value || Json::Base64Encode(config.byte_value) != *config.value))
+  {
+    return std::unexpected("byte-pattern scan value is not canonical base64");
+  }
   const auto ranges = ResolveRanges(config);
   if (!ranges)
     return std::unexpected(ranges.error());
@@ -578,6 +675,19 @@ DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
           ValidateFilter(config.data_type, config.filter, config.value, config.value2, false))
     return std::unexpected(*error);
   const u64 requested_bytes = CalculateGenerationBytes(config, *ranges);
+  if (config.data_type == MemoryScanDataType::Bytes)
+  {
+    const u64 width = DataTypeSize(config);
+    const u64 candidate_bytes = requested_bytes - [&] {
+      u64 snapshot_bytes = 0;
+      for (const ResolvedRange& range : *ranges)
+        snapshot_bytes += range.size;
+      return snapshot_bytes;
+    }();
+    const u64 candidate_count = candidate_bytes * 8;
+    if (candidate_count > MAX_BYTE_COMPARISON_WORK / width)
+      return std::unexpected("byte-pattern scan exceeds the comparison-work limit");
+  }
 
   std::shared_ptr<Scan> scan;
   int job_id = 0;
@@ -619,6 +729,7 @@ DapMemoryEngine::RefineScan(const MemoryScanRefineConfig& config)
   std::shared_ptr<const Generation> previous;
   int job_id = 0;
   bool pause_during_scan = false;
+  std::optional<std::string> worker_value = config.value;
   {
     std::lock_guard lock(m_mutex);
     if (m_job_active)
@@ -637,6 +748,20 @@ DapMemoryEngine::RefineScan(const MemoryScanRefineConfig& config)
       if (const std::optional<std::string> error = ValidateFilter(
               scan->config.data_type, config.filter, config.value, config.value2, true))
         return std::unexpected(*error);
+      if (scan->config.data_type == MemoryScanDataType::Bytes &&
+          (config.filter == MemoryScanFilter::Exact ||
+           config.filter == MemoryScanFilter::NotEqual))
+      {
+        if (!config.value || !config.byte_value ||
+            config.byte_value->size() != scan->config.byte_value.size() ||
+            Json::Base64Encode(*config.byte_value) != *config.value)
+          return std::unexpected("byte-pattern scan value must match the original pattern width");
+        worker_value = Json::Base64Encode(*config.byte_value);
+      }
+      else if (scan->config.data_type == MemoryScanDataType::Bytes && config.byte_value)
+      {
+        return std::unexpected("this byte-pattern filter does not accept value");
+      }
       pause_during_scan = config.pause_during_scan.value_or(scan->config.pause_during_scan);
     }
     const auto ranges = ResolveRanges(scan->config);
@@ -665,7 +790,7 @@ DapMemoryEngine::RefineScan(const MemoryScanRefineConfig& config)
     m_active_scan_id = scan->id;
     m_cancelled.store(false);
   }
-  StartWorker(scan, job_id, config.filter, config.value, config.value2, pause_during_scan,
+  StartWorker(scan, job_id, config.filter, std::move(worker_value), config.value2, pause_during_scan,
               std::move(previous));
   return MemoryScanJobAccepted{scan->id, job_id, pause_during_scan};
 }
@@ -920,7 +1045,8 @@ std::expected<MemoryScanResultPage, std::string> DapMemoryEngine::GetResults(int
     return page;
   count = std::min(count, MAX_RESULT_PAGE_SIZE);
 
-  const u32 width = DataTypeSize(data_type);
+  const u32 width = DataTypeSize(scan->config);
+  count = std::min<u32>(count, static_cast<u32>(std::max<u64>(1, MAX_RESULT_PAGE_RAW_BYTES / width)));
   const u32 stride = aligned ? width : 1;
   u64 seen = 0;
   for (const SnapshotRange& range : *generation->ranges)
@@ -936,8 +1062,11 @@ std::expected<MemoryScanResultPage, std::string> DapMemoryEngine::GetResults(int
       const size_t offset = range.candidate_offset + static_cast<size_t>(local * stride);
       MemoryScanResult& result = page.results.emplace_back();
       result.address = range.start + static_cast<u32>(offset);
-      result.scanned_value = FormatValue(data_type, range.bytes.data() + offset);
+      if (data_type != MemoryScanDataType::Bytes)
+        result.scanned_value = FormatValue(data_type, range.bytes.data() + offset);
       result.raw.assign(range.bytes.begin() + offset, range.bytes.begin() + offset + width);
+      if (data_type == MemoryScanDataType::Bytes)
+        result.scanned_value = Json::Base64Encode(result.raw);
       if (page.results.size() == count)
         return page;
     }
@@ -982,7 +1111,7 @@ DapMemoryEngine::RemoveResults(int scan_id, const std::vector<u32>& addresses)
   if (!scan->generation)
     return std::unexpected("memory scan has no completed generation");
 
-  const u32 width = DataTypeSize(scan->config.data_type);
+  const u32 width = DataTypeSize(scan->config);
   const u32 stride = scan->config.aligned ? width : 1;
   std::vector<u64> candidates_to_remove;
   candidates_to_remove.reserve(addresses.size());
@@ -1102,7 +1231,7 @@ std::unique_lock<std::mutex> DapMemoryEngine::TryLockCoreScan()
 u64 DapMemoryEngine::CalculateGenerationBytes(
     const MemoryScanStartConfig& config, const std::vector<ResolvedRange>& ranges) const
 {
-  const u32 width = DataTypeSize(config.data_type);
+  const u32 width = DataTypeSize(config);
   const u32 stride = config.aligned ? width : 1;
   u64 snapshot_bytes = 0;
   u64 candidate_count = 0;

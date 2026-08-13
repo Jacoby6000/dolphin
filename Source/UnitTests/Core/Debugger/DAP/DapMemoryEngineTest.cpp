@@ -14,6 +14,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Core/Core.h"
+#include "Core/Debugger/DAP/DapJson.h"
 #include "Core/Debugger/DAP/DapMemoryEngine.h"
 #include "Core/HW/AddressSpace.h"
 #include "Core/HW/Memmap.h"
@@ -276,5 +277,93 @@ TEST_F(DapMemoryEngineTest, RemoveResultsAndUndoPreserveImmutableGenerations)
   ASSERT_TRUE(removed_again.has_value());
   EXPECT_EQ(removed_again->generation, 3u);
   EXPECT_EQ(removed_again->result_count, 3u);
+}
+
+TEST_F(DapMemoryEngineTest, BytePatternScanSupportsOverlapAndChangedRefinement)
+{
+  const std::vector<u8> bytes{0xaa, 0xaa, 0xaa, 0xbb};
+  WriteBytes(DATA_ADDRESS, bytes);
+  DAP::MemoryScanStartConfig config;
+  config.ranges.push_back({SCAN_ADDRESS, SCAN_ADDRESS + static_cast<u32>(bytes.size())});
+  config.data_type = DAP::MemoryScanDataType::Bytes;
+  config.filter = DAP::MemoryScanFilter::Exact;
+  config.value = "qqo=";
+  config.byte_value = {0xaa, 0xaa};
+  config.aligned = false;
+  config.pause_during_scan = true;
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_TRUE(accepted.has_value());
+  const auto completed = WaitForEvent(0);
+  ASSERT_TRUE(completed.has_value());
+  EXPECT_EQ(completed->result_count, 2u);
+
+  const auto page = m_engine->GetResults(accepted->scan_id, 0, 10);
+  ASSERT_TRUE(page.has_value());
+  ASSERT_EQ(page->results.size(), 2u);
+  EXPECT_EQ(page->results[0].address, SCAN_ADDRESS);
+  EXPECT_EQ(page->results[1].address, SCAN_ADDRESS + 1);
+  EXPECT_EQ(page->results[0].scanned_value, "qqo=");
+
+  const std::vector<u8> changed{0xaa, 0xaa, 0xab, 0xbb};
+  WriteBytes(DATA_ADDRESS, changed);
+  DAP::MemoryScanRefineConfig refine;
+  refine.scan_id = accepted->scan_id;
+  refine.filter = DAP::MemoryScanFilter::Changed;
+  const auto refined = m_engine->RefineScan(refine);
+  ASSERT_TRUE(refined.has_value());
+  const auto refined_event = WaitForEvent(1);
+  ASSERT_TRUE(refined_event.has_value());
+  EXPECT_EQ(refined_event->result_count, 1u);
+  const auto refined_page = m_engine->GetResults(accepted->scan_id, 0, 10);
+  ASSERT_TRUE(refined_page.has_value());
+  ASSERT_EQ(refined_page->results.size(), 1u);
+  EXPECT_EQ(refined_page->results[0].address, SCAN_ADDRESS + 1);
+  EXPECT_EQ(refined_page->results[0].scanned_value, "qqs=");
+}
+
+TEST_F(DapMemoryEngineTest, BytePatternRefineRequiresOriginalWidth)
+{
+  const std::vector<u8> bytes{0xaa, 0xbb};
+  WriteBytes(DATA_ADDRESS, bytes);
+  DAP::MemoryScanStartConfig config;
+  config.ranges.push_back({SCAN_ADDRESS, SCAN_ADDRESS + 2});
+  config.data_type = DAP::MemoryScanDataType::Bytes;
+  config.filter = DAP::MemoryScanFilter::Exact;
+  config.value = "qrs=";
+  config.byte_value = bytes;
+  config.pause_during_scan = true;
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_TRUE(WaitForEvent(0).has_value());
+
+  DAP::MemoryScanRefineConfig refine;
+  refine.scan_id = accepted->scan_id;
+  refine.filter = DAP::MemoryScanFilter::Exact;
+  refine.value = "qg==";
+  refine.byte_value = std::vector<u8>{0xaa};
+  const auto refined = m_engine->RefineScan(refine);
+  EXPECT_FALSE(refined.has_value());
+  const auto status = m_engine->GetStatus(accepted->scan_id);
+  ASSERT_TRUE(status.has_value());
+  EXPECT_EQ(status->generation, 1u);
+  EXPECT_EQ(status->state, "completed");
+
+  refine.value = "qrs=";
+  refine.byte_value = std::vector<u8>{0xaa, 0xcc};
+  EXPECT_FALSE(m_engine->RefineScan(refine).has_value());
+}
+
+TEST_F(DapMemoryEngineTest, BytePatternScanRejectsExcessiveComparisonWork)
+{
+  DAP::MemoryScanStartConfig config;
+  config.regions = {"mem1"};
+  config.data_type = DAP::MemoryScanDataType::Bytes;
+  config.filter = DAP::MemoryScanFilter::Exact;
+  config.byte_value.assign(64, 0xaa);
+  config.value = DAP::Json::Base64Encode(config.byte_value);
+  config.aligned = false;
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_FALSE(accepted.has_value());
+  EXPECT_NE(accepted.error().find("comparison-work limit"), std::string::npos);
 }
 }  // namespace
