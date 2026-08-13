@@ -426,8 +426,8 @@ TEST_F(DapSessionTest, MemoryScanReturnsBytePatternResult)
   const auto accepted = client.Receive();
   ASSERT_TRUE(accepted.has_value());
   ASSERT_TRUE(accepted->at("success").get<bool>());
-  const int scan_id = static_cast<int>(
-      accepted->at("body").get<picojson::object>().at("scanId").get<double>());
+  const int scan_id =
+      static_cast<int>(accepted->at("body").get<picojson::object>().at("scanId").get<double>());
   const auto completed = client.Receive();
   ASSERT_TRUE(completed.has_value());
   EXPECT_EQ(completed->at("body").get<picojson::object>().at("resultCount").get<double>(), 1.0);
@@ -439,10 +439,8 @@ TEST_F(DapSessionTest, MemoryScanReturnsBytePatternResult)
   const auto response = client.Receive();
   ASSERT_TRUE(response.has_value());
   ASSERT_TRUE(response->at("success").get<bool>());
-  const auto& results = response->at("body")
-                            .get<picojson::object>()
-                            .at("results")
-                            .get<picojson::array>();
+  const auto& results =
+      response->at("body").get<picojson::object>().at("results").get<picojson::array>();
   ASSERT_EQ(results.size(), 1u);
   const auto& result = results[0].get<picojson::object>();
   EXPECT_EQ(result.at("scannedValue").to_str(), "3q2+7w==");
@@ -465,8 +463,8 @@ TEST_F(DapSessionTest, MemoryScanReturnsStringResult)
   const auto accepted = client.Receive();
   ASSERT_TRUE(accepted.has_value());
   ASSERT_TRUE(accepted->at("success").get<bool>());
-  const int scan_id = static_cast<int>(
-      accepted->at("body").get<picojson::object>().at("scanId").get<double>());
+  const int scan_id =
+      static_cast<int>(accepted->at("body").get<picojson::object>().at("scanId").get<double>());
   ASSERT_TRUE(client.Receive().has_value());
   client.Send(fmt::format(
       R"({{"seq":30,"type":"request","command":"dolphin_memoryScanResults",
@@ -474,13 +472,41 @@ TEST_F(DapSessionTest, MemoryScanReturnsStringResult)
       scan_id));
   const auto response = client.Receive();
   ASSERT_TRUE(response.has_value());
-  const auto& results = response->at("body")
-                            .get<picojson::object>()
-                            .at("results")
-                            .get<picojson::array>();
+  const auto& results =
+      response->at("body").get<picojson::object>().at("results").get<picojson::array>();
   ASSERT_EQ(results.size(), 1u);
   EXPECT_EQ(results[0].get<picojson::object>().at("scannedValue").to_str(), "hElLo");
   EXPECT_EQ(results[0].get<picojson::object>().at("raw").to_str(), "aEVsTG8=");
+}
+
+TEST_F(DapSessionTest, MemoryScanReturnsPpcDisassembly)
+{
+  TestClient client(m_client_fd());
+  Handshake(client);
+  client.Send(R"({
+    "seq":31,"type":"request","command":"dolphin_memoryScanStart",
+    "arguments":{"ranges":[{"start":"0x80003100","end":"0x80003108"}],
+      "dataType":"ppcInstruction","filter":"mnemonic","value":"nop",
+      "pauseDuringScan":true}
+  })");
+  const auto accepted = client.Receive();
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_TRUE(accepted->at("success").get<bool>());
+  const int scan_id =
+      static_cast<int>(accepted->at("body").get<picojson::object>().at("scanId").get<double>());
+  ASSERT_TRUE(client.Receive().has_value());
+  client.Send(fmt::format(
+      R"({{"seq":32,"type":"request","command":"dolphin_memoryScanResults",
+           "arguments":{{"scanId":{},"count":10}}}})",
+      scan_id));
+  const auto response = client.Receive();
+  ASSERT_TRUE(response.has_value());
+  const auto& results =
+      response->at("body").get<picojson::object>().at("results").get<picojson::array>();
+  ASSERT_EQ(results.size(), 1u);
+  const auto& result = results[0].get<picojson::object>();
+  EXPECT_EQ(result.at("scannedValue").to_str(), "0x60000000");
+  EXPECT_NE(result.at("disassembly").to_str().find("nop"), std::string::npos);
 }
 
 TEST_F(DapSessionTest, SetBreakpointsResolvesAgainstSourceBase)

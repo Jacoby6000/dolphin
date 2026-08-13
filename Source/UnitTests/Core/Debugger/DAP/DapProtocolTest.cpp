@@ -99,20 +99,20 @@ TEST(DapProtocol, ParseMemoryScanStartDefaultsPauseAndAlignment)
 
 TEST(DapProtocol, ParseMemoryScanBytesDecodesPattern)
 {
-  const auto scan = Protocol::ParseMemoryScanStart(ParseObjectOrDie(
-      R"({"dataType":"bytes","filter":"exact","value":"3q2+7w=="})"));
+  const auto scan = Protocol::ParseMemoryScanStart(
+      ParseObjectOrDie(R"({"dataType":"bytes","filter":"exact","value":"3q2+7w=="})"));
   ASSERT_TRUE(scan.has_value());
   EXPECT_EQ(scan->data_type, MemoryScanDataType::Bytes);
   EXPECT_EQ(scan->byte_value, (std::vector<u8>{0xde, 0xad, 0xbe, 0xef}));
 
+  EXPECT_FALSE(
+      Protocol::ParseMemoryScanStart(ParseObjectOrDie(R"({"dataType":"bytes","filter":"exact"})"))
+          .has_value());
   EXPECT_FALSE(Protocol::ParseMemoryScanStart(
-                   ParseObjectOrDie(R"({"dataType":"bytes","filter":"exact"})"))
+                   ParseObjectOrDie(R"({"dataType":"bytes","filter":"exact","value":"bad"})"))
                    .has_value());
-  EXPECT_FALSE(Protocol::ParseMemoryScanStart(ParseObjectOrDie(
-                   R"({"dataType":"bytes","filter":"exact","value":"bad"})"))
-                   .has_value());
-  EXPECT_FALSE(Protocol::ParseMemoryScanStart(ParseObjectOrDie(
-                   R"({"dataType":"bytes","filter":"exact","value":"3q2+7w== "})"))
+  EXPECT_FALSE(Protocol::ParseMemoryScanStart(
+                   ParseObjectOrDie(R"({"dataType":"bytes","filter":"exact","value":"3q2+7w== "})"))
                    .has_value());
 
   const auto refine = Protocol::ParseMemoryScanRefine(
@@ -132,18 +132,35 @@ TEST(DapProtocol, ParseMemoryScanStringOptions)
   EXPECT_EQ(scan->string_encoding, MemoryScanStringEncoding::Ascii);
   EXPECT_FALSE(scan->case_sensitive);
 
-  EXPECT_FALSE(Protocol::ParseMemoryScanStart(ParseObjectOrDie(
-                   R"({"dataType":"string","filter":"exact","value":"é",
+  EXPECT_FALSE(
+      Protocol::ParseMemoryScanStart(ParseObjectOrDie(
+                                         R"({"dataType":"string","filter":"exact","value":"é",
                         "encoding":"ascii"})"))
-                   .has_value());
-  EXPECT_FALSE(Protocol::ParseMemoryScanStart(ParseObjectOrDie(
-                   R"({"dataType":"string","filter":"exact","value":"x",
+          .has_value());
+  EXPECT_FALSE(
+      Protocol::ParseMemoryScanStart(ParseObjectOrDie(
+                                         R"({"dataType":"string","filter":"exact","value":"x",
                         "encoding":"utf16"})"))
-                   .has_value());
-  EXPECT_FALSE(Protocol::ParseMemoryScanStart(ParseObjectOrDie(
-                   R"({"dataType":"bytes","filter":"exact","value":"eA==",
+          .has_value());
+  EXPECT_FALSE(
+      Protocol::ParseMemoryScanStart(ParseObjectOrDie(
+                                         R"({"dataType":"bytes","filter":"exact","value":"eA==",
                         "caseSensitive":false})"))
-                   .has_value());
+          .has_value());
+}
+
+TEST(DapProtocol, ParseMemoryScanPpcInstruction)
+{
+  const auto mnemonic = Protocol::ParseMemoryScanStart(
+      ParseObjectOrDie(R"({"dataType":"ppcInstruction","filter":"mnemonic","value":"ori"})"));
+  ASSERT_TRUE(mnemonic.has_value());
+  EXPECT_EQ(mnemonic->data_type, MemoryScanDataType::PpcInstruction);
+  EXPECT_EQ(mnemonic->filter, MemoryScanFilter::Mnemonic);
+
+  const auto valid = Protocol::ParseMemoryScanStart(
+      ParseObjectOrDie(R"({"dataType":"ppcInstruction","filter":"validInstruction"})"));
+  ASSERT_TRUE(valid.has_value());
+  EXPECT_EQ(valid->filter, MemoryScanFilter::ValidInstruction);
 }
 
 TEST(DapProtocol, ParseMemoryScanStartRejectsUnknownTypeOrFilter)
@@ -199,13 +216,13 @@ TEST(DapProtocol, ParseMemoryScanRejectsMalformedOptionalFields)
           .has_value());
   EXPECT_FALSE(Protocol::ParseMemoryScanResults(
                    ParseObjectOrDie(R"({"scanId":1,"start":18446744073709551616,"count":2})"))
-          .has_value());
+                   .has_value());
 }
 
 TEST(DapProtocol, ParseMemoryScanRemoveResults)
 {
-  const auto arguments = Protocol::ParseMemoryScanRemoveResults(ParseObjectOrDie(
-      R"({"scanId":3,"addresses":["0x80004000","80004004"]})"));
+  const auto arguments = Protocol::ParseMemoryScanRemoveResults(
+      ParseObjectOrDie(R"({"scanId":3,"addresses":["0x80004000","80004004"]})"));
   ASSERT_TRUE(arguments.has_value());
   EXPECT_EQ(arguments->scan_id, 3);
   EXPECT_EQ(arguments->addresses, (std::vector<u32>{0x80004000, 0x80004004}));
@@ -213,12 +230,12 @@ TEST(DapProtocol, ParseMemoryScanRemoveResults)
 
 TEST(DapProtocol, ParseMemoryScanRemoveResultsRejectsMalformedArguments)
 {
-  EXPECT_FALSE(Protocol::ParseMemoryScanRemoveResults(
-                   ParseObjectOrDie(R"({"scanId":1,"addresses":[]})"))
-                   .has_value());
-  EXPECT_FALSE(Protocol::ParseMemoryScanRemoveResults(
-                   ParseObjectOrDie(R"({"scanId":1,"addresses":[1]})"))
-                   .has_value());
+  EXPECT_FALSE(
+      Protocol::ParseMemoryScanRemoveResults(ParseObjectOrDie(R"({"scanId":1,"addresses":[]})"))
+          .has_value());
+  EXPECT_FALSE(
+      Protocol::ParseMemoryScanRemoveResults(ParseObjectOrDie(R"({"scanId":1,"addresses":[1]})"))
+          .has_value());
   EXPECT_FALSE(Protocol::ParseMemoryScanRemoveResults(
                    ParseObjectOrDie(R"({"scanId":1,"addresses":["not-hex"]})"))
                    .has_value());
@@ -238,12 +255,11 @@ TEST(DapProtocol, ParseResolvePointerChain)
   EXPECT_EQ(arguments->base_address, 0x80004000u);
   EXPECT_EQ(arguments->offsets, (std::vector<s32>{16, -4, 0}));
 
-  const auto boundaries = Protocol::ParseResolvePointerChain(ParseObjectOrDie(
-      R"({"baseAddress":"0","offsets":[-2147483648,2147483647]})"));
+  const auto boundaries = Protocol::ParseResolvePointerChain(
+      ParseObjectOrDie(R"({"baseAddress":"0","offsets":[-2147483648,2147483647]})"));
   ASSERT_TRUE(boundaries.has_value());
   EXPECT_EQ(boundaries->offsets,
-            (std::vector<s32>{std::numeric_limits<s32>::min(),
-                              std::numeric_limits<s32>::max()}));
+            (std::vector<s32>{std::numeric_limits<s32>::min(), std::numeric_limits<s32>::max()}));
 }
 
 TEST(DapProtocol, ParseResolvePointerChainRejectsMalformedArguments)

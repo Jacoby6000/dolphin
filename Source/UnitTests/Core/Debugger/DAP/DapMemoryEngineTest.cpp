@@ -1,6 +1,7 @@
 // Copyright 2026 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -8,11 +9,13 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "Common/CommonTypes.h"
+#include "Common/GekkoDisassembler.h"
 #include "Core/Core.h"
 #include "Core/Debugger/DAP/DapJson.h"
 #include "Core/Debugger/DAP/DapMemoryEngine.h"
@@ -44,8 +47,8 @@ protected:
     power_pc.MSRUpdated();
     Core::UndeclareAsCPUThread();
 
-    m_engine = std::make_unique<DAP::DapMemoryEngine>(
-        system, [this](DAP::MemoryScanTerminalEvent event) {
+    m_engine =
+        std::make_unique<DAP::DapMemoryEngine>(system, [this](DAP::MemoryScanTerminalEvent event) {
           std::lock_guard lock(m_event_mutex);
           m_events.emplace_back(std::move(event));
           m_event_cv.notify_all();
@@ -111,22 +114,17 @@ TEST_F(DapMemoryEngineTest, ExactScanSupportsEveryNumericType)
       {DAP::MemoryScanDataType::S8, {0xff}, "-1"},
       {DAP::MemoryScanDataType::S16, {0xff, 0xfe}, "-2"},
       {DAP::MemoryScanDataType::S32, {0xff, 0xff, 0xff, 0xfd}, "-3"},
-      {DAP::MemoryScanDataType::S64,
-       {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc},
-       "-4"},
+      {DAP::MemoryScanDataType::S64, {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc}, "-4"},
       {DAP::MemoryScanDataType::F32, {0x3f, 0xc0, 0x00, 0x00}, "1.5"},
-      {DAP::MemoryScanDataType::F64,
-       {0xc0, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
-       "-2.25"},
+      {DAP::MemoryScanDataType::F64, {0xc0, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "-2.25"},
   };
 
   for (size_t i = 0; i < cases.size(); ++i)
   {
     const Case& test = cases[i];
     WriteBytes(DATA_ADDRESS, test.bytes);
-    const auto accepted =
-        m_engine->StartScan(MakeConfig(test.data_type, SCAN_ADDRESS,
-                                      static_cast<u32>(test.bytes.size()), test.value));
+    const auto accepted = m_engine->StartScan(
+        MakeConfig(test.data_type, SCAN_ADDRESS, static_cast<u32>(test.bytes.size()), test.value));
     ASSERT_TRUE(accepted.has_value());
 
     const auto terminal = WaitForEvent(i);
@@ -223,8 +221,7 @@ TEST_F(DapMemoryEngineTest, DisposeCancelsJobWaitingForCore)
 
 TEST_F(DapMemoryEngineTest, AlignmentAndResultPagingUseAbsoluteAddresses)
 {
-  const std::vector<u8> bytes{0xff, 0xff, 0xff, 0x00, 0x00, 0x00,
-                              0x05, 0x00, 0x00, 0x00, 0x05};
+  const std::vector<u8> bytes{0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x05};
   WriteBytes(DATA_ADDRESS + 1, bytes);
   auto config = MakeConfig(DAP::MemoryScanDataType::U32, SCAN_ADDRESS + 1,
                            static_cast<u32>(bytes.size()), "5");
@@ -252,9 +249,8 @@ TEST_F(DapMemoryEngineTest, RemoveResultsAndUndoPreserveImmutableGenerations)
   ASSERT_TRUE(accepted.has_value());
   ASSERT_TRUE(WaitForEvent(0).has_value());
 
-  const auto removed =
-      m_engine->RemoveResults(accepted->scan_id, {SCAN_ADDRESS + 1, SCAN_ADDRESS + 1,
-                                                  SCAN_ADDRESS + 20});
+  const auto removed = m_engine->RemoveResults(
+      accepted->scan_id, {SCAN_ADDRESS + 1, SCAN_ADDRESS + 1, SCAN_ADDRESS + 20});
   ASSERT_TRUE(removed.has_value());
   EXPECT_EQ(removed->generation, 2u);
   EXPECT_EQ(removed->result_count, 3u);
@@ -409,5 +405,101 @@ TEST_F(DapMemoryEngineTest, StringScanSupportsAsciiInsensitiveMatching)
   invalid_ascii.filter = DAP::MemoryScanFilter::Exact;
   invalid_ascii.value = "é!!!";
   EXPECT_FALSE(m_engine->RefineScan(invalid_ascii).has_value());
+}
+
+TEST_F(DapMemoryEngineTest, PpcInstructionScanMatchesMnemonicAndDisassembles)
+{
+  const std::vector<u8> bytes{0x60, 0x00, 0x00, 0x00, 0x4e, 0x80,
+                              0x00, 0x20, 0x00, 0x00, 0x00, 0x00};
+  WriteBytes(DATA_ADDRESS, bytes);
+  DAP::MemoryScanStartConfig config;
+  config.ranges.push_back({SCAN_ADDRESS, SCAN_ADDRESS + static_cast<u32>(bytes.size())});
+  config.data_type = DAP::MemoryScanDataType::PpcInstruction;
+  config.filter = DAP::MemoryScanFilter::Mnemonic;
+  config.value = "nop";
+  config.aligned = true;
+  config.pause_during_scan = true;
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_TRUE(accepted.has_value());
+  const auto completed = WaitForEvent(0);
+  ASSERT_TRUE(completed.has_value());
+  EXPECT_EQ(completed->result_count, 1u);
+
+  const auto page = m_engine->GetResults(accepted->scan_id, 0, 10);
+  ASSERT_TRUE(page.has_value());
+  ASSERT_EQ(page->results.size(), 1u);
+  EXPECT_EQ(page->results[0].address, SCAN_ADDRESS);
+  EXPECT_EQ(page->results[0].scanned_value, "0x60000000");
+  ASSERT_TRUE(page->results[0].disassembly.has_value());
+  EXPECT_NE(page->results[0].disassembly->find("nop"), std::string::npos);
+}
+
+TEST_F(DapMemoryEngineTest, PpcInstructionScanFiltersValidInstructions)
+{
+  const std::vector<u8> bytes{0x60, 0x00, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00};
+  WriteBytes(DATA_ADDRESS, bytes);
+  DAP::MemoryScanStartConfig config;
+  config.ranges.push_back({SCAN_ADDRESS, SCAN_ADDRESS + static_cast<u32>(bytes.size())});
+  config.data_type = DAP::MemoryScanDataType::PpcInstruction;
+  config.filter = DAP::MemoryScanFilter::ValidInstruction;
+  config.aligned = true;
+  config.pause_during_scan = true;
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_TRUE(accepted.has_value());
+  const auto completed = WaitForEvent(0);
+  ASSERT_TRUE(completed.has_value());
+  EXPECT_EQ(completed->result_count, 1u);
+}
+
+TEST_F(DapMemoryEngineTest, PpcInstructionValidityRejectsReservedEncoding)
+{
+  const std::vector<u8> bytes{
+      0x00, 0x00, 0x00, 0x00,  // Zero is rendered specially but is not executable.
+      0x08, 0x00, 0x00, 0x00,  // PPC64-only tdi.
+      0x10, 0x00, 0x00, 0x02,  // Unsupported paired-single encoding.
+      0x44, 0x00, 0x00, 0x00,  // Reserved system-call encoding.
+  };
+  WriteBytes(DATA_ADDRESS, bytes);
+  DAP::MemoryScanStartConfig config;
+  config.ranges.push_back({SCAN_ADDRESS, SCAN_ADDRESS + static_cast<u32>(bytes.size())});
+  config.data_type = DAP::MemoryScanDataType::PpcInstruction;
+  config.filter = DAP::MemoryScanFilter::ValidInstruction;
+  config.pause_during_scan = true;
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_TRUE(accepted.has_value());
+  const auto completed = WaitForEvent(0);
+  ASSERT_TRUE(completed.has_value());
+  EXPECT_EQ(completed->result_count, 0u);
+}
+
+TEST_F(DapMemoryEngineTest, NumericScanRejectsPpcOnlyFilter)
+{
+  const std::vector<u8> bytes{0x60, 0x00, 0x00, 0x00};
+  WriteBytes(DATA_ADDRESS, bytes);
+  auto config = MakeConfig(DAP::MemoryScanDataType::U32, SCAN_ADDRESS, 4, "0");
+  config.filter = DAP::MemoryScanFilter::ValidInstruction;
+  config.value.reset();
+  EXPECT_FALSE(m_engine->StartScan(config).has_value());
+}
+
+TEST(DapMemoryEngine, GekkoDisassemblyIsSafeAcrossThreads)
+{
+  constexpr u32 iterations = 10000;
+  const std::string expected_nop = Common::GekkoDisassembler::Disassemble(0x60000000, 0x80004000);
+  const std::string expected_branch =
+      Common::GekkoDisassembler::Disassemble(0x48000000, 0x80005000);
+  std::atomic_bool valid = true;
+  const auto run = [&](u32 instruction, u32 address, const std::string& expected) {
+    for (u32 i = 0; i < iterations && valid.load(); ++i)
+    {
+      if (Common::GekkoDisassembler::Disassemble(instruction, address) != expected)
+        valid = false;
+    }
+  };
+  std::thread nop_thread(run, 0x60000000, 0x80004000, std::cref(expected_nop));
+  std::thread branch_thread(run, 0x48000000, 0x80005000, std::cref(expected_branch));
+  nop_thread.join();
+  branch_thread.join();
+  EXPECT_TRUE(valid.load());
 }
 }  // namespace

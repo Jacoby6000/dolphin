@@ -1445,6 +1445,8 @@ private:
       entry.emplace("address", Json::FormatAddress(result.address));
       entry.emplace("scannedValue", result.scanned_value);
       entry.emplace("raw", Json::Base64Encode(result.raw));
+      if (result.disassembly)
+        entry.emplace("disassembly", *result.disassembly);
       results.emplace_back(std::move(entry));
     }
     picojson::object body;
@@ -1516,8 +1518,7 @@ private:
       RespondError(request.seq, request.command, "invalid memory scan result-removal arguments");
       return;
     }
-    const auto result =
-        m_memory_engine->RemoveResults(arguments->scan_id, arguments->addresses);
+    const auto result = m_memory_engine->RemoveResults(arguments->scan_id, arguments->addresses);
     if (!result)
     {
       RespondError(request.seq, request.command, result.error());

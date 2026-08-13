@@ -624,7 +624,8 @@ GameCube exposes MEM1 and ARAM; Wii exposes MEM1 and MEM2 when initialized.
 ## `dolphin_memoryScanStart`
 
 Starts an asynchronous typed scan. Supported `dataType` values are `u8`, `u16`,
-`u32`, `u64`, `s8`, `s16`, `s32`, `s64`, `f32`, `f64`, `bytes`, and `string`.
+`u32`, `u64`, `s8`, `s16`, `s32`, `s64`, `f32`, `f64`, `bytes`, `string`, and
+`ppcInstruction`.
 Initial filters are `exact`, `notEqual`, `between`, `greaterThan`,
 `greaterOrEqual`, `lessThan`, `lessOrEqual`, and `unknown`.
 Ranges are half-open (`[start,end)`). Omitted or empty `regions` selects MEM1;
@@ -647,6 +648,15 @@ ASCII `A`-`Z`; non-ASCII UTF-8 bytes remain exact. Exact/not-equal refinements
 inherit encoding and case sensitivity and must keep the original encoded width.
 Changed/unchanged compare raw bytes. `scannedValue` is valid UTF-8 with malformed
 result bytes replaced by U+FFFD; `raw` always preserves exact bytes as base64.
+
+`dataType:"ppcInstruction"` scans absolute 4-byte-aligned instruction words.
+Initial filters are `exact` (numeric instruction word), `mnemonic` (the exact,
+case-sensitive first token of canonical disassembly, including aliases such as
+`nop` and `blr`), and `validInstruction` (an encoding supported by Dolphin's
+Gekko execution tables and accepted by the canonical disassembler). Refinements
+also support raw-word `changed` and `unchanged`. Results include the word as
+`scannedValue`, exact bytes in `raw`, and canonical address-aware Gekko
+`disassembly`. The type always enforces 4-byte alignment.
 
 ```jsonc
 {"command":"dolphin_memoryScanStart", "arguments":{

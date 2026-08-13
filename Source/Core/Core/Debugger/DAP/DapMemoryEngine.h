@@ -41,6 +41,7 @@ enum class MemoryScanDataType
   F64,
   Bytes,
   String,
+  PpcInstruction,
 };
 
 enum class MemoryScanFilter
@@ -59,6 +60,8 @@ enum class MemoryScanFilter
   Decreased,
   IncreasedBy,
   DecreasedBy,
+  Mnemonic,
+  ValidInstruction,
 };
 
 enum class MemoryScanStringEncoding
@@ -129,6 +132,7 @@ struct MemoryScanResult
   u32 address = 0;
   std::string scanned_value;
   std::vector<u8> raw;
+  std::optional<std::string> disassembly;
 };
 
 struct MemoryScanResultPage
@@ -249,7 +253,7 @@ private:
                  std::optional<std::string> value, std::optional<std::string> value2,
                  bool pause_during_scan, std::shared_ptr<const Generation> previous);
   void FinishWorker(const std::shared_ptr<Scan>& scan, int job_id,
-                     MemoryScanTerminalEvent terminal);
+                    MemoryScanTerminalEvent terminal);
   void ReapWorker();
   u64 CalculateRetainedBytesLocked(const Generation* excluded_generation = nullptr) const;
   u64 CalculateGenerationBytes(const MemoryScanStartConfig& config,

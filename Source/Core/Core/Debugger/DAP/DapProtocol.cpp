@@ -164,6 +164,8 @@ std::optional<DAP::MemoryScanDataType> ParseMemoryScanDataType(std::string_view 
     return MemoryScanDataType::Bytes;
   if (type == "string")
     return MemoryScanDataType::String;
+  if (type == "ppcInstruction")
+    return MemoryScanDataType::PpcInstruction;
   return std::nullopt;
 }
 
@@ -197,6 +199,10 @@ std::optional<DAP::MemoryScanFilter> ParseMemoryScanFilter(std::string_view filt
     return MemoryScanFilter::IncreasedBy;
   if (filter == "decreasedBy")
     return MemoryScanFilter::DecreasedBy;
+  if (filter == "mnemonic")
+    return MemoryScanFilter::Mnemonic;
+  if (filter == "validInstruction")
+    return MemoryScanFilter::ValidInstruction;
   return std::nullopt;
 }
 }  // namespace
@@ -790,6 +796,8 @@ std::optional<MemoryScanStartConfig> ParseMemoryScanStart(const picojson::object
   {
     return std::nullopt;
   }
+  if (result.data_type == MemoryScanDataType::PpcInstruction && !result.aligned)
+    return std::nullopt;
   if (result.data_type == MemoryScanDataType::Bytes)
   {
     if (!result.value)
@@ -806,15 +814,14 @@ std::optional<MemoryScanStartConfig> ParseMemoryScanStart(const picojson::object
     const std::string encoding = ReadStringFromJson(arguments, "encoding").value_or("utf8");
     if (encoding != "utf8" && encoding != "ascii")
       return std::nullopt;
-    if (encoding == "ascii" && std::ranges::any_of(*result.value, [](unsigned char c) {
-          return c > 0x7f;
-        }))
+    if (encoding == "ascii" &&
+        std::ranges::any_of(*result.value, [](unsigned char c) { return c > 0x7f; }))
     {
       return std::nullopt;
     }
     result.byte_value.assign(result.value->begin(), result.value->end());
-    result.string_encoding = encoding == "ascii" ? MemoryScanStringEncoding::Ascii :
-                                                   MemoryScanStringEncoding::Utf8;
+    result.string_encoding =
+        encoding == "ascii" ? MemoryScanStringEncoding::Ascii : MemoryScanStringEncoding::Utf8;
     result.case_sensitive = ReadBoolFromJson(arguments, "caseSensitive").value_or(true);
   }
 
