@@ -118,8 +118,32 @@ TEST(DapProtocol, ParseMemoryScanBytesDecodesPattern)
   const auto refine = Protocol::ParseMemoryScanRefine(
       ParseObjectOrDie(R"({"scanId":1,"filter":"exact","value":"qrs="})"));
   ASSERT_TRUE(refine.has_value());
-  ASSERT_TRUE(refine->byte_value.has_value());
-  EXPECT_EQ(*refine->byte_value, (std::vector<u8>{0xaa, 0xbb}));
+  EXPECT_EQ(refine->value, "qrs=");
+}
+
+TEST(DapProtocol, ParseMemoryScanStringOptions)
+{
+  const auto scan = Protocol::ParseMemoryScanStart(ParseObjectOrDie(
+      R"({"dataType":"string","filter":"exact","value":"Hello",
+           "encoding":"ascii","caseSensitive":false})"));
+  ASSERT_TRUE(scan.has_value());
+  EXPECT_EQ(scan->data_type, MemoryScanDataType::String);
+  EXPECT_EQ(scan->byte_value, (std::vector<u8>{'H', 'e', 'l', 'l', 'o'}));
+  EXPECT_EQ(scan->string_encoding, MemoryScanStringEncoding::Ascii);
+  EXPECT_FALSE(scan->case_sensitive);
+
+  EXPECT_FALSE(Protocol::ParseMemoryScanStart(ParseObjectOrDie(
+                   R"({"dataType":"string","filter":"exact","value":"é",
+                        "encoding":"ascii"})"))
+                   .has_value());
+  EXPECT_FALSE(Protocol::ParseMemoryScanStart(ParseObjectOrDie(
+                   R"({"dataType":"string","filter":"exact","value":"x",
+                        "encoding":"utf16"})"))
+                   .has_value());
+  EXPECT_FALSE(Protocol::ParseMemoryScanStart(ParseObjectOrDie(
+                   R"({"dataType":"bytes","filter":"exact","value":"eA==",
+                        "caseSensitive":false})"))
+                   .has_value());
 }
 
 TEST(DapProtocol, ParseMemoryScanStartRejectsUnknownTypeOrFilter)

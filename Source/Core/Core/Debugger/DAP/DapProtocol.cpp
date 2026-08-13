@@ -162,6 +162,8 @@ std::optional<DAP::MemoryScanDataType> ParseMemoryScanDataType(std::string_view 
     return MemoryScanDataType::F64;
   if (type == "bytes")
     return MemoryScanDataType::Bytes;
+  if (type == "string")
+    return MemoryScanDataType::String;
   return std::nullopt;
 }
 
@@ -768,7 +770,9 @@ std::optional<MemoryScanStartConfig> ParseMemoryScanStart(const picojson::object
     return std::nullopt;
   if (HasInvalidOptionalString(arguments, "value") ||
       HasInvalidOptionalString(arguments, "value2") ||
+      HasInvalidOptionalString(arguments, "encoding") ||
       HasInvalidOptionalBool(arguments, "aligned") ||
+      HasInvalidOptionalBool(arguments, "caseSensitive") ||
       HasInvalidOptionalBool(arguments, "pauseDuringScan"))
   {
     return std::nullopt;
@@ -781,6 +785,11 @@ std::optional<MemoryScanStartConfig> ParseMemoryScanStart(const picojson::object
   result.value2 = ReadStringFromJson(arguments, "value2");
   result.aligned = ReadBoolFromJson(arguments, "aligned").value_or(true);
   result.pause_during_scan = ReadBoolFromJson(arguments, "pauseDuringScan").value_or(false);
+  if (result.data_type != MemoryScanDataType::String &&
+      (arguments.contains("encoding") || arguments.contains("caseSensitive")))
+  {
+    return std::nullopt;
+  }
   if (result.data_type == MemoryScanDataType::Bytes)
   {
     if (!result.value)
@@ -789,6 +798,24 @@ std::optional<MemoryScanStartConfig> ParseMemoryScanStart(const picojson::object
     if (!decoded)
       return std::nullopt;
     result.byte_value = *decoded;
+  }
+  else if (result.data_type == MemoryScanDataType::String)
+  {
+    if (!result.value || result.value->empty() || result.value->size() > MAX_BYTE_PATTERN_SIZE)
+      return std::nullopt;
+    const std::string encoding = ReadStringFromJson(arguments, "encoding").value_or("utf8");
+    if (encoding != "utf8" && encoding != "ascii")
+      return std::nullopt;
+    if (encoding == "ascii" && std::ranges::any_of(*result.value, [](unsigned char c) {
+          return c > 0x7f;
+        }))
+    {
+      return std::nullopt;
+    }
+    result.byte_value.assign(result.value->begin(), result.value->end());
+    result.string_encoding = encoding == "ascii" ? MemoryScanStringEncoding::Ascii :
+                                                   MemoryScanStringEncoding::Utf8;
+    result.case_sensitive = ReadBoolFromJson(arguments, "caseSensitive").value_or(true);
   }
 
   const picojson::array* regions = GetArray(arguments, "regions");
@@ -850,12 +877,6 @@ std::optional<MemoryScanRefineConfig> ParseMemoryScanRefine(const picojson::obje
   result.value = ReadStringFromJson(arguments, "value");
   result.value2 = ReadStringFromJson(arguments, "value2");
   result.pause_during_scan = ReadBoolFromJson(arguments, "pauseDuringScan");
-  if (result.value)
-  {
-    const std::optional<std::vector<u8>> decoded = DecodeBytePattern(*result.value);
-    if (decoded)
-      result.byte_value = *decoded;
-  }
   return result;
 }
 

@@ -16,6 +16,7 @@
 
 #include <fmt/format.h>
 
+#include "Common/StringUtil.h"
 #include "Core/Core.h"
 #include "Core/Debugger/DAP/DapJson.h"
 #include "Core/HW/DSP.h"
@@ -228,6 +229,11 @@ void ClearBit(std::vector<u8>& bits, u64 index)
 {
   bits[index / 8] &= static_cast<u8>(~(1u << (index % 8)));
 }
+
+bool IsValidUtf8(std::string_view value)
+{
+  return UTF16ToUTF8(UTF8ToUTF16(value)) == value;
+}
 }  // namespace
 
 DapMemoryEngine::DapMemoryEngine(Core::System& system, TerminalCallback terminal_callback)
@@ -395,6 +401,7 @@ u32 DapMemoryEngine::DataTypeSize(const MemoryScanStartConfig& config)
   case MemoryScanDataType::F64:
     return 8;
   case MemoryScanDataType::Bytes:
+  case MemoryScanDataType::String:
     return static_cast<u32>(config.byte_value.size());
   }
   return 1;
@@ -421,6 +428,7 @@ DapMemoryEngine::ParseValue(MemoryScanDataType data_type, std::string_view value
     PARSE_CASE(F32, float);
     PARSE_CASE(F64, double);
   case MemoryScanDataType::Bytes:
+  case MemoryScanDataType::String:
     return std::nullopt;
   }
 #undef PARSE_CASE
@@ -435,7 +443,7 @@ std::optional<std::string> DapMemoryEngine::ValidateFilter(MemoryScanDataType da
 {
   if (!has_previous && IsPreviousValueFilter(filter))
     return "this filter requires a previous scan generation";
-  if (data_type == MemoryScanDataType::Bytes)
+  if (data_type == MemoryScanDataType::Bytes || data_type == MemoryScanDataType::String)
   {
     if (filter != MemoryScanFilter::Exact && filter != MemoryScanFilter::NotEqual &&
         filter != MemoryScanFilter::Changed && filter != MemoryScanFilter::Unchanged)
@@ -479,6 +487,7 @@ std::string DapMemoryEngine::FormatValue(MemoryScanDataType data_type, const u8*
     FORMAT_CASE(F32, float);
     FORMAT_CASE(F64, double);
   case MemoryScanDataType::Bytes:
+  case MemoryScanDataType::String:
     return {};
   }
 #undef FORMAT_CASE
@@ -498,7 +507,8 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
 
   std::optional<NumericValue> parsed_value;
   std::optional<NumericValue> parsed_value2;
-  if (scan.config.data_type != MemoryScanDataType::Bytes)
+  if (scan.config.data_type != MemoryScanDataType::Bytes &&
+      scan.config.data_type != MemoryScanDataType::String)
   {
     parsed_value = value ? ParseValue(scan.config.data_type, *value) : NumericValue{u8{0}};
     parsed_value2 = value2 ? ParseValue(scan.config.data_type, *value2) : NumericValue{u8{0}};
@@ -507,16 +517,26 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
   }
 
   std::vector<u8> byte_target;
-  if (scan.config.data_type == MemoryScanDataType::Bytes &&
+  if ((scan.config.data_type == MemoryScanDataType::Bytes ||
+       scan.config.data_type == MemoryScanDataType::String) &&
       (filter == MemoryScanFilter::Exact || filter == MemoryScanFilter::NotEqual))
   {
     if (previous)
     {
-      const std::optional<std::vector<u8>> decoded =
-          value ? Json::Base64Decode(*value) : std::nullopt;
-      if (!decoded || decoded->size() != scan.config.byte_value.size())
-        return std::unexpected("byte-pattern scan value must match the original pattern width");
-      byte_target = *decoded;
+      if (scan.config.data_type == MemoryScanDataType::Bytes)
+      {
+        const std::optional<std::vector<u8>> decoded =
+            value ? Json::Base64Decode(*value) : std::nullopt;
+        if (!decoded || decoded->size() != scan.config.byte_value.size())
+          return std::unexpected("byte-pattern scan value must match the original pattern width");
+        byte_target = *decoded;
+      }
+      else
+      {
+        if (!value || value->size() != scan.config.byte_value.size())
+          return std::unexpected("string scan value must match the original encoded width");
+        byte_target.assign(value->begin(), value->end());
+      }
     }
     else
     {
@@ -590,7 +610,20 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
         bool matches = false;
         if (filter == MemoryScanFilter::Exact || filter == MemoryScanFilter::NotEqual)
         {
-          matches = std::ranges::equal(std::span(current, width), byte_target);
+          if (scan.config.data_type == MemoryScanDataType::String && !scan.config.case_sensitive)
+          {
+            matches = std::ranges::equal(
+                std::span(current, width), byte_target, [](u8 lhs, u8 rhs) {
+                  const auto fold = [](u8 byte) {
+                    return byte >= 'A' && byte <= 'Z' ? static_cast<u8>(byte + ('a' - 'A')) : byte;
+                  };
+                  return fold(lhs) == fold(rhs);
+                });
+          }
+          else
+          {
+            matches = std::ranges::equal(std::span(current, width), byte_target);
+          }
           if (filter == MemoryScanFilter::NotEqual)
             matches = !matches;
         }
@@ -645,6 +678,7 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
     result = process.template operator()<double>();
     break;
   case MemoryScanDataType::Bytes:
+  case MemoryScanDataType::String:
     result = process_bytes();
     break;
   }
@@ -656,7 +690,8 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
 std::expected<MemoryScanJobAccepted, std::string>
 DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
 {
-  if (config.data_type == MemoryScanDataType::Bytes &&
+  if ((config.data_type == MemoryScanDataType::Bytes ||
+       config.data_type == MemoryScanDataType::String) &&
       (config.byte_value.empty() || config.byte_value.size() > 4096))
   {
     return std::unexpected("byte-pattern scan value must contain 1 to 4096 bytes");
@@ -665,6 +700,23 @@ DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
       (!config.value || Json::Base64Encode(config.byte_value) != *config.value))
   {
     return std::unexpected("byte-pattern scan value is not canonical base64");
+  }
+  if (config.data_type == MemoryScanDataType::String &&
+      (!config.value || std::vector<u8>(config.value->begin(), config.value->end()) !=
+                            config.byte_value))
+  {
+    return std::unexpected("string scan value does not match its encoded bytes");
+  }
+  if (config.data_type == MemoryScanDataType::String &&
+      config.string_encoding == MemoryScanStringEncoding::Ascii &&
+      std::ranges::any_of(config.byte_value, [](u8 byte) { return byte > 0x7f; }))
+  {
+    return std::unexpected("ASCII string scan value contains non-ASCII bytes");
+  }
+  if (config.data_type == MemoryScanDataType::String &&
+      config.string_encoding == MemoryScanStringEncoding::Utf8 && !IsValidUtf8(*config.value))
+  {
+    return std::unexpected("UTF-8 string scan value is malformed");
   }
   const auto ranges = ResolveRanges(config);
   if (!ranges)
@@ -675,7 +727,8 @@ DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
           ValidateFilter(config.data_type, config.filter, config.value, config.value2, false))
     return std::unexpected(*error);
   const u64 requested_bytes = CalculateGenerationBytes(config, *ranges);
-  if (config.data_type == MemoryScanDataType::Bytes)
+  if (config.data_type == MemoryScanDataType::Bytes ||
+      config.data_type == MemoryScanDataType::String)
   {
     const u64 width = DataTypeSize(config);
     const u64 candidate_bytes = requested_bytes - [&] {
@@ -749,18 +802,32 @@ DapMemoryEngine::RefineScan(const MemoryScanRefineConfig& config)
               scan->config.data_type, config.filter, config.value, config.value2, true))
         return std::unexpected(*error);
       if (scan->config.data_type == MemoryScanDataType::Bytes &&
-          (config.filter == MemoryScanFilter::Exact ||
-           config.filter == MemoryScanFilter::NotEqual))
+          (config.filter == MemoryScanFilter::Exact || config.filter == MemoryScanFilter::NotEqual))
       {
-        if (!config.value || !config.byte_value ||
-            config.byte_value->size() != scan->config.byte_value.size() ||
-            Json::Base64Encode(*config.byte_value) != *config.value)
+        const size_t expected_encoded_size = ((scan->config.byte_value.size() + 2) / 3) * 4;
+        if (!config.value || config.value->size() != expected_encoded_size)
           return std::unexpected("byte-pattern scan value must match the original pattern width");
-        worker_value = Json::Base64Encode(*config.byte_value);
+        const std::optional<std::vector<u8>> decoded =
+            Json::Base64Decode(*config.value);
+        if (!decoded || decoded->size() != scan->config.byte_value.size() ||
+            Json::Base64Encode(*decoded) != *config.value)
+          return std::unexpected("byte-pattern scan value must match the original pattern width");
+        worker_value = config.value;
       }
-      else if (scan->config.data_type == MemoryScanDataType::Bytes && config.byte_value)
+      else if (scan->config.data_type == MemoryScanDataType::String &&
+               (config.filter == MemoryScanFilter::Exact ||
+                config.filter == MemoryScanFilter::NotEqual))
       {
-        return std::unexpected("this byte-pattern filter does not accept value");
+        if (!config.value || config.value->size() != scan->config.byte_value.size() ||
+            (scan->config.string_encoding == MemoryScanStringEncoding::Ascii &&
+             std::ranges::any_of(*config.value,
+                                 [](unsigned char byte) { return byte > 0x7f; })) ||
+            (scan->config.string_encoding == MemoryScanStringEncoding::Utf8 &&
+             !IsValidUtf8(*config.value)))
+        {
+          return std::unexpected("string scan value must match the original encoded width");
+        }
+        worker_value = config.value;
       }
       pause_during_scan = config.pause_during_scan.value_or(scan->config.pause_during_scan);
     }
@@ -1062,11 +1129,14 @@ std::expected<MemoryScanResultPage, std::string> DapMemoryEngine::GetResults(int
       const size_t offset = range.candidate_offset + static_cast<size_t>(local * stride);
       MemoryScanResult& result = page.results.emplace_back();
       result.address = range.start + static_cast<u32>(offset);
-      if (data_type != MemoryScanDataType::Bytes)
+      if (data_type != MemoryScanDataType::Bytes && data_type != MemoryScanDataType::String)
         result.scanned_value = FormatValue(data_type, range.bytes.data() + offset);
       result.raw.assign(range.bytes.begin() + offset, range.bytes.begin() + offset + width);
       if (data_type == MemoryScanDataType::Bytes)
         result.scanned_value = Json::Base64Encode(result.raw);
+      else if (data_type == MemoryScanDataType::String)
+        result.scanned_value = UTF16ToUTF8(UTF8ToUTF16(std::string_view(
+            reinterpret_cast<const char*>(result.raw.data()), result.raw.size())));
       if (page.results.size() == count)
         return page;
     }

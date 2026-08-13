@@ -40,6 +40,7 @@ enum class MemoryScanDataType
   F32,
   F64,
   Bytes,
+  String,
 };
 
 enum class MemoryScanFilter
@@ -60,6 +61,12 @@ enum class MemoryScanFilter
   DecreasedBy,
 };
 
+enum class MemoryScanStringEncoding
+{
+  Utf8,
+  Ascii,
+};
+
 struct MemoryScanRange
 {
   u32 start = 0;
@@ -75,6 +82,8 @@ struct MemoryScanStartConfig
   std::optional<std::string> value;
   std::optional<std::string> value2;
   std::vector<u8> byte_value;
+  MemoryScanStringEncoding string_encoding = MemoryScanStringEncoding::Utf8;
+  bool case_sensitive = true;
   bool aligned = true;
   bool pause_during_scan = false;
 };
@@ -85,7 +94,6 @@ struct MemoryScanRefineConfig
   MemoryScanFilter filter = MemoryScanFilter::Changed;
   std::optional<std::string> value;
   std::optional<std::string> value2;
-  std::optional<std::vector<u8>> byte_value;
   std::optional<bool> pause_during_scan;
 };
 

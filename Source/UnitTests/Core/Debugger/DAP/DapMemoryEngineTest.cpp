@@ -340,7 +340,6 @@ TEST_F(DapMemoryEngineTest, BytePatternRefineRequiresOriginalWidth)
   refine.scan_id = accepted->scan_id;
   refine.filter = DAP::MemoryScanFilter::Exact;
   refine.value = "qg==";
-  refine.byte_value = std::vector<u8>{0xaa};
   const auto refined = m_engine->RefineScan(refine);
   EXPECT_FALSE(refined.has_value());
   const auto status = m_engine->GetStatus(accepted->scan_id);
@@ -349,8 +348,7 @@ TEST_F(DapMemoryEngineTest, BytePatternRefineRequiresOriginalWidth)
   EXPECT_EQ(status->state, "completed");
 
   refine.value = "qrs=";
-  refine.byte_value = std::vector<u8>{0xaa, 0xcc};
-  EXPECT_FALSE(m_engine->RefineScan(refine).has_value());
+  EXPECT_TRUE(m_engine->RefineScan(refine).has_value());
 }
 
 TEST_F(DapMemoryEngineTest, BytePatternScanRejectsExcessiveComparisonWork)
@@ -365,5 +363,51 @@ TEST_F(DapMemoryEngineTest, BytePatternScanRejectsExcessiveComparisonWork)
   const auto accepted = m_engine->StartScan(config);
   ASSERT_FALSE(accepted.has_value());
   EXPECT_NE(accepted.error().find("comparison-work limit"), std::string::npos);
+}
+
+TEST_F(DapMemoryEngineTest, StringScanSupportsAsciiInsensitiveMatching)
+{
+  const std::vector<u8> bytes{'h', 'E', 'l', 'L', 'o', '!', 0xff};
+  WriteBytes(DATA_ADDRESS, bytes);
+  DAP::MemoryScanStartConfig config;
+  config.ranges.push_back({SCAN_ADDRESS, SCAN_ADDRESS + static_cast<u32>(bytes.size())});
+  config.data_type = DAP::MemoryScanDataType::String;
+  config.filter = DAP::MemoryScanFilter::Exact;
+  config.value = "Hello";
+  config.byte_value = {'H', 'e', 'l', 'l', 'o'};
+  config.string_encoding = DAP::MemoryScanStringEncoding::Ascii;
+  config.case_sensitive = false;
+  config.aligned = false;
+  config.pause_during_scan = true;
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_TRUE(accepted.has_value());
+  const auto completed = WaitForEvent(0);
+  ASSERT_TRUE(completed.has_value());
+  EXPECT_EQ(completed->result_count, 1u);
+
+  const auto page = m_engine->GetResults(accepted->scan_id, 0, 10);
+  ASSERT_TRUE(page.has_value());
+  ASSERT_EQ(page->results.size(), 1u);
+  EXPECT_EQ(page->results[0].scanned_value, "hElLo");
+
+  const std::vector<u8> invalid_utf8{'h', 'E', 0xff, 'L', 'o', '!', 0xff};
+  WriteBytes(DATA_ADDRESS, invalid_utf8);
+  DAP::MemoryScanRefineConfig refine;
+  refine.scan_id = accepted->scan_id;
+  refine.filter = DAP::MemoryScanFilter::Changed;
+  const auto refined = m_engine->RefineScan(refine);
+  ASSERT_TRUE(refined.has_value());
+  ASSERT_TRUE(WaitForEvent(1).has_value());
+  const auto changed = m_engine->GetResults(accepted->scan_id, 0, 10);
+  ASSERT_TRUE(changed.has_value());
+  ASSERT_EQ(changed->results.size(), 1u);
+  EXPECT_EQ(changed->results[0].scanned_value, "hE\xef\xbf\xbdLo");
+  EXPECT_EQ(changed->results[0].raw, (std::vector<u8>{'h', 'E', 0xff, 'L', 'o'}));
+
+  DAP::MemoryScanRefineConfig invalid_ascii;
+  invalid_ascii.scan_id = accepted->scan_id;
+  invalid_ascii.filter = DAP::MemoryScanFilter::Exact;
+  invalid_ascii.value = "é!!!";
+  EXPECT_FALSE(m_engine->RefineScan(invalid_ascii).has_value());
 }
 }  // namespace

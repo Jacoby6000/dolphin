@@ -624,7 +624,7 @@ GameCube exposes MEM1 and ARAM; Wii exposes MEM1 and MEM2 when initialized.
 ## `dolphin_memoryScanStart`
 
 Starts an asynchronous typed scan. Supported `dataType` values are `u8`, `u16`,
-`u32`, `u64`, `s8`, `s16`, `s32`, `s64`, `f32`, `f64`, and `bytes`.
+`u32`, `u64`, `s8`, `s16`, `s32`, `s64`, `f32`, `f64`, `bytes`, and `string`.
 Initial filters are `exact`, `notEqual`, `between`, `greaterThan`,
 `greaterOrEqual`, `lessThan`, `lessOrEqual`, and `unknown`.
 Ranges are half-open (`[start,end)`). Omitted or empty `regions` selects MEM1;
@@ -638,6 +638,15 @@ pattern width is the stride; with `false`, overlapping matches are possible.
 Byte results return the current pattern as base64 in both `scannedValue` and
 `raw`. Aligned candidates are anchored to absolute addresses where
 `address % width == 0`. A changed byte can affect multiple overlapping windows.
+
+`dataType:"string"` uses the same fixed-width engine with a plain JSON string
+`value`. `encoding` is `utf8` (default) or `ascii`; ASCII rejects non-ASCII
+input and UTF-8 rejects malformed input. Encoded width is 1 to 4096 bytes.
+`caseSensitive` defaults to `true`. Case-insensitive matching folds only
+ASCII `A`-`Z`; non-ASCII UTF-8 bytes remain exact. Exact/not-equal refinements
+inherit encoding and case sensitivity and must keep the original encoded width.
+Changed/unchanged compare raw bytes. `scannedValue` is valid UTF-8 with malformed
+result bytes replaced by U+FFFD; `raw` always preserves exact bytes as base64.
 
 ```jsonc
 {"command":"dolphin_memoryScanStart", "arguments":{
