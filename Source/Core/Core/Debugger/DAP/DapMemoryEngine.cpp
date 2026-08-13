@@ -16,6 +16,7 @@
 
 #include <fmt/format.h>
 
+#include "Common/Assert.h"
 #include "Common/GekkoDisassembler.h"
 #include "Common/StringUtil.h"
 #include "Core/Core.h"
@@ -46,6 +47,12 @@ constexpr size_t MAX_UNDO_GENERATIONS = 16;
 
 std::mutex s_core_scan_mutex;
 thread_local const DapMemoryEngine* s_memory_scan_worker = nullptr;
+
+MemoryScanBudget& GetProcessMemoryScanBudget()
+{
+  static MemoryScanBudget budget(MAX_RETAINED_BYTES);
+  return budget;
+}
 
 template <typename T>
 T ReadBigEndian(const u8* bytes)
@@ -269,8 +276,84 @@ bool IsValidUtf8(std::string_view value)
 }
 }  // namespace
 
+struct MemoryScanBudget::Charge::State
+{
+  explicit State(u64 limit_) : limit(limit_) {}
+  std::atomic<u64> used{0};
+  const u64 limit;
+};
+
+MemoryScanBudget::Charge::Charge(std::shared_ptr<State> state, u64 bytes)
+    : m_state(std::move(state)), m_bytes(bytes)
+{
+}
+
+MemoryScanBudget::Charge::Charge(Charge&& other) noexcept
+    : m_state(std::move(other.m_state)), m_bytes(std::exchange(other.m_bytes, 0))
+{
+}
+
+MemoryScanBudget::Charge& MemoryScanBudget::Charge::operator=(Charge&& other) noexcept
+{
+  if (this != &other)
+  {
+    Release();
+    m_state = std::move(other.m_state);
+    m_bytes = std::exchange(other.m_bytes, 0);
+  }
+  return *this;
+}
+
+MemoryScanBudget::Charge::~Charge()
+{
+  Release();
+}
+
+MemoryScanBudget::Charge MemoryScanBudget::Charge::Split(u64 bytes)
+{
+  ASSERT(m_state && bytes <= m_bytes);
+  m_bytes -= bytes;
+  return Charge(m_state, bytes);
+}
+
+void MemoryScanBudget::Charge::Release()
+{
+  if (m_bytes != 0)
+  {
+    m_state->used.fetch_sub(m_bytes, std::memory_order_relaxed);
+    m_bytes = 0;
+  }
+}
+
+MemoryScanBudget::MemoryScanBudget(u64 limit) : m_state(std::make_shared<Charge::State>(limit))
+{
+}
+
+std::optional<MemoryScanBudget::Charge> MemoryScanBudget::TryReserve(u64 bytes) const
+{
+  u64 used = m_state->used.load(std::memory_order_relaxed);
+  do
+  {
+    if (used > m_state->limit || bytes > m_state->limit - used)
+      return std::nullopt;
+  } while (!m_state->used.compare_exchange_weak(used, used + bytes, std::memory_order_relaxed));
+  return Charge(m_state, bytes);
+}
+
+u64 MemoryScanBudget::GetUsedBytes() const
+{
+  return m_state->used.load(std::memory_order_relaxed);
+}
+
 DapMemoryEngine::DapMemoryEngine(Core::System& system, TerminalCallback terminal_callback)
-    : m_system(system), m_terminal_callback(std::move(terminal_callback))
+    : DapMemoryEngine(system, std::move(terminal_callback), GetProcessMemoryScanBudget())
+{
+}
+
+DapMemoryEngine::DapMemoryEngine(Core::System& system, TerminalCallback terminal_callback,
+                                 MemoryScanBudget budget)
+    : m_system(system), m_terminal_callback(std::move(terminal_callback)),
+      m_budget(std::move(budget))
 {
 }
 
@@ -608,7 +691,8 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
                                  const std::shared_ptr<const Generation>& previous,
                                  MemoryScanFilter filter, const std::optional<std::string>& value,
                                  const std::optional<std::string>& value2,
-                                 std::atomic<bool>& cancelled) const
+                                 std::atomic<bool>& cancelled,
+                                 MemoryScanBudget::Charge reservation) const
 {
   if (const std::optional<std::string> error =
           ValidateFilter(scan.config.data_type, filter, value, value2, previous != nullptr))
@@ -657,10 +741,16 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
   const u32 width = DataTypeSize(scan.config);
   const u32 stride = scan.config.aligned ? width : 1;
   auto generation = std::make_shared<Generation>();
-  auto generation_ranges = std::make_shared<std::vector<SnapshotRange>>(std::move(snapshot));
+  auto generation_ranges = std::make_shared<SnapshotStorage>();
+  u64 snapshot_bytes = 0;
+  for (const SnapshotRange& range : snapshot)
+    snapshot_bytes += range.bytes.size();
+  generation_ranges->ranges = std::move(snapshot);
+  generation_ranges->budget_charge = reservation.Split(snapshot_bytes);
+  generation->budget_charge = std::move(reservation);
 
   u64 total_candidates = 0;
-  for (SnapshotRange& range : *generation_ranges)
+  for (SnapshotRange& range : generation_ranges->ranges)
   {
     range.first_candidate = total_candidates;
     range.candidate_offset =
@@ -676,10 +766,11 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
   auto process = [&]<typename T>() -> std::expected<void, std::string> {
     const T target = value ? std::get<T>(*parsed_value) : T{};
     const T target2 = value2 ? std::get<T>(*parsed_value2) : T{};
-    for (size_t range_index = 0; range_index < generation->ranges->size(); ++range_index)
+    for (size_t range_index = 0; range_index < generation->ranges->ranges.size(); ++range_index)
     {
-      const SnapshotRange& current_range = (*generation->ranges)[range_index];
-      const SnapshotRange* previous_range = previous ? &(*previous->ranges)[range_index] : nullptr;
+      const SnapshotRange& current_range = generation->ranges->ranges[range_index];
+      const SnapshotRange* previous_range =
+          previous ? &previous->ranges->ranges[range_index] : nullptr;
       for (u64 local = 0; local < current_range.candidate_count; ++local)
       {
         const u64 global = current_range.first_candidate + local;
@@ -704,10 +795,11 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
 
   auto process_bytes = [&]() -> std::expected<void, std::string> {
     const u64 cancellation_interval = std::max<u64>(1, (1u << 20) / width);
-    for (size_t range_index = 0; range_index < generation->ranges->size(); ++range_index)
+    for (size_t range_index = 0; range_index < generation->ranges->ranges.size(); ++range_index)
     {
-      const SnapshotRange& current_range = (*generation->ranges)[range_index];
-      const SnapshotRange* previous_range = previous ? &(*previous->ranges)[range_index] : nullptr;
+      const SnapshotRange& current_range = generation->ranges->ranges[range_index];
+      const SnapshotRange* previous_range =
+          previous ? &previous->ranges->ranges[range_index] : nullptr;
       for (u64 local = 0; local < current_range.candidate_count; ++local)
       {
         const u64 global = current_range.first_candidate + local;
@@ -758,10 +850,11 @@ DapMemoryEngine::BuildGeneration(const Scan& scan, std::vector<SnapshotRange> sn
     const u32 target = filter == MemoryScanFilter::Exact ?
                            std::get<u32>(*ParseValue(scan.config.data_type, *value)) :
                            0;
-    for (const SnapshotRange& current_range : *generation->ranges)
+    for (const SnapshotRange& current_range : generation->ranges->ranges)
     {
-      const size_t range_index = &current_range - generation->ranges->data();
-      const SnapshotRange* previous_range = previous ? &(*previous->ranges)[range_index] : nullptr;
+      const size_t range_index = &current_range - generation->ranges->ranges.data();
+      const SnapshotRange* previous_range =
+          previous ? &previous->ranges->ranges[range_index] : nullptr;
       for (u64 local = 0; local < current_range.candidate_count; ++local)
       {
         const u64 global = current_range.first_candidate + local;
@@ -931,6 +1024,9 @@ DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
     if (candidate_count > MAX_PPC_DISASSEMBLY_WORK)
       return std::unexpected("PPC instruction scan exceeds the decoding-work limit");
   }
+  std::optional<MemoryScanBudget::Charge> reservation = m_budget.TryReserve(requested_bytes);
+  if (!reservation)
+    return std::unexpected("process-wide memory scan budget exceeded");
 
   std::shared_ptr<Scan> scan;
   int job_id = 0;
@@ -940,10 +1036,6 @@ DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
       return std::unexpected("another memory scan job is active");
     if (m_scans.size() >= MAX_SCANS)
       return std::unexpected("memory scan session limit reached");
-    const u64 retained_bytes = CalculateRetainedBytesLocked();
-    if (retained_bytes > MAX_RETAINED_BYTES ||
-        requested_bytes > MAX_RETAINED_BYTES - retained_bytes)
-      return std::unexpected("memory scan retained-state budget exceeded");
     scan = std::make_shared<Scan>();
     scan->id = m_next_scan_id++;
     scan->config = config;
@@ -958,7 +1050,7 @@ DapMemoryEngine::StartScan(const MemoryScanStartConfig& config)
     m_cancelled.store(false);
   }
   StartWorker(scan, job_id, config.filter, config.value, config.value2, config.pause_during_scan,
-              nullptr);
+              nullptr, std::move(*reservation));
   return MemoryScanJobAccepted{scan->id, job_id, config.pause_during_scan};
 }
 
@@ -975,6 +1067,7 @@ DapMemoryEngine::RefineScan(const MemoryScanRefineConfig& config)
 
   std::shared_ptr<Scan> scan;
   std::shared_ptr<const Generation> previous;
+  std::optional<MemoryScanBudget::Charge> reservation;
   int job_id = 0;
   bool pause_during_scan = false;
   std::optional<std::string> worker_value = config.value;
@@ -1033,10 +1126,9 @@ DapMemoryEngine::RefineScan(const MemoryScanRefineConfig& config)
     if (!ranges)
       return std::unexpected(ranges.error());
     const u64 requested_bytes = CalculateGenerationBytes(scan->config, *ranges);
-    const u64 retained_bytes = CalculateRetainedBytesLocked();
-    if (retained_bytes > MAX_RETAINED_BYTES ||
-        requested_bytes > MAX_RETAINED_BYTES - retained_bytes)
-      return std::unexpected("memory scan retained-state budget exceeded");
+    reservation = m_budget.TryReserve(requested_bytes);
+    if (!reservation)
+      return std::unexpected("process-wide memory scan budget exceeded");
     {
       std::lock_guard scan_lock(scan->mutex);
       scan->state = "running";
@@ -1050,28 +1142,31 @@ DapMemoryEngine::RefineScan(const MemoryScanRefineConfig& config)
     m_cancelled.store(false);
   }
   StartWorker(scan, job_id, config.filter, std::move(worker_value), config.value2,
-              pause_during_scan, std::move(previous));
+              pause_during_scan, std::move(previous), std::move(*reservation));
   return MemoryScanJobAccepted{scan->id, job_id, pause_during_scan};
 }
 
 void DapMemoryEngine::StartWorker(std::shared_ptr<Scan> scan, int job_id, MemoryScanFilter filter,
                                   std::optional<std::string> value,
                                   std::optional<std::string> value2, bool pause_during_scan,
-                                  std::shared_ptr<const Generation> previous)
+                                  std::shared_ptr<const Generation> previous,
+                                  MemoryScanBudget::Charge reservation)
 {
   std::lock_guard lock(m_worker_mutex);
-  m_worker = std::thread([this, scan = std::move(scan), job_id, filter, value = std::move(value),
-                          value2 = std::move(value2), pause_during_scan,
-                          previous = std::move(previous)]() mutable {
-    s_memory_scan_worker = this;
-    RunWorker(std::move(scan), job_id, filter, std::move(value), std::move(value2),
-              pause_during_scan, std::move(previous));
-  });
+  m_worker =
+      std::thread([this, scan = std::move(scan), job_id, filter, value = std::move(value),
+                   value2 = std::move(value2), pause_during_scan, previous = std::move(previous),
+                   reservation = std::move(reservation)]() mutable {
+        s_memory_scan_worker = this;
+        RunWorker(std::move(scan), job_id, filter, std::move(value), std::move(value2),
+                  pause_during_scan, std::move(previous), std::move(reservation));
+      });
 }
 
 void DapMemoryEngine::RunWorker(std::shared_ptr<Scan> scan, int job_id, MemoryScanFilter filter,
                                 std::optional<std::string> value, std::optional<std::string> value2,
-                                bool pause_during_scan, std::shared_ptr<const Generation> previous)
+                                bool pause_during_scan, std::shared_ptr<const Generation> previous,
+                                MemoryScanBudget::Charge reservation)
 {
   const auto started = std::chrono::steady_clock::now();
   MemoryScanTerminalEvent terminal;
@@ -1089,7 +1184,9 @@ void DapMemoryEngine::RunWorker(std::shared_ptr<Scan> scan, int job_id, MemorySc
   {
     terminal.event = "dolphin_memoryScanFailed";
     terminal.message = resolved.error();
-    FinishWorker(scan, job_id, std::move(terminal));
+    reservation = {};
+    previous.reset();
+    FinishWorker(std::move(scan), job_id, std::move(terminal));
     return;
   }
 
@@ -1102,7 +1199,17 @@ void DapMemoryEngine::RunWorker(std::shared_ptr<Scan> scan, int job_id, MemorySc
     if (m_cancelled.load())
     {
       terminal.event = "dolphin_memoryScanCancelled";
-      FinishWorker(scan, job_id, std::move(terminal));
+      reservation = {};
+      previous.reset();
+      {
+        std::lock_guard lock(scan->mutex);
+        if (scan->disposed)
+        {
+          scan->generation.reset();
+          scan->undo_generations.clear();
+        }
+      }
+      FinishWorker(std::move(scan), job_id, std::move(terminal));
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1124,7 +1231,7 @@ void DapMemoryEngine::RunWorker(std::shared_ptr<Scan> scan, int job_id, MemorySc
     }
     if (snapshot)
       built = BuildGeneration(*scan, std::move(*snapshot), previous, filter, value, value2,
-                              m_cancelled);
+                              m_cancelled, std::move(reservation));
     if (built)
     {
       std::lock_guard lock(scan->mutex);
@@ -1163,7 +1270,7 @@ void DapMemoryEngine::RunWorker(std::shared_ptr<Scan> scan, int job_id, MemorySc
     core_scan_lock.unlock();
     if (snapshot)
       built = BuildGeneration(*scan, std::move(*snapshot), previous, filter, value, value2,
-                              m_cancelled);
+                              m_cancelled, std::move(reservation));
     else
       built = std::unexpected(snapshot.error());
     if (built)
@@ -1212,14 +1319,18 @@ void DapMemoryEngine::RunWorker(std::shared_ptr<Scan> scan, int job_id, MemorySc
     terminal.generation = (*built)->number;
     terminal.result_count = (*built)->result_count;
   }
-  FinishWorker(scan, job_id, std::move(terminal));
+  built = std::unexpected("worker state released");
+  reservation = {};
+  previous.reset();
+  FinishWorker(std::move(scan), job_id, std::move(terminal));
 }
 
-void DapMemoryEngine::FinishWorker(const std::shared_ptr<Scan>& scan, int job_id,
+void DapMemoryEngine::FinishWorker(std::shared_ptr<Scan> scan, int job_id,
                                    MemoryScanTerminalEvent terminal)
 {
   {
-    std::lock_guard lock(scan->mutex);
+    std::lock_guard engine_lock(m_mutex);
+    std::lock_guard scan_lock(scan->mutex);
     if (terminal.event == "dolphin_memoryScanCompleted")
     {
       scan->state = "completed";
@@ -1235,9 +1346,11 @@ void DapMemoryEngine::FinishWorker(const std::shared_ptr<Scan>& scan, int job_id
       scan->state = "failed";
       scan->phase = "failed";
     }
-  }
-  {
-    std::lock_guard lock(m_mutex);
+    if (scan->disposed)
+    {
+      scan->generation.reset();
+      scan->undo_generations.clear();
+    }
     if (m_active_scan_id == scan->id && scan->current_job_id == job_id)
     {
       m_job_active = false;
@@ -1245,6 +1358,7 @@ void DapMemoryEngine::FinishWorker(const std::shared_ptr<Scan>& scan, int job_id
     }
   }
   TerminalCallback callback = m_terminal_callback;
+  scan.reset();
   callback(std::move(terminal));
 }
 
@@ -1316,9 +1430,9 @@ std::expected<MemoryScanResultPage, std::string> DapMemoryEngine::GetResults(int
   u64 seen = generation->result_index[block];
   u64 global = static_cast<u64>(block) * RESULT_INDEX_BLOCK_BYTES * 8;
   size_t range_index = 0;
-  while (range_index < generation->ranges->size() &&
-         global >= (*generation->ranges)[range_index].first_candidate +
-                       (*generation->ranges)[range_index].candidate_count)
+  while (range_index < generation->ranges->ranges.size() &&
+         global >= generation->ranges->ranges[range_index].first_candidate +
+                       generation->ranges->ranges[range_index].candidate_count)
   {
     ++range_index;
   }
@@ -1328,15 +1442,15 @@ std::expected<MemoryScanResultPage, std::string> DapMemoryEngine::GetResults(int
       continue;
     if (seen++ < start)
       continue;
-    while (range_index < generation->ranges->size() &&
-           global >= (*generation->ranges)[range_index].first_candidate +
-                         (*generation->ranges)[range_index].candidate_count)
+    while (range_index < generation->ranges->ranges.size() &&
+           global >= generation->ranges->ranges[range_index].first_candidate +
+                         generation->ranges->ranges[range_index].candidate_count)
     {
       ++range_index;
     }
-    if (range_index == generation->ranges->size())
+    if (range_index == generation->ranges->ranges.size())
       break;
-    const SnapshotRange& range = (*generation->ranges)[range_index];
+    const SnapshotRange& range = generation->ranges->ranges[range_index];
     const u64 local = global - range.first_candidate;
     const size_t offset = range.candidate_offset + static_cast<size_t>(local * stride);
     MemoryScanResult& result = page.results.emplace_back();
@@ -1404,9 +1518,9 @@ DapMemoryEngine::RemoveResults(int scan_id, const std::vector<u32>& addresses)
   for (const u32 address : addresses)
   {
     const auto range_it = std::upper_bound(
-        scan->generation->ranges->begin(), scan->generation->ranges->end(), address,
+        scan->generation->ranges->ranges.begin(), scan->generation->ranges->ranges.end(), address,
         [](u32 value, const SnapshotRange& range) { return value < range.start; });
-    if (range_it == scan->generation->ranges->begin())
+    if (range_it == scan->generation->ranges->ranges.begin())
       continue;
     const SnapshotRange& range = *std::prev(range_it);
     if (address < range.start)
@@ -1437,22 +1551,21 @@ DapMemoryEngine::RemoveResults(int scan_id, const std::vector<u32>& addresses)
   }
 
   scan_lock.unlock();
-  const u64 retained_bytes = CalculateRetainedBytesLocked();
   scan_lock.lock();
   const u64 candidate_bytes = scan->generation->candidates.size();
   const u64 index_bytes =
       ((candidate_bytes + RESULT_INDEX_BLOCK_BYTES - 1) / RESULT_INDEX_BLOCK_BYTES + 1) *
       sizeof(u64);
   const u64 generation_bytes = candidate_bytes + index_bytes;
-  if (retained_bytes > MAX_RETAINED_BYTES || generation_bytes > MAX_RETAINED_BYTES - retained_bytes)
-  {
-    return std::unexpected("memory scan retained-state budget exceeded");
-  }
+  std::optional<MemoryScanBudget::Charge> reservation = m_budget.TryReserve(generation_bytes);
+  if (!reservation)
+    return std::unexpected("process-wide memory scan budget exceeded");
 
   auto generation = std::make_shared<Generation>();
   generation->ranges = scan->generation->ranges;
   generation->candidates = scan->generation->candidates;
   generation->result_count = scan->generation->result_count;
+  generation->budget_charge = std::move(*reservation);
   for (const u64 global : candidates_to_remove)
     ClearBit(generation->candidates, global);
   generation->result_count -= candidates_to_remove.size();
@@ -1490,12 +1603,15 @@ bool DapMemoryEngine::Dispose(int scan_id)
   const auto it = m_scans.find(scan_id);
   if (it == m_scans.end())
     return false;
+  {
+    std::lock_guard scan_lock(it->second->mutex);
+    it->second->disposed = true;
+  }
   if (m_job_active && m_active_scan_id == scan_id)
   {
     std::lock_guard scan_lock(it->second->mutex);
     if (it->second->state == "running" && it->second->phase != "committing")
     {
-      it->second->disposed = true;
       m_cancelled.store(true);
     }
   }
@@ -1533,33 +1649,6 @@ u64 DapMemoryEngine::CalculateGenerationBytes(const MemoryScanStartConfig& confi
       ((candidate_bytes + RESULT_INDEX_BLOCK_BYTES - 1) / RESULT_INDEX_BLOCK_BYTES + 1) *
       sizeof(u64);
   return snapshot_bytes + candidate_bytes + index_bytes;
-}
-
-u64 DapMemoryEngine::CalculateRetainedBytesLocked(const Generation* excluded_generation) const
-{
-  u64 retained_bytes = 0;
-  std::set<const Generation*> generations;
-  std::set<const std::vector<SnapshotRange>*> snapshots;
-  for (const auto& [id, scan] : m_scans)
-  {
-    std::lock_guard scan_lock(scan->mutex);
-    auto add_generation = [&](const std::shared_ptr<const Generation>& generation) {
-      if (!generation || generation.get() == excluded_generation ||
-          !generations.insert(generation.get()).second)
-        return;
-      retained_bytes += generation->candidates.size();
-      retained_bytes += generation->result_index.size() * sizeof(u64);
-      if (generation->ranges && snapshots.insert(generation->ranges.get()).second)
-      {
-        for (const SnapshotRange& range : *generation->ranges)
-          retained_bytes += range.bytes.size();
-      }
-    };
-    add_generation(scan->generation);
-    for (const std::shared_ptr<const Generation>& generation : scan->undo_generations)
-      add_generation(generation);
-  }
-  return retained_bytes;
 }
 
 void DapMemoryEngine::BuildResultIndex(Generation* generation)

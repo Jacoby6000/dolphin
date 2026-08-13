@@ -27,6 +27,8 @@ class System;
 
 namespace DAP
 {
+class DapMemoryEngine;
+
 enum class MemoryScanDataType
 {
   U8,
@@ -165,12 +167,49 @@ struct MemoryScanTerminalEvent
   std::string message;
 };
 
+class MemoryScanBudget
+{
+public:
+  class Charge
+  {
+  public:
+    Charge() = default;
+    Charge(Charge&& other) noexcept;
+    Charge& operator=(Charge&& other) noexcept;
+    ~Charge();
+
+    Charge(const Charge&) = delete;
+    Charge& operator=(const Charge&) = delete;
+
+  private:
+    struct State;
+    friend class MemoryScanBudget;
+    friend class DapMemoryEngine;
+    Charge(std::shared_ptr<State> state, u64 bytes);
+    Charge Split(u64 bytes);
+    void Release();
+
+    std::shared_ptr<State> m_state;
+    u64 m_bytes = 0;
+  };
+
+  explicit MemoryScanBudget(u64 limit);
+  std::optional<Charge> TryReserve(u64 bytes) const;
+  u64 GetUsedBytes() const;
+
+private:
+  std::shared_ptr<Charge::State> m_state;
+};
+
 class DapMemoryEngine
 {
 public:
   using TerminalCallback = std::function<void(MemoryScanTerminalEvent)>;
 
   DapMemoryEngine(Core::System& system, TerminalCallback terminal_callback);
+  // Tests may inject a smaller shared quota; production sessions use the process singleton.
+  DapMemoryEngine(Core::System& system, TerminalCallback terminal_callback,
+                  MemoryScanBudget budget);
   ~DapMemoryEngine();
 
   DapMemoryEngine(const DapMemoryEngine&) = delete;
@@ -203,10 +242,17 @@ private:
     u32 candidate_offset = 0;
   };
 
+  struct SnapshotStorage
+  {
+    MemoryScanBudget::Charge budget_charge;
+    std::vector<SnapshotRange> ranges;
+  };
+
   struct Generation
   {
     u64 number = 0;
-    std::shared_ptr<const std::vector<SnapshotRange>> ranges;
+    std::shared_ptr<const SnapshotStorage> ranges;
+    MemoryScanBudget::Charge budget_charge;
     std::vector<u8> candidates;
     std::vector<u64> result_index;
     u64 result_count = 0;
@@ -245,18 +291,18 @@ private:
   BuildGeneration(const Scan& scan, std::vector<SnapshotRange> snapshot,
                   const std::shared_ptr<const Generation>& previous, MemoryScanFilter filter,
                   const std::optional<std::string>& value, const std::optional<std::string>& value2,
-                  std::atomic<bool>& cancelled) const;
+                  std::atomic<bool>& cancelled, MemoryScanBudget::Charge reservation) const;
 
   void StartWorker(std::shared_ptr<Scan> scan, int job_id, MemoryScanFilter filter,
                    std::optional<std::string> value, std::optional<std::string> value2,
-                   bool pause_during_scan, std::shared_ptr<const Generation> previous);
+                   bool pause_during_scan, std::shared_ptr<const Generation> previous,
+                   MemoryScanBudget::Charge reservation);
   void RunWorker(std::shared_ptr<Scan> scan, int job_id, MemoryScanFilter filter,
                  std::optional<std::string> value, std::optional<std::string> value2,
-                 bool pause_during_scan, std::shared_ptr<const Generation> previous);
-  void FinishWorker(const std::shared_ptr<Scan>& scan, int job_id,
-                    MemoryScanTerminalEvent terminal);
+                 bool pause_during_scan, std::shared_ptr<const Generation> previous,
+                 MemoryScanBudget::Charge reservation);
+  void FinishWorker(std::shared_ptr<Scan> scan, int job_id, MemoryScanTerminalEvent terminal);
   bool ReapWorker();
-  u64 CalculateRetainedBytesLocked(const Generation* excluded_generation = nullptr) const;
   u64 CalculateGenerationBytes(const MemoryScanStartConfig& config,
                                const std::vector<ResolvedRange>& ranges) const;
 
@@ -273,6 +319,7 @@ private:
 
   Core::System& m_system;
   TerminalCallback m_terminal_callback;
+  MemoryScanBudget m_budget;
   mutable std::mutex m_mutex;
   std::map<int, std::shared_ptr<Scan>> m_scans;
   std::mutex m_worker_mutex;

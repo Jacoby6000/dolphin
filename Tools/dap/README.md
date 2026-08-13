@@ -81,6 +81,10 @@ Each operation below links to its detailed reference section in
 | [`dolphin_memoryScanRemoveResults`](capabilities.md#dolphin_memoryscanremoveresults) | Remove explicit result addresses into a new immutable generation. |
 | [`dolphin_resolvePointerChain`](capabilities.md#dolphin_resolvepointerchain) | Resolve a big-endian 32-bit pointer chain under one emulation pause. |
 
+The listener admits at most two concurrent clients, including clients waiting
+to send `initialize`. Additional connections are closed immediately; reconnect
+after an existing session exits.
+
 ## Running the server
 
 Build with the NoGUI target (DAP sources compile into the `core` static lib;

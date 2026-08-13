@@ -616,4 +616,61 @@ TEST(DapMemoryEngine, GekkoDisassemblyIsSafeAcrossThreads)
   branch_thread.join();
   EXPECT_TRUE(valid.load());
 }
+
+TEST(DapMemoryEngine, SharedBudgetChargesAndReleasesExactly)
+{
+  DAP::MemoryScanBudget budget(10);
+  auto first = budget.TryReserve(6);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(budget.GetUsedBytes(), 6u);
+  EXPECT_FALSE(budget.TryReserve(5).has_value());
+  first.reset();
+  EXPECT_EQ(budget.GetUsedBytes(), 0u);
+  EXPECT_TRUE(budget.TryReserve(10).has_value());
+}
+
+TEST_F(DapMemoryEngineTest, SharedBudgetBoundsMultipleEngines)
+{
+  const std::vector<u8> bytes{1, 2, 3, 4};
+  WriteBytes(DATA_ADDRESS, bytes);
+  DAP::MemoryScanBudget budget(21);
+  std::mutex event_mutex;
+  std::condition_variable event_condition;
+  size_t event_count = 0;
+  const auto callback = [&](DAP::MemoryScanTerminalEvent) {
+    {
+      std::lock_guard lock(event_mutex);
+      ++event_count;
+    }
+    event_condition.notify_one();
+  };
+  m_engine = std::make_unique<DAP::DapMemoryEngine>(Core::System::GetInstance(), callback, budget);
+  auto second =
+      std::make_unique<DAP::DapMemoryEngine>(Core::System::GetInstance(), callback, budget);
+
+  auto config = MakeConfig(DAP::MemoryScanDataType::U8, SCAN_ADDRESS, 4, "0");
+  config.filter = DAP::MemoryScanFilter::Unknown;
+  config.value.reset();
+  const auto accepted = m_engine->StartScan(config);
+  ASSERT_TRUE(accepted.has_value());
+  {
+    std::unique_lock lock(event_mutex);
+    ASSERT_TRUE(
+        event_condition.wait_for(lock, std::chrono::seconds(5), [&] { return event_count == 1; }));
+  }
+  EXPECT_EQ(budget.GetUsedBytes(), 21u);
+  EXPECT_FALSE(second->StartScan(config).has_value());
+
+  EXPECT_TRUE(m_engine->Dispose(accepted->scan_id));
+  m_engine.reset();
+  EXPECT_EQ(budget.GetUsedBytes(), 0u);
+  ASSERT_TRUE(second->StartScan(config).has_value());
+  {
+    std::unique_lock lock(event_mutex);
+    ASSERT_TRUE(
+        event_condition.wait_for(lock, std::chrono::seconds(5), [&] { return event_count == 2; }));
+  }
+  second.reset();
+  EXPECT_EQ(budget.GetUsedBytes(), 0u);
+}
 }  // namespace

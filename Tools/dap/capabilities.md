@@ -760,7 +760,7 @@ cancellation; its worker still emits a terminal event. Completion can win if
 the generation has already entered its atomic commit.
 
 Limits: one active scan job per DAP session, eight retained scans, 256 MiB of
-snapshot plus candidate state per session, 256 MiB of snapshot input per job,
+snapshot plus candidate state process-wide, 256 MiB of snapshot input per job,
 non-overlapping ranges, at most 1 GiB of estimated byte-pattern comparison
 work, 128-byte numeric literals, and 4096 results per page. Wide byte-pattern
 result pages are reduced to at most 1 MiB of raw result bytes, so fewer than the
