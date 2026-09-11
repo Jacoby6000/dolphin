@@ -972,6 +972,44 @@ std::vector<u8> DapDebugController::ReadMemory(u32 address, std::size_t size)
   return bytes;
 }
 
+std::expected<PointerChainResult, std::string>
+DapDebugController::ResolvePointerChain(u32 base_address, std::span<const s32> offsets)
+{
+  Core::CPUThreadGuard guard(m_system);
+  AddressSpace::Accessors* accessors = AddressSpace::GetAccessors(AddressSpace::Type::Effective);
+
+  PointerChainResult result;
+  result.final_address = base_address;
+  result.steps.reserve(offsets.size());
+  for (const s32 offset : offsets)
+  {
+    if (result.final_address > std::numeric_limits<u32>::max() - 3)
+      return std::unexpected(fmt::format("pointer at 0x{:08x} crosses the address boundary",
+                                         result.final_address));
+    for (u32 byte = 0; byte < 4; ++byte)
+    {
+      if (!accessors->IsValidAddress(guard, result.final_address + byte))
+      {
+        return std::unexpected(
+            fmt::format("cannot read pointer at 0x{:08x}", result.final_address));
+      }
+    }
+
+    const u32 pointer_value = accessors->ReadU32(guard, result.final_address);
+    const s64 adjusted = static_cast<s64>(pointer_value) + offset;
+    if (adjusted < 0 || adjusted > std::numeric_limits<u32>::max())
+    {
+      return std::unexpected(
+          fmt::format("pointer offset overflows at 0x{:08x}", result.final_address));
+    }
+
+    const u32 next = static_cast<u32>(adjusted);
+    result.steps.push_back({result.final_address, pointer_value, offset, next});
+    result.final_address = next;
+  }
+  return result;
+}
+
 std::size_t DapDebugController::WriteMemory(u32 address, std::span<const u8> data)
 {
   // DESNOTE(jbarber, 2026-07-21): Same overflow guard as ReadMemory above --

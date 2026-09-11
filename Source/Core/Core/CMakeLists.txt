@@ -70,6 +70,8 @@ add_library(core
   Debugger/DAP/DapFraming.h
   Debugger/DAP/DapJson.cpp
   Debugger/DAP/DapJson.h
+  Debugger/DAP/DapMemoryEngine.cpp
+  Debugger/DAP/DapMemoryEngine.h
   Debugger/DAP/DapProtocol.cpp
   Debugger/DAP/DapProtocol.h
   Debugger/DAP/DapRealtimeWatch.cpp

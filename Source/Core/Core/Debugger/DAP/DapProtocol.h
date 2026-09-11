@@ -11,6 +11,7 @@
 #include <picojson.h>
 
 #include "Common/CommonTypes.h"
+#include "Core/Debugger/DAP/DapMemoryEngine.h"
 
 // Structured models for the subset of the Debug Adapter Protocol the Dolphin
 // DAP server speaks. Requests are decoded from picojson objects into typed
@@ -270,6 +271,40 @@ struct DetourArguments
 };
 
 std::optional<DetourArguments> ParseDetour(const picojson::object& arguments);
+
+struct ResolvePointerChainArguments
+{
+  u32 base_address = 0;
+  std::vector<s32> offsets;
+};
+
+std::optional<ResolvePointerChainArguments>
+ParseResolvePointerChain(const picojson::object& arguments);
+
+struct MemoryScanStatusArguments
+{
+  int scan_id = 0;
+};
+
+struct MemoryScanResultsArguments
+{
+  int scan_id = 0;
+  u64 start = 0;
+  u32 count = 0;
+};
+
+struct MemoryScanRemoveResultsArguments
+{
+  int scan_id = 0;
+  std::vector<u32> addresses;
+};
+
+std::optional<MemoryScanStartConfig> ParseMemoryScanStart(const picojson::object& arguments);
+std::optional<MemoryScanRefineConfig> ParseMemoryScanRefine(const picojson::object& arguments);
+std::optional<MemoryScanStatusArguments> ParseMemoryScanStatus(const picojson::object& arguments);
+std::optional<MemoryScanResultsArguments> ParseMemoryScanResults(const picojson::object& arguments);
+std::optional<MemoryScanRemoveResultsArguments>
+ParseMemoryScanRemoveResults(const picojson::object& arguments);
 
 // Arguments of a `launch`/`attach` request. `stop_on_entry` is nullopt when
 // the client omitted the field; the session resolves the effective policy

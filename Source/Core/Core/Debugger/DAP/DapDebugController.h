@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <expected>
 #include <map>
 #include <optional>
 #include <span>
@@ -140,6 +141,20 @@ struct ExceptionInfo
   std::string description;
 };
 
+struct PointerChainStep
+{
+  u32 address = 0;
+  u32 pointer_value = 0;
+  s32 offset = 0;
+  u32 result_address = 0;
+};
+
+struct PointerChainResult
+{
+  u32 final_address = 0;
+  std::vector<PointerChainStep> steps;
+};
+
 class DapDebugController
 {
 public:
@@ -203,6 +218,8 @@ public:
   // Removes all freezes installed by this controller.
   void ClearFreezes();
   std::vector<u8> ReadMemory(u32 address, std::size_t size);
+  std::expected<PointerChainResult, std::string>
+  ResolvePointerChain(u32 base_address, std::span<const s32> offsets);
   // Writes as many leading bytes of `data` as map to valid addresses and
   // returns the number written; stops at the first invalid address. After
   // the bytes land, invalidates the iCache and JIT block cache for every

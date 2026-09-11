@@ -36,6 +36,16 @@ the server for responses/events.
   - [`dolphin_findFreeMemory`](#dolphin_findfreememory)
   - [`dolphin_injectCode`](#dolphin_injectcode)
   - [`dolphin_detour`](#dolphin_detour)
+  - [`dolphin_memoryRegions`](#dolphin_memoryregions)
+  - [`dolphin_memoryScanStart`](#dolphin_memoryscanstart)
+  - [`dolphin_memoryScanRefine`](#dolphin_memoryscanrefine)
+  - [`dolphin_memoryScanStatus`](#dolphin_memoryscanstatus)
+  - [`dolphin_memoryScanResults`](#dolphin_memoryscanresults)
+  - [`dolphin_memoryScanCancel`](#dolphin_memoryscancancel)
+  - [`dolphin_memoryScanDispose`](#dolphin_memoryscandispose)
+  - [`dolphin_memoryScanUndo`](#dolphin_memoryscanundo)
+  - [`dolphin_memoryScanRemoveResults`](#dolphin_memoryscanremoveresults)
+  - [`dolphin_resolvePointerChain`](#dolphin_resolvepointerchain)
 
 # Standard requests
 
@@ -69,7 +79,10 @@ Dolphin-specific extensions it supports.
    "supportsDolphinFreeze": true,
    "supportsDolphinFindFreeMemory": true,
    "supportsDolphinInjectCode": true,
-   "supportsDolphinDetour": true
+   "supportsDolphinDetour": true,
+   "supportsDolphinMemoryRegions": true,
+   "supportsDolphinMemoryScan": true,
+   "supportsDolphinPointerChain": true
   }}}
 
 // ← then an "initialized" event (means "ready for setBreakpoints / launch")
@@ -593,3 +606,221 @@ the body reads, writes, or calls — is up to the PPC code you supply. The body
 or another `dolphin_detour` call that touches the same regions; the patched
 bytes don't survive PPC reset, and the rollback on a failed detour only
 restores regions touched by *that* detour.
+
+## `dolphin_memoryRegions`
+
+Returns target metadata and the canonical regions accepted by memory scans.
+GameCube exposes MEM1 and ARAM; Wii exposes MEM1 and MEM2 when initialized.
+
+```jsonc
+{"command":"dolphin_memoryRegions"}
+// -> {"platform":"gamecube", "pointerSize":4,
+//     "byteOrder":"big", "regions":[
+//       {"id":"mem1", "name":"MEM1", "baseAddress":"0x80000000",
+//        "size":25165824, "readable":true, "writable":true, "scannable":true}
+//     ]}
+```
+
+## `dolphin_memoryScanStart`
+
+Starts an asynchronous typed scan. Supported `dataType` values are `u8`, `u16`,
+`u32`, `u64`, `s8`, `s16`, `s32`, `s64`, `f32`, `f64`, `bytes`, `string`, and
+`ppcInstruction`.
+Initial filters are `exact`, `notEqual`, `between`, `greaterThan`,
+`greaterOrEqual`, `lessThan`, `lessOrEqual`, and `unknown`.
+Ranges are half-open (`[start,end)`). Omitted or empty `regions` selects MEM1;
+explicit ranges must be wholly contained in one of the selected regions.
+Adjacent ranges in the same region are treated as one continuous range, and
+requests are limited to 1024 ranges and three unique region IDs.
+
+`dataType:"bytes"` performs a fixed-width raw pattern scan. `value` is canonical
+base64 containing 1 to 4096 bytes. Initial filters are `exact` and `notEqual`;
+refinements also support `changed` and `unchanged`. Exact/not-equal refinements
+must provide a base64 value with the original width. With `aligned:true`, the
+pattern width is the stride; with `false`, overlapping matches are possible.
+Byte results return the current pattern as base64 in both `scannedValue` and
+`raw`. Aligned candidates are anchored to absolute addresses where
+`address % width == 0`. A changed byte can affect multiple overlapping windows.
+
+`dataType:"string"` uses the same fixed-width engine with a plain JSON string
+`value`. `encoding` is `utf8` (default) or `ascii`; ASCII rejects non-ASCII
+input and UTF-8 rejects malformed input. Encoded width is 1 to 4096 bytes.
+`caseSensitive` defaults to `true`. Case-insensitive matching folds only
+ASCII `A`-`Z`; non-ASCII UTF-8 bytes remain exact. Exact/not-equal refinements
+inherit encoding and case sensitivity and must keep the original encoded width.
+Changed/unchanged compare raw bytes. `scannedValue` is valid UTF-8 with malformed
+result bytes replaced by U+FFFD; `raw` always preserves exact bytes as base64.
+
+`dataType:"ppcInstruction"` scans absolute 4-byte-aligned instruction words.
+Initial filters are `exact` (numeric instruction word), `mnemonic` (the exact,
+case-sensitive first token of canonical disassembly, including aliases such as
+`nop` and `blr`), and `validInstruction` (an encoding supported by Dolphin's
+Gekko execution tables and accepted by the canonical disassembler). Refinements
+also support raw-word `changed` and `unchanged`. Results include the word as
+`scannedValue`, exact bytes in `raw`, and canonical address-aware Gekko
+`disassembly`. The type always enforces 4-byte alignment.
+Mnemonic and validity scans are limited to 4,194,304 instruction candidates.
+
+```jsonc
+{"command":"dolphin_memoryScanStart", "arguments":{
+  "regions":["mem1"],
+  "ranges":[{"start":"0x80000000", "end":"0x81800000"}],
+  "dataType":"u32", "filter":"exact", "value":"100",
+  "aligned":true, "pauseDuringScan":false
+}}
+// -> {"scanId":1, "jobId":1, "state":"running", "pauseDuringScan":false}
+```
+
+Every scan pauses CPU, DSP, and FIFO while all requested ranges are copied into
+one consistent snapshot. With `pauseDuringScan:false` (the default), emulation
+resumes before the immutable snapshot is filtered. With `true`, execution stays
+paused through filtering and atomic result commit. A core that was already
+paused remains paused.
+While a `pauseDuringScan:true` job owns the core, requests other than memory
+region, scan status/results/cancel/dispose/undo/result-removal, and disconnect
+are rejected. Undo and result removal remain safe to receive but reject while
+the job is active.
+
+The accepted response is followed by exactly one terminal event. Clients do
+not need to poll status:
+
+```jsonc
+{"event":"dolphin_memoryScanCompleted", "body":{
+  "scanId":1, "jobId":1, "generation":1, "resultCount":42,
+  "durationMilliseconds":183, "pauseDuringScan":false
+}}
+```
+
+Failures emit `dolphin_memoryScanFailed` with `message`; cancellation emits
+`dolphin_memoryScanCancelled`. Failed or cancelled refinements leave the last
+committed generation available.
+
+## `dolphin_memoryScanRefine`
+
+Filters a completed generation using a fresh consistent snapshot. In addition
+to value filters, refinement supports `changed`, `unchanged`, `increased`,
+`decreased`, `increasedBy`, and `decreasedBy`.
+
+```jsonc
+{"command":"dolphin_memoryScanRefine", "arguments":{
+  "scanId":1, "filter":"decreased"
+}}
+```
+
+Omitting `pauseDuringScan` inherits the value from `dolphin_memoryScanStart`;
+an explicit boolean overrides it for that refinement job.
+
+## `dolphin_memoryScanStatus`
+
+Optional diagnostics/recovery request. Normal clients should wait for terminal
+events instead.
+
+```jsonc
+{"command":"dolphin_memoryScanStatus", "arguments":{"scanId":1}}
+// -> {"scanId":1, "jobId":2, "generation":1, "state":"running",
+//     "phase":"filtering", "pauseDuringScan":true,
+//     "emulationPaused":true, "resultCount":42}
+```
+
+Phases are `waiting`, `capturing`, `filtering`, `committing`, `completed`,
+`cancelled`, or `failed`.
+
+## `dolphin_memoryScanResults`
+
+Returns up to 4096 committed results. Results remain readable while a refinement
+builds the next generation privately.
+
+```jsonc
+{"command":"dolphin_memoryScanResults", "arguments":{
+  "scanId":1, "start":0, "count":256
+}}
+// -> {"scanId":1, "generation":1, "totalResults":42, "start":0,
+//     "results":[{"address":"0x80401234", "scannedValue":"100",
+//                  "raw":"AAAAZA=="}]}
+```
+
+## `dolphin_memoryScanCancel`
+
+```jsonc
+{"command":"dolphin_memoryScanCancel", "arguments":{"scanId":1}}
+```
+
+Cancellation is cooperative. The original job still emits its mandatory
+`dolphin_memoryScanCancelled` terminal event once it has released any scan-owned
+pause.
+
+## `dolphin_memoryScanDispose`
+
+```jsonc
+{"command":"dolphin_memoryScanDispose", "arguments":{"scanId":1}}
+```
+
+Releases retained snapshots and results. Disposing an active scan requests
+cancellation; its worker still emits a terminal event. Completion can win if
+the generation has already entered its atomic commit.
+
+Limits: one active scan job per DAP session, eight retained scans, 256 MiB of
+snapshot plus candidate state process-wide, 256 MiB of snapshot input per job,
+non-overlapping ranges, at most 1 GiB of estimated byte-pattern comparison
+work, 128-byte numeric literals, and 4096 results per page. Wide byte-pattern
+result pages are reduced to at most 1 MiB of raw result bytes, so fewer than the
+requested count may return.
+
+## `dolphin_memoryScanUndo`
+
+Restores the previous committed result generation. Successful refinements and
+result removals retain up to 16 undo generations. Undo is synchronous, emits no
+terminal event, and is rejected while any scan job in the session is active.
+
+```jsonc
+{"command":"dolphin_memoryScanUndo", "arguments":{"scanId":1}}
+// -> {"scanId":1, "generation":1, "resultCount":42,
+//     "removedCount":0, "canUndo":false}
+```
+
+Generation numbers identify immutable states and are not reused. Undo restores
+the original generation number; the next refinement or removal receives a new,
+larger number. Refinement generations retain their snapshots and candidate
+bitmaps; removal generations share snapshots but retain their own bitmaps.
+Budget admission counts the complete live retained set plus the in-flight
+generation, before any 16-generation history eviction.
+
+## `dolphin_memoryScanRemoveResults`
+
+Removes up to 4096 explicit result addresses. A successful removal creates a
+new immutable generation without copying the retained snapshot. Duplicate,
+unknown, unaligned, and already-removed addresses are ignored. If no supplied
+address is an active result, no generation is created.
+
+```jsonc
+{"command":"dolphin_memoryScanRemoveResults", "arguments":{
+  "scanId":1, "addresses":["0x80401234","0x80405678"]
+}}
+// -> {"scanId":1, "generation":3, "resultCount":40,
+//     "removedCount":2, "canUndo":true}
+```
+
+## `dolphin_resolvePointerChain`
+
+Resolves up to 64 big-endian 32-bit pointer dereferences while CPU, DSP, and
+FIFO are paused by one `CPUThreadGuard`. `offsets` must contain one to 64 JSON
+integers in `[-2147483648, 2147483647]`. Each entry causes one dereference:
+Dolphin reads the pointer at the current address and computes
+`next = pointer + offset`.
+
+```jsonc
+{"command":"dolphin_resolvePointerChain", "arguments":{
+  "baseAddress":"0x80004000", "offsets":[16,-4]
+}}
+// -> {"finalAddress":"0x8000601c", "steps":[
+//   {"address":"0x80004000", "pointerValue":"0x80005000",
+//    "offset":16, "resultAddress":"0x80005010"},
+//   {"address":"0x80005010", "pointerValue":"0x80006020",
+//    "offset":-4, "resultAddress":"0x8000601c"}
+// ]}
+```
+
+The request fails if any four-byte pointer is unreadable, an offset leaves the
+32-bit address space, the offset list is empty, or it exceeds 64 entries. The
+final address is range-checked but not dereferenced or otherwise required to be
+readable.

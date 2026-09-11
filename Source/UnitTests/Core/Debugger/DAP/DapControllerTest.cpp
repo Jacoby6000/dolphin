@@ -321,6 +321,44 @@ TEST_F(DapControllerTest, ReadMemoryStopsAtEndOfRam)
   EXPECT_EQ(controller.ReadMemory(start, 8).size(), 2u);
 }
 
+TEST_F(DapControllerTest, ResolvePointerChainReturnsIntermediateSteps)
+{
+  const std::array<u8, 4> first{{0x00, 0x00, 0x40, 0x20}};
+  const std::array<u8, 4> second{{0x00, 0x00, 0x50, 0x20}};
+  System().GetMemory().CopyToEmu(0x4000, first.data(), first.size());
+  System().GetMemory().CopyToEmu(0x4030, second.data(), second.size());
+
+  DAP::DapDebugController controller(System());
+  const std::array<s32, 2> offsets{{0x10, -4}};
+  const auto resolved = controller.ResolvePointerChain(0x4000, offsets);
+  ASSERT_TRUE(resolved.has_value());
+  EXPECT_EQ(resolved->final_address, 0x501cu);
+  ASSERT_EQ(resolved->steps.size(), 2u);
+  EXPECT_EQ(resolved->steps[0].address, 0x4000u);
+  EXPECT_EQ(resolved->steps[0].pointer_value, 0x4020u);
+  EXPECT_EQ(resolved->steps[0].result_address, 0x4030u);
+  EXPECT_EQ(resolved->steps[1].address, 0x4030u);
+  EXPECT_EQ(resolved->steps[1].pointer_value, 0x5020u);
+  EXPECT_EQ(resolved->steps[1].offset, -4);
+}
+
+TEST_F(DapControllerTest, ResolvePointerChainRejectsUnreadablePointerAndOverflow)
+{
+  DAP::DapDebugController controller(System());
+  const std::array<s32, 1> no_offset{{0}};
+  EXPECT_FALSE(controller.ResolvePointerChain(INVALID_ADDRESS, no_offset).has_value());
+
+  const std::array<u8, 4> pointer{{0xff, 0xff, 0xff, 0xff}};
+  System().GetMemory().CopyToEmu(TEST_ADDRESS, pointer.data(), pointer.size());
+  const std::array<s32, 1> positive_offset{{1}};
+  EXPECT_FALSE(controller.ResolvePointerChain(TEST_ADDRESS, positive_offset).has_value());
+
+  const std::array<u8, 4> zero_pointer{{0x00, 0x00, 0x00, 0x00}};
+  System().GetMemory().CopyToEmu(TEST_ADDRESS, zero_pointer.data(), zero_pointer.size());
+  const std::array<s32, 1> negative_offset{{-1}};
+  EXPECT_FALSE(controller.ResolvePointerChain(TEST_ADDRESS, negative_offset).has_value());
+}
+
 TEST_F(DapControllerTest, WriteMemoryPersistsToRam)
 {
   const std::array<u8, 4> payload{{0xca, 0xfe, 0xd0, 0x0d}};
