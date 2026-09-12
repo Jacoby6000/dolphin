@@ -225,7 +225,7 @@ Package and install the bundled connector:
 ```bash
 cd /path/to/dolphin/Tools/dap/vscode
 npx @vscode/vsce package
-code --install-extension dolphin-dap-client-0.1.0.vsix
+code --install-extension dolphin-dap-client-0.1.1.vsix
 ```
 
 Code - OSS users should replace `code` with `code-oss`. The connector only registers the
@@ -255,6 +255,10 @@ Open the source project in VS Code and create `.vscode/launch.json`:
       "request": "attach",
       "host": "127.0.0.1",
       "port": 5678,
+      "sourcePaths": [
+        "${workspaceFolder}/src",
+        "${workspaceFolder}/extern/dolphin/src"
+      ],
       "stopOnEntry": true
     }
   ]
@@ -262,6 +266,9 @@ Open the source project in VS Code and create `.vscode/launch.json`:
 ```
 
 Open **Run and Debug**, select **Attach to Dolphin**, and start debugging.
+
+`sourcePaths` lists ordered directories used to resolve relative and basename-only paths
+recorded by the ELF's DWARF data. Omit it when DWARF paths already identify readable files.
 
 The ISO supplies the disc environment, while Dolphin executes the ELF so its symbols and
 DWARF addresses match the running code. Build the source files you need to inspect without
