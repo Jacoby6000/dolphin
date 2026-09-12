@@ -220,8 +220,10 @@ Expect a JSON `response` with `"command":"initialize"` and `"success":true`.
 
 ## Visual Studio Code
 
-Use VS Code's standard `debugServer` setting to connect an installed debugger extension
-to Dolphin's TCP server:
+Install Microsoft's
+[`C/C++`](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cpptools)
+extension, then use VS Code's standard `debugServer` setting to connect directly to
+Dolphin's TCP server:
 
 ```json
 {
@@ -229,18 +231,18 @@ to Dolphin's TCP server:
   "configurations": [
     {
       "name": "Attach to Dolphin",
-      "type": "<installed-debugger-type>",
+      "type": "cppdbg",
       "request": "attach",
-      "debugServer": 5678,
-      "stopOnEntry": true
+      "program": "/path/to/main.elf",
+      "debugServer": 5678
     }
   ]
 }
 ```
 
-Replace `type` with a debugger type registered by one of your installed extensions.
-VS Code does not include a generic DAP debugger type. Start Dolphin with the matching TCP
-port before starting this configuration.
+The C/C++ extension registers the `cppdbg` type and enables source breakpoints. Because
+`debugServer` is set, VS Code connects to Dolphin instead of starting the extension's own
+debug adapter. Start Dolphin with the matching TCP port before starting this configuration.
 
 ## Neovim
 
