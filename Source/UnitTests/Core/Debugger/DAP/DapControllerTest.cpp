@@ -592,10 +592,25 @@ TEST_F(DapControllerTest, ResolveSourceLineBreakpointUsesDwarfLineTable)
   EXPECT_EQ(*address, DwarfTestFixture::kLineTwoAddress);
 }
 
+TEST_F(DapControllerTest, ResolveSourceLineBreakpointDoesNotTreatDwarfFileHandleAsAddress)
+{
+  DAP::DapDebugController controller(System());
+  {
+    Core::CPUThreadGuard guard(System());
+    ASSERT_TRUE(Core::Debug::ImportDwarf(guard, System().GetPowerPC().GetSymbolDB(),
+                                         DwarfTestFixture::kDebugSection,
+                                         DwarfTestFixture::kLineSection));
+    System().GetPowerPC().GetSymbolDB().AddSourceFile("missing.c");
+  }
+
+  const DAP::SourceBreakpointContext context{.source_reference = 2};
+  EXPECT_FALSE(controller.ResolveSourceLineBreakpoint(context, 3));
+}
+
 TEST_F(DapControllerTest, ResolveSourceLineBreakpointFallbackRejectsOverflowingLine)
 {
   // DESNOTE(jbarber, 2026-07-22): When DWARF line lookup fails, the fallback
-  // computes `*base + line * 4`. Computing in 32-bit would silently wrap
+  // computes `*base + (line - 1) * 4`. Computing in 32-bit would silently wrap
   // for a large `line` paired with a high base, installing a breakpoint at
   // a nonsense PC. The 64-bit guard returns nullopt instead so the
   // breakpoint is reported unresolved. Bugbot #63.
@@ -603,19 +618,16 @@ TEST_F(DapControllerTest, ResolveSourceLineBreakpointFallbackRejectsOverflowingL
   // base near the top of the 32-bit space; a line that pushes base+line*4
   // past u32 max should fail to resolve.
   const DAP::SourceBreakpointContext context{.source_name = "0xFFFFFFF0"};
-  const std::optional<u32> address = controller.ResolveSourceLineBreakpoint(context, 4u);
+  const std::optional<u32> address = controller.ResolveSourceLineBreakpoint(context, 5u);
   EXPECT_FALSE(address.has_value());
 }
 
 TEST_F(DapControllerTest, ResolveSourceLineBreakpointFallbackAcceptsBoundaryLine)
 {
-  // A line whose base+line*4 exactly equals u32 max should resolve.
-  // base = 0xFFFFFFFC, line = 3 -> 0xFFFFFFFC + 12 = 0x100000008 > u32 max,
-  // so this should NOT resolve. Pick base = 0xFFFFFFF0, line = 3 ->
-  // 0xFFFFFFF0 + 12 = 0xFFFFFFFC (in range).
+  // A line whose base+(line-1)*4 exactly equals the last aligned u32 should resolve.
   DAP::DapDebugController controller(System());
   const DAP::SourceBreakpointContext context{.source_name = "0xFFFFFFF0"};
-  const std::optional<u32> address = controller.ResolveSourceLineBreakpoint(context, 3u);
+  const std::optional<u32> address = controller.ResolveSourceLineBreakpoint(context, 4u);
   ASSERT_TRUE(address.has_value());
   EXPECT_EQ(*address, 0xFFFFFFFCu);
 }
@@ -1382,9 +1394,9 @@ TEST_F(DapControllerTest, GetLoadedSourcesListsFunctionSymbols)
   DAP::DapDebugController controller(System());
   const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
   ASSERT_EQ(sources.size(), 1u);
-  EXPECT_EQ(sources[0].source_reference, static_cast<int>(TEST_ADDRESS));
+  EXPECT_EQ(sources[0].source_reference, DAP::MakeDisassemblySourceReference(TEST_ADDRESS));
   EXPECT_EQ(sources[0].name, "game.elf");
-  EXPECT_EQ(sources[0].path, "0x00003100");
+  EXPECT_TRUE(sources[0].path.empty());
 }
 
 TEST_F(DapControllerTest, GetSourceReturnsDisassembly)
@@ -1393,7 +1405,7 @@ TEST_F(DapControllerTest, GetSourceReturnsDisassembly)
   System().GetMemory().CopyToEmu(TEST_ADDRESS, nop.data(), nop.size());
 
   DAP::DapDebugController controller(System());
-  const auto source = controller.GetSource(TEST_ADDRESS, 0, 0);
+  const auto source = controller.GetSource(DAP::MakeDisassemblySourceReference(TEST_ADDRESS), 0, 0);
   ASSERT_TRUE(source.has_value());
   EXPECT_EQ(source->mime_type, "text/x-disassembly");
   EXPECT_NE(source->content.find("nop"), std::string::npos);
@@ -1402,17 +1414,18 @@ TEST_F(DapControllerTest, GetSourceReturnsDisassembly)
 TEST_F(DapControllerTest, GetSourceRejectsInvalidBase)
 {
   DAP::DapDebugController controller(System());
-  EXPECT_FALSE(controller.GetSource(INVALID_ADDRESS, 0, 0).has_value());
+  EXPECT_FALSE(
+      controller.GetSource(DAP::MakeDisassemblySourceReference(INVALID_ADDRESS), 0, 0).has_value());
 }
 
 TEST_F(DapControllerTest, GetBreakpointLocationsStopsAtInvalidMemory)
 {
   DAP::DapDebugController controller(System());
   const std::vector<DAP::BreakpointLocation> locations =
-      controller.GetBreakpointLocations(TEST_ADDRESS, 0, 3);
+      controller.GetBreakpointLocations(DAP::MakeDisassemblySourceReference(TEST_ADDRESS), 1, 4);
   ASSERT_EQ(locations.size(), 4u);
-  EXPECT_EQ(locations[0].line, 0);
-  EXPECT_EQ(locations[3].line, 3);
+  EXPECT_EQ(locations[0].line, 1);
+  EXPECT_EQ(locations[3].line, 4);
 }
 
 TEST_F(DapControllerTest, GetStackTraceIncludesSourceForKnownSymbol)
@@ -1430,7 +1443,7 @@ TEST_F(DapControllerTest, GetStackTraceIncludesSourceForKnownSymbol)
   ASSERT_EQ(trace.frames.size(), 1u);
   ASSERT_TRUE(trace.frames[0].source_base.has_value());
   EXPECT_EQ(*trace.frames[0].source_base, TEST_ADDRESS);
-  EXPECT_EQ(trace.frames[0].source_line, 2);
+  EXPECT_EQ(trace.frames[0].source_line, 3);
 }
 
 TEST_F(DapControllerTest, RestartResetsPpcState)
@@ -1468,7 +1481,7 @@ TEST_F(DapControllerTest, ClearBreakpointsRemovesCodeAndDataBreakpoints)
   // UpdateSourceBreakpoints and UpdateInstructionBreakpoints merge: both
   // contribute to the global BreakPoints store via ReapplyCodeBreakpoints.
   const DAP::SourceBreakpointContext context{.source_name = "0x00003100"};
-  controller.UpdateSourceBreakpoints("test:1", context, {{.line = 0}});
+  controller.UpdateSourceBreakpoints("test:1", context, {{.line = 1}});
   controller.UpdateInstructionBreakpoints({{.address = TEST_ADDRESS + 0x100}});
   controller.SetDataBreakpoints({{.address = TEST_ADDRESS, .read = true, .write = true}});
 
@@ -1545,7 +1558,7 @@ TEST_F(DapControllerTest, GetLoadedSourcesListsDwarfFiles)
   const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
   ASSERT_EQ(sources.size(), 1u);
   EXPECT_EQ(sources[0].path, DwarfTestFixture::kCompileUnitName);
-  EXPECT_EQ(sources[0].source_reference, 1);
+  EXPECT_EQ(sources[0].source_reference, 0);
 }
 
 TEST_F(DapControllerTest, GetLoadedSourcesStripsPathToBasename)

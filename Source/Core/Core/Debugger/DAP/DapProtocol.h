@@ -12,6 +12,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Core/Debugger/DAP/DapMemoryEngine.h"
+#include "Core/Debugger/DAP/DapSource.h"
 
 // Structured models for the subset of the Debug Adapter Protocol the Dolphin
 // DAP server speaks. Requests are decoded from picojson objects into typed
@@ -88,7 +89,7 @@ struct RequestedBreakpoint
 
 // Arguments of a `setBreakpoints` request. The base address is taken from the
 // `source.name`/`source.path` hex string (Dolphin models a "source" as a code
-// region anchored at an address). Each breakpoint's address is base + line*4.
+// region anchored at an address). Pseudo-source lines are one-based.
 struct SetBreakpointsArguments
 {
   std::optional<u32> base;
@@ -149,10 +150,11 @@ SetInstructionBreakpointsArguments
 ParseSetInstructionBreakpoints(const picojson::object& arguments);
 
 // Arguments of a `gotoTargets` request. The base address is taken from the
-// `source.name`/`source.path` hex string; `line` is a 4-byte instruction index.
+// `source.name`/`source.path` hex string; pseudo-source lines are one-based.
 struct GotoTargetsArguments
 {
   std::optional<u32> address;
+  int line = 0;
 };
 
 GotoTargetsArguments ParseGotoTargets(const picojson::object& arguments);
@@ -169,7 +171,7 @@ std::optional<GotoArguments> ParseGoto(const picojson::object& arguments);
 
 struct SourceRequestArguments
 {
-  std::optional<u32> base;
+  std::optional<SourceReference> source_reference;
   int start_line = 0;
   int end_line = -1;
 };
@@ -178,7 +180,7 @@ SourceRequestArguments ParseSourceRequest(const picojson::object& arguments);
 
 struct BreakpointLocationsArguments
 {
-  std::optional<u32> base;
+  std::optional<SourceReference> source_reference;
   int start_line = 0;
   int end_line = -1;
 };

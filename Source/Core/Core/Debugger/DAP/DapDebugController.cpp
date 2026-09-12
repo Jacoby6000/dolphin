@@ -389,16 +389,18 @@ DapDebugController::ResolveSourceLineBreakpoint(const SourceBreakpointContext& c
 {
   Core::CPUThreadGuard guard(m_system);
   auto& symbol_db = m_system.GetPowerPC().GetSymbolDB();
+  bool is_file_reference = false;
 
   if (symbol_db.HasSourceLineInfo())
   {
-    if (context.source_reference && *context.source_reference > 0)
+    if (context.source_reference)
     {
       const auto& files = symbol_db.GetSourceFiles();
-      if (static_cast<size_t>(*context.source_reference) <= files.size())
+      if (*context.source_reference <= files.size())
       {
-        if (const std::optional<u32> address =
-                symbol_db.GetLineAddress(files[*context.source_reference - 1], line))
+        is_file_reference = true;
+        if (const std::optional<u32> address = symbol_db.GetLineAddress(
+                files[static_cast<size_t>(*context.source_reference - 1)], line))
           return address;
       }
     }
@@ -418,8 +420,17 @@ DapDebugController::ResolveSourceLineBreakpoint(const SourceBreakpointContext& c
     }
   }
 
+  if (is_file_reference)
+    return std::nullopt;
+
   std::optional<u32> base;
-  if (context.source_path)
+  if (context.source_reference)
+  {
+    base = DecodeDisassemblySourceReference(*context.source_reference);
+    if (!base && *context.source_reference <= std::numeric_limits<u32>::max())
+      base = static_cast<u32>(*context.source_reference);
+  }
+  if (!base && context.source_path)
     base = Json::ParseHexAddress(*context.source_path);
   if (!base && context.source_name)
     base = Json::ParseHexAddress(*context.source_name);
@@ -430,7 +441,9 @@ DapDebugController::ResolveSourceLineBreakpoint(const SourceBreakpointContext& c
   // produces a non-resolvable nullopt rather than silently wrapping past
   // u32 max and installing a breakpoint at a nonsense PC. Mirrors the same
   // guard in ParseSetBreakpoints. Bugbot #63.
-  const u64 effective = static_cast<u64>(*base) + static_cast<u64>(line) * 4ull;
+  if (line == 0)
+    return std::nullopt;
+  const u64 effective = static_cast<u64>(*base) + (static_cast<u64>(line) - 1ull) * 4ull;
   if (effective > static_cast<u64>(std::numeric_limits<u32>::max()))
     return std::nullopt;
   return static_cast<u32>(effective);
@@ -571,8 +584,8 @@ constexpr u32 MAX_DEBUG_STRING_PREVIEW = 256;
 const Core::Debug::Dwarf::Type* FindType(const Core::Debug::Dwarf::ParseResult& info,
                                          const u32 offset)
 {
-  const auto it = std::ranges::lower_bound(info.types, offset, {},
-                                           &Core::Debug::Dwarf::Type::die_offset);
+  const auto it =
+      std::ranges::lower_bound(info.types, offset, {}, &Core::Debug::Dwarf::Type::die_offset);
   return it == info.types.end() || it->die_offset != offset ? nullptr : &*it;
 }
 
@@ -1096,17 +1109,19 @@ StackTraceResult DapDebugController::GetStackTrace(const int start_frame, const 
     if (source_line)
     {
       frame.source_file = source_line->file;
-      frame.source_line = static_cast<int>(source_line->line);
+      frame.source_line = static_cast<int>(
+          std::clamp<u32>(source_line->line, 1, static_cast<u32>(std::numeric_limits<int>::max())));
     }
     else if (symbol != nullptr && symbol->type == Common::Symbol::Type::Function)
     {
       frame.source_base = symbol->address;
-      frame.source_line = static_cast<int>((address - symbol->address) / 4);
+      frame.source_line = static_cast<int>((address - symbol->address) / 4) + 1;
     }
     else
     {
-      frame.source_base = address;
-      frame.source_line = 0;
+      // An unknown address is not an adapter-provided source. Keep the frame and
+      // instruction pointer for diagnostics without making clients fetch a fake file.
+      frame.source_line = 1;
     }
 
     frames.push_back(std::move(frame));
@@ -1173,7 +1188,7 @@ std::vector<LoadedSource> DapDebugController::GetLoadedSources()
     for (u32 i = 0; i < files.size(); ++i)
     {
       LoadedSource source;
-      source.source_reference = static_cast<int>(i + 1);
+      source.source_reference = File::Exists(files[i]) ? i + 1 : 0;
       source.path = files[i];
       source.name = files[i];
       const size_t slash = source.name.find_last_of("/\\");
@@ -1189,8 +1204,7 @@ std::vector<LoadedSource> DapDebugController::GetLoadedSources()
       return;
 
     LoadedSource source;
-    source.source_reference = static_cast<int>(symbol.address);
-    source.path = Json::FormatAddress(symbol.address);
+    source.source_reference = MakeDisassemblySourceReference(symbol.address);
     source.name = symbol.object_name.empty() ? symbol.name : symbol.object_name;
     if (source.name.empty())
       source.name = source.path;
@@ -1199,13 +1213,13 @@ std::vector<LoadedSource> DapDebugController::GetLoadedSources()
   return sources;
 }
 
-std::optional<SourceContent> DapDebugController::GetSource(const u32 base_address,
+std::optional<SourceContent> DapDebugController::GetSource(const SourceReference source_reference,
                                                            const int start_line, const int end_line)
 {
   Core::CPUThreadGuard guard(m_system);
   auto& symbol_db = m_system.GetPowerPC().GetSymbolDB();
 
-  const int first_line = std::max(start_line, 0);
+  const int first_line = std::max(start_line, 1);
   const auto add_lines_clamped = [](const int line, const int count) {
     return line > std::numeric_limits<int>::max() - count ? std::numeric_limits<int>::max() :
                                                             line + count;
@@ -1235,10 +1249,10 @@ std::optional<SourceContent> DapDebugController::GetSource(const u32 base_addres
   const u64 span = static_cast<u64>(last_line) - static_cast<u64>(first_line) + 1ull;
   const int line_count = static_cast<int>(std::min(span, static_cast<u64>(kMaxResponseLines)));
 
-  if (symbol_db.HasSourceLineInfo() && base_address > 0 &&
-      base_address <= symbol_db.GetSourceFiles().size())
+  if (symbol_db.HasSourceLineInfo() && source_reference > 0 &&
+      source_reference <= symbol_db.GetSourceFiles().size())
   {
-    const std::string& path = symbol_db.GetSourceFiles()[base_address - 1];
+    const std::string& path = symbol_db.GetSourceFiles()[static_cast<size_t>(source_reference - 1)];
     File::IOFile file(path, "r");
     if (!file)
       return std::nullopt;
@@ -1281,7 +1295,10 @@ std::optional<SourceContent> DapDebugController::GetSource(const u32 base_addres
     return result;
   }
 
-  if (!PowerPC::MMU::HostIsRAMAddress(guard, base_address))
+  std::optional<u32> base_address = DecodeDisassemblySourceReference(source_reference);
+  if (!base_address && source_reference <= std::numeric_limits<u32>::max())
+    base_address = static_cast<u32>(source_reference);
+  if (!base_address || !PowerPC::MMU::HostIsInstructionRAMAddress(guard, *base_address))
     return std::nullopt;
 
   SourceContent result;
@@ -1290,12 +1307,12 @@ std::optional<SourceContent> DapDebugController::GetSource(const u32 base_addres
 
   for (int i = 0; i < line_count; ++i)
   {
-    const u64 addr64 = static_cast<u64>(base_address) +
-                       (static_cast<u64>(first_line) + static_cast<u64>(i)) * 4ull;
+    const u64 addr64 = static_cast<u64>(*base_address) +
+                       (static_cast<u64>(first_line - 1) + static_cast<u64>(i)) * 4ull;
     if (addr64 > std::numeric_limits<u32>::max())
       break;
     const u32 addr = static_cast<u32>(addr64);
-    if (!PowerPC::MMU::HostIsRAMAddress(guard, addr))
+    if (!PowerPC::MMU::HostIsInstructionRAMAddress(guard, addr))
       break;
     if (i > 0)
       result.content += '\n';
@@ -1307,14 +1324,16 @@ std::optional<SourceContent> DapDebugController::GetSource(const u32 base_addres
   return result;
 }
 
-std::vector<BreakpointLocation> DapDebugController::GetBreakpointLocations(const u32 base_address,
-                                                                           const int start_line,
-                                                                           const int end_line)
+std::vector<BreakpointLocation>
+DapDebugController::GetBreakpointLocations(const SourceReference source_reference,
+                                           const int start_line, const int end_line)
 {
   Core::CPUThreadGuard guard(m_system);
   std::vector<BreakpointLocation> locations;
 
-  const int first_line = std::max(start_line, 0);
+  if (start_line <= 0)
+    return locations;
+  const int first_line = start_line;
   const auto add_lines_clamped = [](const int line, const int count) {
     return line > std::numeric_limits<int>::max() - count ? std::numeric_limits<int>::max() :
                                                             line + count;
@@ -1334,10 +1353,10 @@ std::vector<BreakpointLocation> DapDebugController::GetBreakpointLocations(const
   const u64 line_count = static_cast<u64>(capped_last) - static_cast<u64>(first_line) + 1;
 
   auto& symbol_db = m_system.GetPowerPC().GetSymbolDB();
-  if (symbol_db.HasSourceLineInfo() && base_address > 0 &&
-      base_address <= symbol_db.GetSourceFiles().size())
+  if (symbol_db.HasSourceLineInfo() && source_reference > 0 &&
+      source_reference <= symbol_db.GetSourceFiles().size())
   {
-    const std::string& file = symbol_db.GetSourceFiles()[base_address - 1];
+    const std::string& file = symbol_db.GetSourceFiles()[static_cast<size_t>(source_reference - 1)];
     for (u64 i = 0; i < line_count; ++i)
     {
       const int line = static_cast<int>(static_cast<u64>(first_line) + i);
@@ -1347,14 +1366,20 @@ std::vector<BreakpointLocation> DapDebugController::GetBreakpointLocations(const
     return locations;
   }
 
+  std::optional<u32> base_address = DecodeDisassemblySourceReference(source_reference);
+  if (!base_address && source_reference <= std::numeric_limits<u32>::max())
+    base_address = static_cast<u32>(source_reference);
+  if (!base_address)
+    return locations;
+
   for (u64 i = 0; i < line_count; ++i)
   {
     const int line = static_cast<int>(static_cast<u64>(first_line) + i);
-    const u64 addr64 = static_cast<u64>(base_address) + static_cast<u64>(line) * 4ull;
+    const u64 addr64 = static_cast<u64>(*base_address) + (static_cast<u64>(line) - 1ull) * 4ull;
     if (addr64 > std::numeric_limits<u32>::max())
       break;
     const u32 addr = static_cast<u32>(addr64);
-    if (!PowerPC::MMU::HostIsRAMAddress(guard, addr))
+    if (!PowerPC::MMU::HostIsInstructionRAMAddress(guard, addr))
       break;
     locations.push_back({line});
   }

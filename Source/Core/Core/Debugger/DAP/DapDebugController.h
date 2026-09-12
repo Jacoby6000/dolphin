@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Core/Debugger/DAP/DapSource.h"
 #include "Core/Debugger/DWARF/DwarfReader.h"
 
 namespace Core
@@ -93,7 +94,7 @@ struct StackTraceResult
 
 struct LoadedSource
 {
-  int source_reference = 0;
+  SourceReference source_reference = 0;
   std::string name;
   std::string path;
 };
@@ -117,7 +118,7 @@ struct CodeBreakpointRequest
 
 struct SourceBreakpointContext
 {
-  std::optional<int> source_reference;
+  std::optional<SourceReference> source_reference;
   std::optional<std::string> source_path;
   std::optional<std::string> source_name;
 };
@@ -220,9 +221,10 @@ public:
   std::vector<ThreadInfo> GetThreads();
   StackTraceResult GetStackTrace(int start_frame = 0, int levels = 20);
   std::vector<LoadedSource> GetLoadedSources();
-  std::optional<SourceContent> GetSource(u32 base_address, int start_line, int end_line);
-  std::vector<BreakpointLocation> GetBreakpointLocations(u32 base_address, int start_line,
-                                                         int end_line);
+  std::optional<SourceContent> GetSource(SourceReference source_reference, int start_line,
+                                         int end_line);
+  std::vector<BreakpointLocation> GetBreakpointLocations(SourceReference source_reference,
+                                                         int start_line, int end_line);
   void Restart();
   void Terminate();
   // Clears all code/data breakpoints this controller installed in the global
