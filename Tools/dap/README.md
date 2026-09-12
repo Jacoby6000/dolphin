@@ -222,8 +222,18 @@ Expect a JSON `response` with `"command":"initialize"` and `"success":true`.
 
 Install Microsoft's
 [`C/C++`](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cpptools)
-extension, then use VS Code's standard `debugServer` setting to connect directly to
-Dolphin's TCP server:
+extension. Start the NoGUI executable in a terminal with the debug ELF and matching ISO:
+
+```bash
+/path/to/dolphin-emu-nogui \
+  -C Dolphin.General.DAPPort=5678 \
+  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/main.elf \
+  --platform headless
+```
+
+Open the source project in VS Code and create `.vscode/launch.json`:
 
 ```json
 {
@@ -242,7 +252,11 @@ Dolphin's TCP server:
 
 The C/C++ extension registers the `cppdbg` type and enables source breakpoints. Because
 `debugServer` is set, VS Code connects to Dolphin instead of starting the extension's own
-debug adapter. Start Dolphin with the matching TCP port before starting this configuration.
+debug adapter. Open **Run and Debug**, select **Attach to Dolphin**, and start debugging.
+
+The ISO supplies the disc environment, while Dolphin executes the ELF so its symbols and
+DWARF addresses match the running code. Build the source files you need to inspect without
+optimization for reliable stepping and locals.
 
 ## Neovim
 
