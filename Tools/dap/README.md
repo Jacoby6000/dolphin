@@ -220,9 +220,9 @@ Expect a JSON `response` with `"command":"initialize"` and `"success":true`.
 
 ## Visual Studio Code
 
-Install Microsoft's
-[`C/C++`](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cpptools)
-extension. Start the NoGUI executable in a terminal with the debug ELF and matching ISO:
+Install [`CodeLLDB`](https://open-vsx.org/extension/vadimcn/vscode-lldb)
+(`vadimcn.vscode-lldb`). Start the NoGUI executable in a terminal with the debug ELF and
+matching ISO:
 
 ```bash
 /path/to/dolphin-emu-nogui \
@@ -241,7 +241,7 @@ Open the source project in VS Code and create `.vscode/launch.json`:
   "configurations": [
     {
       "name": "Attach to Dolphin",
-      "type": "cppdbg",
+      "type": "lldb",
       "request": "attach",
       "program": "/path/to/main.elf",
       "debugServer": 5678
@@ -250,9 +250,9 @@ Open the source project in VS Code and create `.vscode/launch.json`:
 }
 ```
 
-The C/C++ extension registers the `cppdbg` type and enables source breakpoints. Because
-`debugServer` is set, VS Code connects to Dolphin instead of starting the extension's own
-debug adapter. Open **Run and Debug**, select **Attach to Dolphin**, and start debugging.
+CodeLLDB registers the `lldb` type and enables source breakpoints. Because `debugServer`
+is set, VS Code connects to Dolphin instead of starting CodeLLDB's own debug adapter. Open
+**Run and Debug**, select **Attach to Dolphin**, and start debugging.
 
 The ISO supplies the disc environment, while Dolphin executes the ELF so its symbols and
 DWARF addresses match the running code. Build the source files you need to inspect without
