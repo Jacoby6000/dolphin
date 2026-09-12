@@ -20,7 +20,7 @@ connects over TCP (or a Unix socket on Linux) after Dolphin is listening.
 
    ```bash
    cp Tools/dap/nvim/.dolphin-dap.example.lua /path/to/melee/.dolphin-dap.lua
-   # edit iso / elf / dolphin binary paths
+   # edit the ELF, ISO, and Dolphin binary paths
    ```
 
 Buffer diagnostics moved to `<leader>ld` so `<leader>d*` is free for DAP (see `dolphin-dap.lua`).
@@ -42,8 +42,9 @@ Terminal:
 ```bash
 dolphin-emu-nogui \
   -C Dolphin.General.DAPPort=5678 \
-  --debug-elf /path/to/main.elf \
-  --exec /path/to/game.iso \
+  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/main.elf \
   --platform headless
 ```
 
@@ -57,8 +58,9 @@ GUI build (same flags, no `--platform headless`):
 ```bash
 dolphin-emu \
   -C Dolphin.General.DAPPort=5678 \
-  --debug-elf /path/to/main.elf \
-  --exec /path/to/game.iso
+  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/main.elf
 ```
 
 Or pick **Dolphin attach (Qt spawn, :5678)** in Neovim to start `dolphin-emu` and
@@ -69,8 +71,9 @@ Nogui with an emulator window (no Qt UI, but video output):
 ```bash
 dolphin-emu-nogui \
   -C Dolphin.General.DAPPort=5678 \
-  --debug-elf /path/to/main.elf \
-  --exec /path/to/game.iso \
+  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/main.elf \
   --platform x11
 ```
 
@@ -79,8 +82,31 @@ nogui (video, x11)** / **Dolphin attach (nogui video spawn, :5678)** in Neovim.
 
 ### Launch (Neovim starts Dolphin)
 
-Requires `iso` in `.dolphin-dap.lua`. Neovim spawns Dolphin with a dynamic DAP port
-and connects automatically:
+For source-level decomp debugging, specify both inputs: set `program` to the built ELF
+and `disc` to the corresponding game ISO. Neovim spawns Dolphin with a dynamic DAP
+port and connects automatically.
+
+```lua
+return {
+  dolphin = "/path/to/build/Binaries/dolphin-emu-nogui",
+  program = "/path/to/melee/build/GALE01/main.elf",
+  disc = "/path/to/melee.iso",
+  source_paths = { "/path/to/melee/src", "/path/to/melee/extern/dolphin/src" },
+  enable_cheats = false,
+}
+```
+
+`disc` mounts the ISO and enables its bootstrap environment. Dolphin uses the ISO to
+establish the disc ID, FST, OS state, and DVD/filesystem access, but ignores the DOL in
+the ISO as the program to execute. It loads and executes `program` instead, so the ELF's
+memory layout, symbols, and embedded DWARF remain authoritative.
+
+When `program` is the ISO and `elf` is set, the ISO's DOL executes and the ELF supplies
+metadata only. This supports partial decompilation, but it is safe only when the ELF has
+exactly the same link layout as the running DOL. The `program` field also accepts DOL
+and disc images for other workflows, and legacy `iso` is accepted as an alias for
+`program`.
+Set `enable_cheats = false` when codes saved for another executable layout must not run.
 
 | Config | Binary | Platform |
 |--------|--------|----------|
@@ -94,21 +120,35 @@ video backend. Optional `dolphin_gui` overrides the Qt binary path (defaults to
 
 ## Source paths / DWARF
 
-For real file:line stack traces, load DWARF via `--debug-elf` (sidecar) or boot a
-debug ELF. Source paths in DWARF must match your editor paths — open the decomp
-tree so `loadedSources` paths resolve (e.g. `src/melee/gm/foo.c`).
+For a fully linked decomp build, set `program` to the ELF and `disc` to the ISO. The ELF
+then supplies both the running code and its debug information.
 
-**Note:** line breakpoints in source files still use the disassembly fallback in
-Dolphin's `setBreakpoints` handler; instruction breakpoints and DWARF stack/source
-views work today. Prefer `<leader>dt` on a line for breakpoints until source
-breakpoints are wired through the line table.
+For a partially decompiled project, you can instead set `program` to the ISO and `elf`
+to a sidecar ELF. Dolphin still executes the DOL in the ISO; the sidecar only supplies
+types, structures, globals, and source information for known code. Use this mode only
+when the sidecar ELF preserves the exact code and data addresses of the running DOL.
+If linking the ELF moves anything, breakpoints and variables may point at the wrong
+memory.
+
+Source stepping and locals do not work reliably in optimized source files (translation
+units). Build the files you need to debug without optimization; otherwise stepping may
+skip lines and locals may be missing or incorrect. Other files can remain optimized.
+
+Set ordered `source_paths` roots when old MWCC DWARF reports only basenames. The
+integration tries a direct relative path, then a recursive basename lookup within each
+root. It does not guess when a root contains multiple matching files; use a narrower
+root in that case.
 
 ## Unix socket (Linux)
 
 Start Dolphin with:
 
 ```bash
-dolphin-emu-nogui -C Dolphin.General.DAPSocket=/tmp/dolphin-dap.sock --exec /path/to/game.iso
+dolphin-emu-nogui \
+  -C Dolphin.General.DAPSocket=/tmp/dolphin-dap.sock \
+  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/main.elf
 ```
 
 Or set in `~/.config/dolphin-emu/Dolphin.ini`:

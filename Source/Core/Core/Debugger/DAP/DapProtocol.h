@@ -19,6 +19,15 @@
 // escaping and number formatting are handled by the serializer.
 namespace DAP::Protocol
 {
+enum class SteppingGranularity
+{
+  Statement,
+  Line,
+  Instruction,
+};
+
+std::optional<SteppingGranularity> ParseSteppingGranularity(const picojson::object& arguments);
+
 // A decoded DAP request envelope. `arguments` is empty when the request carries
 // none.
 struct Request

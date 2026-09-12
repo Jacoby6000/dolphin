@@ -628,7 +628,7 @@ bool MMU::Memcheck(u32 address, u64 var, bool write, size_t size)
   if (mc->is_freeze)
     return write;  // suppress writes, allow reads through
 
-  if (m_system.GetCPU().IsStepping())
+  if (m_system.GetCPU().IsStepping() && !m_power_pc.AreSteppingMemchecksEnabled())
   {
     // Disable when stepping so that resume works.
     return false;
@@ -639,6 +639,9 @@ bool MMU::Memcheck(u32 address, u64 var, bool write, size_t size)
   const bool pause = mc->Action(m_system, var, address, write, size, m_ppc_state.pc);
   if (!pause)
     return false;
+
+  if (m_system.GetCPU().IsStepping())
+    m_power_pc.NotifySteppingMemcheckHit();
 
   m_system.GetCPU().Break();
 

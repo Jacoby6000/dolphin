@@ -1,15 +1,17 @@
 // Copyright 2026 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+
 #include <gtest/gtest.h>
 
+#include "Common/SymbolDB.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/Debugger/DWARF/DwarfImport.h"
 #include "Core/HW/AddressSpace.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/Memmap.h"
-#include "Common/SymbolDB.h"
 #include "Core/PowerPC/PPCSymbolDB.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -76,6 +78,16 @@ TEST_F(PPCSymbolDBLineTest, ClearRemovesSourceLineInfo)
   EXPECT_FALSE(SymbolDB().HasSourceLineInfo());
 }
 
+TEST_F(PPCSymbolDBLineTest, DwarfDebugInfoUsesSharedImmutableStorage)
+{
+  SymbolDB().SetDwarfDebugInfo(DwarfTestFixture::MakeTypedParseResult());
+
+  const auto first = SymbolDB().GetDwarfDebugInfo();
+  const auto second = SymbolDB().GetDwarfDebugInfo();
+  ASSERT_TRUE(first);
+  EXPECT_EQ(first.get(), second.get());
+}
+
 TEST_F(PPCSymbolDBLineTest, ImportDwarfPopulatesLineTable)
 {
   Core::CPUThreadGuard guard(Core::System::GetInstance());
@@ -104,6 +116,23 @@ TEST_F(PPCSymbolDBLineTest, GetSourceLineAtExactEntryAddress)
   ASSERT_TRUE(line);
   EXPECT_EQ(line->line, 5U);
   EXPECT_EQ(line->address, 0x00004100U);
+}
+
+TEST_F(PPCSymbolDBLineTest, GetSourceLineDoesNotEscapeContainingFunction)
+{
+  constexpr u32 first_function = 0x00004100;
+  constexpr u32 source_less_function = 0x00004200;
+  const u32 file_index = SymbolDB().AddSourceFile("foo.c");
+  SymbolDB().AddLineEntry(first_function, file_index, 5);
+  const std::array<u8, 8> code{{0x60, 0x00, 0x00, 0x00, 0x4e, 0x80, 0x00, 0x20}};
+  Core::System::GetInstance().GetMemory().CopyToEmu(first_function, code.data(), code.size());
+  Core::System::GetInstance().GetMemory().CopyToEmu(source_less_function, code.data(), code.size());
+  Core::CPUThreadGuard guard(Core::System::GetInstance());
+  SymbolDB().AddKnownSymbol(guard, first_function, code.size(), "with_source", "foo.c");
+  SymbolDB().AddKnownSymbol(guard, source_less_function, code.size(), "without_source", "asm.o");
+
+  EXPECT_TRUE(SymbolDB().GetSourceLine(first_function + 4).has_value());
+  EXPECT_FALSE(SymbolDB().GetSourceLine(source_less_function).has_value());
 }
 
 TEST_F(PPCSymbolDBLineTest, GetLineAddressReturnsNearestPrecedingLine)
@@ -162,8 +191,7 @@ TEST_F(PPCSymbolDBLineTest, ImportDwarfAddsFunctionSymbol)
   Core::CPUThreadGuard guard(Core::System::GetInstance());
   ASSERT_TRUE(Core::Debug::ImportDwarf(guard, SymbolDB(), DwarfTestFixture::kDebugSection,
                                        DwarfTestFixture::kLineSection));
-  const Common::Symbol* symbol =
-      SymbolDB().GetSymbolFromAddr(DwarfTestFixture::kFunctionAddress);
+  const Common::Symbol* symbol = SymbolDB().GetSymbolFromAddr(DwarfTestFixture::kFunctionAddress);
   ASSERT_NE(symbol, nullptr);
   EXPECT_EQ(symbol->name, DwarfTestFixture::kFunctionName);
 }

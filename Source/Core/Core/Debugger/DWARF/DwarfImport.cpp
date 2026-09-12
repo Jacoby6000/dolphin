@@ -64,15 +64,21 @@ bool ImportDwarf(const CPUThreadGuard& guard, PPCSymbolDB& symbol_db,
 
   NOTICE_LOG_FMT(SYMBOLS, "Imported DWARF: {} functions, {} line entries, {} source files",
                  parsed->functions.size(), parsed->lines.size(), parsed->files.size());
-  return ApplyParseResult(guard, symbol_db, *parsed, object_name);
+  if (!ApplyParseResult(guard, symbol_db, *parsed, object_name))
+    return false;
+  symbol_db.SetDwarfDebugInfo(std::move(*parsed));
+  return true;
 }
 
 bool ImportDwarfFromElf(const CPUThreadGuard& guard, PPCSymbolDB& symbol_db,
                         const std::string& elf_path)
 {
   ElfReader elf(elf_path);
-  if (!elf.IsValid())
+  if (!elf.IsValid() || elf.GetMachine() != EM_PPC)
+  {
+    WARN_LOG_FMT(SYMBOLS, "{} is not a valid 32-bit big-endian PowerPC ELF", elf_path);
     return false;
+  }
 
   const SectionID debug_section = elf.GetSectionByName(".debug");
   const SectionID line_section = elf.GetSectionByName(".line");

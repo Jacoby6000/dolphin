@@ -4,6 +4,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -11,6 +12,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/SymbolDB.h"
+#include "Core/Debugger/DWARF/DwarfReader.h"
 
 namespace Core
 {
@@ -73,6 +75,8 @@ public:
   std::optional<u32> GetLineAddressForQuery(std::string_view file_query, u32 line) const;
   const std::vector<std::string>& GetSourceFiles() const;
   bool HasDenseLineInfoInRange(u32 start, u32 size) const;
+  void SetDwarfDebugInfo(Core::Debug::Dwarf::ParseResult info);
+  std::shared_ptr<const Core::Debug::Dwarf::ParseResult> GetDwarfDebugInfo() const;
 
   void PrintCalls(u32 funcAddr) const;
   void PrintCallers(u32 funcAddr) const;
@@ -92,4 +96,5 @@ private:
 
   std::vector<std::string> m_source_files;
   std::map<u32, LineEntry> m_line_table;
+  std::shared_ptr<const Core::Debug::Dwarf::ParseResult> m_dwarf_debug_info;
 };

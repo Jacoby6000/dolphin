@@ -28,13 +28,13 @@
 
 #include "Core/AchievementManager.h"
 #include "Core/Boot/Boot.h"
-#include "Core/Debugger/DWARF/DwarfImport.h"
-#include "Core/Debugger/Entrypoints/EntrypointsImport.h"
 #include "Core/Config/DefaultLocale.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/SYSCONFSettings.h"
 #include "Core/ConfigLoaders/GameConfigLoader.h"
 #include "Core/Core.h"
+#include "Core/Debugger/DWARF/DwarfImport.h"
+#include "Core/Debugger/Entrypoints/EntrypointsImport.h"
 #include "Core/DolphinAnalytics.h"
 #include "Core/FifoPlayer/FifoDataFile.h"
 #include "Core/HLE/HLE.h"
@@ -281,18 +281,6 @@ void SConfig::OnTitleDirectlyBooted(const Core::CPUThreadGuard& guard)
 
   auto& ppc_symbol_db = system.GetPPCSymbolDB();
 
-  // DESNOTE(jbarber, 2026-07-22): Clear source line info before any sidecar
-  // import so a previously-booted title's DWARF/entrypoints data doesn't
-  // merge with this title's. LoadMap below atomic-swaps m_functions /
-  // m_notes (so stale function symbols are handled there), but the PPC-
-  // specific m_source_files / m_line_table are additive and only ever
-  // populated by ImportConfiguredDwarfElf / ImportConfiguredEntrypoints
-  // below — without this clear, switching games leaves the previous title's
-  // line info sitting in the DB and DAP source mapping can hand back stale
-  // file/line lookups. The executable boot path already clears via the
-  // explicit PPCSymbolDB::Clear() in CBoot; this is a no-op there and
-  // covers Disc/WAD/NAND/IPL/MIOS boots (which never clear before reaching
-  // here).
   ppc_symbol_db.ClearSourceLineInfo();
 
   bool symbols_changed = false;
@@ -369,18 +357,34 @@ struct SetGameMetadata
     if (!executable.reader->IsValid())
       return false;
 
-    *region = DiscIO::Region::Unknown;
     system.SetIsWii(executable.reader->IsWii());
 
     // Strip the .elf/.dol file extension and directories before the name
     SplitPath(executable.path, nullptr, &config->m_debugger_game_id, nullptr);
 
-    // Set DOL/ELF game ID appropriately
-    std::string executable_path = executable.path;
-    constexpr char BACKSLASH = '\\';
-    constexpr char FORWARDSLASH = '/';
-    std::ranges::replace(executable_path, BACKSLASH, FORWARDSLASH);
-    config->SetRunningGameMetadata(SConfig::MakeGameID(PathToFileName(executable_path)));
+    if (Config::Get(Config::MAIN_BOOT_EXECUTABLE_WITH_DEFAULT_DISC))
+    {
+      const std::string default_iso = Config::Get(Config::MAIN_DEFAULT_ISO);
+      std::unique_ptr<DiscIO::VolumeDisc> disc = DiscIO::CreateDiscForCore(default_iso);
+      if (!disc)
+        return false;
+
+      *region = disc->GetRegion();
+      const bool disc_is_wii = disc->GetVolumeType() == DiscIO::Platform::WiiDisc;
+      if (disc_is_wii != system.IsWii())
+        return false;
+      config->SetRunningGameMetadata(*disc, disc->GetGamePartition());
+    }
+    else
+    {
+      *region = DiscIO::Region::Unknown;
+      // Set DOL/ELF game ID appropriately
+      std::string executable_path = executable.path;
+      constexpr char BACKSLASH = '\\';
+      constexpr char FORWARDSLASH = '/';
+      std::ranges::replace(executable_path, BACKSLASH, FORWARDSLASH);
+      config->SetRunningGameMetadata(SConfig::MakeGameID(PathToFileName(executable_path)));
+    }
 
     Host_TitleChanged();
 

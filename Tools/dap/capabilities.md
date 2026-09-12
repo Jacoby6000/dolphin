@@ -99,13 +99,10 @@ Dolphin-specific extensions it supports.
 Response is empty `{}`. Server then emits a `stopped` event with
 `reason: "entry"` (launch) or `reason: "attach"`.
 
-**`stopOnEntry`** (standard DAP field): controls whether the core breaks at
-entry. While a DAP debugger is attached the core starts paused
-(see `CPUSetInitialExecutionState` in `Core.cpp`); with `stopOnEntry: true`
-the server emits a `stopped`/`entry` (or `stopped`/`attach`) event and the
-client proceeds to set breakpoints. With `stopOnEntry: false` the server skips
-the entry stop and resumes the core — the client receives a `continued` event
-(via the CPU state hook) instead, and the game runs immediately.
+**`stopOnEntry`** (standard DAP field): controls whether the game pauses before
+it begins. With `stopOnEntry: true`, the client can set breakpoints before
+continuing. With `stopOnEntry: false`, the game runs immediately and the client
+receives a `continued` event.
 
 When the field is **omitted** from the request, the session falls back to the
 `Dolphin.General.DAPStopOnEntry` config (default `true`, set at dolphin launch
@@ -134,8 +131,8 @@ hasn't already.
 //  → {"command": "pause"}
 //  → {"event": "stopped", "body": {"reason": "pause", "threadId": 1}}
 
-{"command": "next",      "arguments": {"threadId": 1}}   // step over
-{"command": "stepIn",    "arguments": {"threadId": 1}}
+{"command": "next",      "arguments": {"threadId": 1, "granularity": "line"}}
+{"command": "stepIn",    "arguments": {"threadId": 1, "granularity": "instruction"}}
 {"command": "stepOut",   "arguments": {"threadId": 1}}
 //  → {"event": "stopped", "body": {"reason": "step", "threadId": 1}}
 ```
@@ -143,6 +140,15 @@ hasn't already.
 On a spontaneous stop (breakpoint hit / watchpoint hit / step completion) the
 reason is classified: `"breakpoint"`, `"data breakpoint"`, or `"step"`.
 `hitBreakpointIds` is populated for code breakpoints.
+
+Omitted, `"statement"`, and `"line"` granularity run asynchronously in
+interpreter mode until the `(source file, line)` changes. `next` consumes linking
+calls through their return address while `stepIn` enters them. `"instruction"`
+preserves single-opcode stepping. When the current PC has no source row, source
+stepping falls back to one opcode (`stepIn`) or one logical call-over (`next`).
+Source stepping checks code breakpoints after every opcode and is bounded by a
+5-second deadline and 1000000 instructions; continue, pause, and disconnect cancel
+an in-flight step, and overlapping step requests are rejected.
 
 ## `setBreakpoints`
 
@@ -189,12 +195,9 @@ specified address is read or written. `accessType` is one of
 }}
 ```
 
-**Ranged watchpoints (Dolphin extension).** The DAP spec has no notion of a
-watchpoint region — `dataId` is a single address. Dolphin's `TMemCheck` natively
-supports ranges, so this server accepts an optional **`length`** field on each
-data breakpoint. When `length > 1`, the controller installs a ranged watchpoint
-over `[address, address+length-1]`. Omitting `length` (or `length: 1`) preserves
-standard single-byte behavior — spec-compliant clients are unaffected.
+**Ranged watchpoints (Dolphin extension).** Standard DAP watchpoints identify one
+address. Dolphin also accepts an optional **`length`** field to watch several
+bytes. Omitting `length` or setting it to `1` keeps the standard behavior.
 
 ```jsonc
 // watch the 0x100-byte region starting at 0xdeadb33f for writes
@@ -259,7 +262,8 @@ rather than wrapping and disassembling unrelated low memory.
 ```jsonc
 {"command": "stackTrace", "arguments": {"threadId": 1, "startFrame": 0, "levels": 20}}
 {"command": "threads"}
-{"command": "scopes", "arguments": {"frameId": 0}}     // → ["Registers", "PC"]
+{"command": "scopes", "arguments": {"frameId": 0}}
+// → ["Registers", "PC", "Locals", "Globals"] when typed DWARF is loaded
 {"command": "variables", "arguments": {"variablesReference": 1000}}  // 1000 = Registers
 {"command": "setVariable", "arguments":
   {"variablesReference": 1000, "name": "r3", "value": "0x12345678"}}
@@ -268,6 +272,16 @@ rather than wrapping and disassembling unrelated low memory.
 Frame `source.path`/`source.name` carry either a real source file path (when
 DWARF/entrypoints line info is loaded) or a hex anchor address for a
 disassembly pseudo-source.
+
+`Locals` and `Globals` are available only for frame 0 and only when MWCC DWARF
+1.1 debug information is loaded. `variables` can expand supported typedefs,
+pointers, fixed-size arrays, structures, and unions to at most 32 levels and 1000
+children. It resolves absolute, supported PPC-register (`r0`-`r31`, `lr`, `ctr`, or `xer`),
+base-register-plus-constant, and constant member-offset locations. Values are
+read-only raw hexadecimal; location
+lists, arbitrary DWARF expressions, bit fields, inheritance, dynamic arrays, and
+unwinding locals for older frames are not implemented. Expansion references are
+invalidated by resume, stepping, restart, terminate, or a new `scopes` request.
 
 ## `evaluate`
 
@@ -321,13 +335,11 @@ inputs.
 
 ```jsonc
 {"command": "terminate"}          // → emits {"event": "terminated", "body": {"restart": false}}
-{"command": "restart"}           // → core reset + Break + State::Paused, then a stopped/"restart" event
+{"command": "restart"}           // → reset, pause, then emit a stopped/"restart" event
 {"command": "disconnect"}         // → session ends, sockets torn down
 ```
 
-`restart` forces `CPU::Break()` + `Core::State::Paused` after the PPC reset so
-the post-restart `stopped`/`"restart"` event is truthful even when the client
-had continued execution before the restart.
+`restart` leaves the game paused and emits a `stopped`/`"restart"` event.
 
 # Dolphin-specific custom requests
 
@@ -337,14 +349,10 @@ DAP-aware editor that wants to use them needs a small client-side extension
 
 ## `dolphin_realtimeWatch`
 
-Subscribes to changes in a memory region. Unlike `setDataBreakpoints` (which
-**pauses** on access), a realtime watch **streams** the new value to the client
-on every change without halting emulation. Sampling happens at field rate
-(~60 Hz NTSC / ~50 Hz PAL) via the `vi_end_field_event` CPU-thread hook — the
-same signal the Qt `MemoryViewWidget` and `CheatsManager` use — so the watch
-never stalls the core. Changes are diffed against the last-seen snapshot; only
-genuinely changed regions emit events, and the initial subscribe is seeded with
-the current contents so the first frame doesn't echo back as a spurious change.
+Subscribes to changes in a memory region. Unlike `setDataBreakpoints`, which
+pauses the game on access, a realtime watch streams changed values without
+stopping. Values are checked once per video field, and unchanged regions do not
+produce events.
 
 ```jsonc
 // subscribe
@@ -412,24 +420,10 @@ created via `dolphin_realtimeWatch` or `dolphin_freeze`):
 //  → error response  if watchId is unknown or data length != watch count
 ```
 
-The frozen canon (`data`) must always be exactly `count` bytes long. The
-adapter enforces the freeze with two layers:
-
-1. **MMU write suppression** — an `is_freeze` memcheck is installed on the
-   watched range. Emulated CPU stores (`MMU::Write<T>`) that hit the range
-   are silently dropped before reaching RAM, so the game's own writes are
-   perfectly unobservable (no ~16 ms window).
-2. **Field-rate Tick fallback** — at each video field, `Tick()` re-applies
-   the canon if the region drifted. With layer 1 active, drift only comes
-   from DMA/peripheral writes that bypass `MMU::Write` (PI/DVD transfers,
-   `Memory::CopyToEmu`, etc.). The ~16 ms window is DMA-only, not CPU.
-
-HostWrite (debugger/cheat writes, including DAP `WriteMemory`) bypasses the
-memcheck by design, so the DAP client can update the frozen value itself
-without first unfreezing. The canon is written into guest RAM immediately at
-subscribe/Freeze time (under `CPUThreadGuard`) via `HostWrite` so the freeze
-takes effect at once even when the core is paused — the watched bytes are
-not left at the game value waiting for the next field.
+The frozen value (`data`) must always be exactly `count` bytes long. A freeze
+takes effect immediately and blocks normal game writes. Hardware-driven writes
+may appear briefly before the value is restored on the next video field. The DAP
+client can replace the value with `writeMemory` without unfreezing it first.
 
 `dolphin_memoryChanged` events are suppressed for frozen subscriptions (the
 freeze *is* the response).
@@ -802,11 +796,10 @@ address is an active result, no generation is created.
 
 ## `dolphin_resolvePointerChain`
 
-Resolves up to 64 big-endian 32-bit pointer dereferences while CPU, DSP, and
-FIFO are paused by one `CPUThreadGuard`. `offsets` must contain one to 64 JSON
-integers in `[-2147483648, 2147483647]`. Each entry causes one dereference:
-Dolphin reads the pointer at the current address and computes
-`next = pointer + offset`.
+Resolves up to 64 big-endian 32-bit pointer dereferences from one consistent
+snapshot. `offsets` must contain one to 64 JSON integers in
+`[-2147483648, 2147483647]`. For each offset, Dolphin reads the pointer at the
+current address and adds the offset to find the next address.
 
 ```jsonc
 {"command":"dolphin_resolvePointerChain", "arguments":{

@@ -8,8 +8,11 @@
 --- Per-project settings: add `.dolphin-dap.lua` at the repo root, e.g.
 ---   return {
 ---     dolphin = "~/projects/dolphin-dap/build/Binaries/dolphin-emu-nogui",
----     iso = "~/roms/GALE01.iso",
----     elf = "~/melee/build/GALE01/main.elf", -- optional sidecar DWARF
+---     program = "~/melee/build/GALE01/main.elf", -- ELF to execute; supplies symbols/DWARF
+---     disc = "~/games/melee.iso", -- bootstrap/filesystem source; its DOL is not executed
+---     elf = "~/melee/build/GALE01/main.elf", -- advanced metadata-only sidecar mode
+---     source_paths = { "~/melee/src", "~/melee/extern/dolphin/src" },
+---     enable_cheats = false,
 ---     port = 5678,
 ---   }
 
@@ -88,15 +91,73 @@ local function normalize_project(project)
   return {
     dolphin = dolphin,
     dolphin_gui = dolphin_gui,
-    iso = expand_path(project.iso),
+    -- `iso` remains accepted for existing project files; `program` also supports ELF/DOL.
+    program = expand_path(project.program or project.iso),
+    disc = expand_path(project.disc),
     elf = expand_path(project.elf),
+    entrypoints = expand_path(project.entrypoints),
     port = project.port or 5678,
     socket = expand_path(project.socket),
     host = project.host or "127.0.0.1",
     cwd = expand_path(project.cwd),
+    source_paths = vim.tbl_map(expand_path, project.source_paths or {}),
+    enable_cheats = project.enable_cheats,
     platform = project.platform,
     nogui = project.nogui,
   }
+end
+
+local source_path_cache = {}
+
+local function resolve_source_path(path, source_paths)
+  if not path or path == "" or vim.fn.filereadable(path) == 1 then
+    return path
+  end
+
+  local relative = path:gsub("^[/\\]+", "")
+  for _, root in ipairs(source_paths or {}) do
+    local cache_key = root .. "\0" .. relative
+    if source_path_cache[cache_key] then
+      return source_path_cache[cache_key]
+    end
+    local direct = vim.fs.joinpath(root, relative)
+    if vim.fn.filereadable(direct) == 1 then
+      source_path_cache[cache_key] = direct
+      return direct
+    end
+
+    local matches = vim.fs.find(vim.fs.basename(relative), {
+      path = root,
+      type = "file",
+      limit = math.huge,
+    })
+    table.sort(matches)
+    if #matches == 1 then
+      source_path_cache[cache_key] = matches[1]
+      return matches[1]
+    end
+    if #matches > 1 then
+      notify(
+        string.format("Ambiguous DWARF source %s under %s; use a narrower source_paths entry", path, root),
+        vim.log.levels.WARN
+      )
+      return path
+    end
+  end
+  return path
+end
+
+local function register_source_path_resolver(dap)
+  dap.listeners.before.stackTrace["dolphin-dap-source-paths"] = function(session, err, response)
+    if err or not response or session.config.type ~= "dolphin" then
+      return
+    end
+    for _, frame in ipairs(response.stackFrames or {}) do
+      if frame.source and frame.source.path then
+        frame.source.path = resolve_source_path(frame.source.path, session.config.source_paths)
+      end
+    end
+  end
 end
 
 local function default_nogui_platform()
@@ -133,30 +194,49 @@ local function resolve_launch_target(config, project)
 end
 
 local function build_launch_args(project, target, port)
-  if not project.iso or project.iso == "" then
-    return nil, "`.dolphin-dap.lua` must set `iso` for launch configs"
+  if not project.program or project.program == "" then
+    return nil, "`.dolphin-dap.lua` must set `program` for launch configs"
   end
 
   local args = {
     "-C",
     string.format(DAP_PORT_CONFIG, port),
-    "--exec",
-    project.iso,
   }
+
+  if project.disc and project.disc ~= "" and project.disc ~= project.program then
+    vim.list_extend(args, {
+      "-C",
+      "Dolphin.Core.DefaultISO=" .. project.disc,
+      "-C",
+      "Dolphin.Core.BootExecutableWithDefaultDisc=true",
+    })
+  end
+  if project.enable_cheats ~= nil then
+    vim.list_extend(args, {
+      "-C",
+      "Dolphin.Core.EnableCheats=" .. tostring(project.enable_cheats),
+    })
+  end
+  vim.list_extend(args, { "--exec", project.program })
 
   if target.platform then
     vim.list_extend(args, { "--platform", target.platform })
   end
 
-  if project.elf and project.elf ~= "" then
+  if project.elf and project.elf ~= "" and project.elf ~= project.program then
     vim.list_extend(args, { "--debug-elf", project.elf })
-    local entrypoints = project.entrypoints
-    if not entrypoints or entrypoints == "" then
-      entrypoints = vim.fn.fnamemodify(project.elf, ":p:h") .. "/entrypoints.json"
-    end
-    if entrypoints ~= "" and vim.fn.filereadable(entrypoints) == 1 then
-      vim.list_extend(args, { "--debug-entrypoints", entrypoints })
-    end
+  end
+
+  local entrypoints = project.entrypoints
+  local debug_layout = project.elf
+  if not debug_layout or debug_layout == "" then
+    debug_layout = project.program:lower():match("%.elf$") and project.program or nil
+  end
+  if (not entrypoints or entrypoints == "") and debug_layout then
+    entrypoints = vim.fn.fnamemodify(debug_layout, ":p:h") .. "/entrypoints.json"
+  end
+  if entrypoints and entrypoints ~= "" and vim.fn.filereadable(entrypoints) == 1 then
+    vim.list_extend(args, { "--debug-entrypoints", entrypoints })
   end
 
   return args
@@ -243,7 +323,7 @@ end
 function M.build_configurations(project)
   project = normalize_project(project)
 
-  local video_platform = project.platform == "auto" or project.platform == "video"
+  local video_platform = (project.platform == "auto" or project.platform == "video")
       and default_nogui_platform()
     or project.platform
     or default_nogui_platform()
@@ -255,6 +335,7 @@ function M.build_configurations(project)
       name = string.format("Dolphin attach (:%d)", project.port),
       port = project.port,
       host = project.host,
+      source_paths = project.source_paths,
     },
     {
       type = "dolphin",
@@ -265,9 +346,11 @@ function M.build_configurations(project)
       platform = video_platform,
       port = project.port,
       host = project.host,
-      iso = project.iso,
+      program = project.program,
+      disc = project.disc,
       elf = project.elf,
       cwd = project.cwd,
+      source_paths = project.source_paths,
     },
     {
       type = "dolphin",
@@ -277,9 +360,11 @@ function M.build_configurations(project)
       nogui = false,
       port = project.port,
       host = project.host,
-      iso = project.iso,
+      program = project.program,
+      disc = project.disc,
       elf = project.elf,
       cwd = project.cwd,
+      source_paths = project.source_paths,
     },
     {
       type = "dolphin",
@@ -287,9 +372,11 @@ function M.build_configurations(project)
       name = "Dolphin launch headless",
       nogui = true,
       platform = "headless",
-      iso = project.iso,
+      program = project.program,
+      disc = project.disc,
       elf = project.elf,
       cwd = project.cwd,
+      source_paths = project.source_paths,
     },
     {
       type = "dolphin",
@@ -297,18 +384,22 @@ function M.build_configurations(project)
       name = string.format("Dolphin launch nogui (video, %s)", video_platform),
       nogui = true,
       platform = video_platform,
-      iso = project.iso,
+      program = project.program,
+      disc = project.disc,
       elf = project.elf,
       cwd = project.cwd,
+      source_paths = project.source_paths,
     },
     {
       type = "dolphin",
       request = "launch",
       name = "Dolphin launch (Qt)",
       nogui = false,
-      iso = project.iso,
+      program = project.program,
+      disc = project.disc,
       elf = project.elf,
       cwd = project.cwd,
+      source_paths = project.source_paths,
     },
   }
 
@@ -319,7 +410,12 @@ function M.build_configurations(project)
       name = "Dolphin attach (unix socket)",
       mode = "pipe",
       socket = project.socket,
+      source_paths = project.source_paths,
     })
+  end
+
+  for _, config in ipairs(configs) do
+    config.enable_cheats = project.enable_cheats
   end
 
   return configs
@@ -358,6 +454,7 @@ function M.setup(opts)
   M.register_configurations(project)
 
   local dap = require("dap")
+  register_source_path_resolver(dap)
   dap.providers.configs["dolphin-dap"] = function(_)
     local project_cfg = M.find_project_config()
     if not project_cfg then
@@ -407,11 +504,11 @@ function M.setup(opts)
   end
 
   if not opts.quiet then
-    if project.iso then
-      notify(string.format("project ISO: %s", project.iso))
+    if project.program then
+      notify(string.format("program: %s", project.program))
     else
       notify(
-        "no `.dolphin-dap.lua` found — add one with at least `iso` (and optional `elf`) for launch",
+        "no `.dolphin-dap.lua` found — set `program` to the ELF and `disc` to the ISO for launch",
         vim.log.levels.WARN
       )
     end
@@ -495,6 +592,7 @@ function M.attach()
     name = string.format("Dolphin attach (:%d)", project.port),
     port = project.port,
     host = project.host,
+    source_paths = project.source_paths,
   })
 end
 

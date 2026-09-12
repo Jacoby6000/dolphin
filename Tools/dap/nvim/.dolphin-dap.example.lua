@@ -12,11 +12,26 @@ return {
   -- Qt build for GUI attach/launch (defaults to dolphin path with "-nogui" stripped).
   -- dolphin_gui = "~/projects/ai/yolo/dolphin-dap/build/Binaries/dolphin-emu",
 
-  -- Game disc image to boot.
-  iso = "~/roms/GALE01.iso",
+  -- The ELF to execute. Its memory layout, symbols, and embedded DWARF are authoritative.
+  program = "~/projects/ai/yolo/melee/build/GALE01/main.elf",
 
-  -- Sidecar debug ELF for DWARF line info (same build as the running DOL).
-  elf = "~/projects/ai/yolo/melee/build/GALE01/main.elf",
+  -- The corresponding game ISO. Dolphin uses its bootstrap and filesystem environment,
+  -- but ignores its embedded DOL and executes `program` instead.
+  disc = "~/games/melee.iso",
+
+  -- Advanced metadata-only sidecar mode for an executable with the exact same link layout.
+  -- This does not replace the executable selected by `program`.
+  -- elf = "~/projects/ai/yolo/melee/build/GALE01/main.elf",
+
+  -- Ordered roots used to resolve basename-only source paths from older DWARF.
+  -- Each root should contain unique basenames; ambiguous matches are not guessed.
+  source_paths = {
+    "~/projects/ai/yolo/melee/src",
+    "~/projects/ai/yolo/melee/extern/dolphin/src",
+  },
+
+  -- Optional launch override; disable codes that target another executable layout.
+  enable_cheats = false,
 
   -- TCP port for attach configs (launch uses a dynamic port via nvim-dap).
   port = 5678,
@@ -35,6 +50,7 @@ return {
 -- Manual attach example (paste in a terminal, then pick "Dolphin attach (:5678)" in Neovim):
 -- dolphin-emu-nogui \
 --   -C Dolphin.General.DAPPort=5678 \
---   --exec ~/roms/GALE01.iso \
---   --platform x11 \
---   --debug-elf ~/projects/ai/yolo/melee/build/GALE01/main.elf
+--   -C Dolphin.Core.DefaultISO=~/games/melee.iso \
+--   -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+--   --exec ~/projects/ai/yolo/melee/build/GALE01/main.elf \
+--   --platform x11

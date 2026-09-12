@@ -17,7 +17,7 @@ For the per-operation request/response reference, see
 - [Neovim (lazy.nvim)](#neovim-lazynvim)
 - [Tests](#tests)
 - [Known limitations](#known-limitations)
-- [Source awareness (DWARF 1.1 + entrypoints)](#source-awareness-dwarf-11-entrypoints)
+- [Source debugging with DWARF](#source-debugging-with-dwarf)
 
 ## Features
 
@@ -29,13 +29,13 @@ Each operation below links to its detailed reference section in
 | Request | Summary |
 |---------|---------|
 | [`initialize`](capabilities.md#initialize) | Capability handshake — advertises standard + Dolphin-specific extensions. |
-| [`launch`](capabilities.md#launch-attach) | Boot the configured ISO/DOL. Emulation starts paused. |
+| [`launch`](capabilities.md#launch-attach) | Start the configured game. Emulation starts paused. |
 | [`attach`](capabilities.md#launch-attach) | Attach to an already-running core. |
 | [`configurationDone`](capabilities.md#configurationdone) | Concludes the launch handshake. |
 | [`continue`](capabilities.md#continue-pause-step) | Resume execution. `allThreadsContinued: true` reported. |
 | [`pause`](capabilities.md#continue-pause-step) | Halt the core; emits `stopped`/`"pause"`. |
-| [`next`](capabilities.md#continue-pause-step) | Step over (interpreter mode). |
-| [`stepIn`](capabilities.md#continue-pause-step) | Step into (interpreter mode). |
+| [`next`](capabilities.md#continue-pause-step) | Step to the next source row without entering calls; instruction granularity remains available. |
+| [`stepIn`](capabilities.md#continue-pause-step) | Step to the next source row, entering calls; instruction granularity remains available. |
 | [`stepOut`](capabilities.md#continue-pause-step) | Step out (async worker, classified stop on completion). |
 | [`setBreakpoints`](capabilities.md#setbreakpoints) | Source/line code breakpoints. Conditional via `condition`. |
 | [`setInstructionBreakpoints`](capabilities.md#setinstructionbreakpoints) | Address-keyed code breakpoints; replaces the whole list. |
@@ -45,8 +45,8 @@ Each operation below links to its detailed reference section in
 | [`disassemble`](capabilities.md#disassemble) | Per-instruction disassembly. `instructionCount` capped at 65536. |
 | [`stackTrace`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | PPC call stack. |
 | [`threads`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | OS thread enumeration. |
-| [`scopes`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | Variable scopes for a frame (`Registers`, `PC`). |
-| [`variables`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | Enumerate variables in a scope. |
+| [`scopes`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | Registers/PC, plus frame-0 DWARF locals and globals. |
+| [`variables`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | Enumerate scopes and expand supported DWARF structs, pointers, and arrays. |
 | [`setVariable`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | Mutate a variable (registers, etc.). |
 | [`evaluate`](capabilities.md#evaluate) | Evaluate a PPC debugger expression. |
 | [`goto`](capabilities.md#goto-gototargets) | Set PC; re-emits `stopped`/`"goto"`. |
@@ -87,73 +87,89 @@ after an existing session exits.
 
 ## Running the server
 
-Build with the NoGUI target (DAP sources compile into the `core` static lib;
-there is no separate binary or compile flag):
+Build Dolphin's NoGUI target:
 
 ```bash
 cmake -B build -DENABLE_NOGUI=ON -DENABLE_QT=OFF
 cmake --build build --target dolphin-nogui
 ```
 
-The server is **inert** unless a DAP port or socket is configured at runtime
-(mirrors `GDBPort`). DAP and GDB are mutually exclusive. `stdout` stays free
-for normal logging. The DAP client (VS Code / Cursor / Neovim) then attaches
-over the socket.
+Choose one of these modes when starting Dolphin.
 
-**TCP** (`Dolphin.General.DAPPort`):
+### Mode 1: Run the ISO
+
+Use this mode to debug the game contained in the ISO:
 
 ```bash
-dolphin-emu-nogui -C Dolphin.General.DAPPort=5678 \
-  --exec ~/projects/ai/yolo/crowd-control/melee-iso/game.iso --platform headless
+dolphin-emu-nogui \
+  -C Dolphin.General.DAPPort=5678 \
+  --exec /path/to/game.iso \
+  --platform headless
 ```
 
-Or persist in `Dolphin.ini`:
+Dolphin executes the DOL stored in the ISO. Address breakpoints, instruction stepping,
+registers, and memory tools work normally. Source stepping and locals require debug
+information that matches this exact DOL, which retail ISOs usually do not contain.
+
+An ELF supplied with `--debug-elf` is metadata only in this mode. It does not replace
+the ISO's DOL. Use it only when its addresses exactly match the DOL in the ISO.
+
+### Mode 2: Run a debug ELF with an ISO
+
+Use this mode for source-level debugging of a decomp build:
+
+```bash
+dolphin-emu-nogui \
+  -C Dolphin.General.DAPPort=5678 \
+  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/main.elf \
+  --platform headless
+```
+
+Both files have a separate purpose:
+
+- The ISO provides the disc bootstrap, game files, and filesystem environment.
+- The DOL stored in the ISO is not executed.
+- The ELF provides the executable code, symbols, and DWARF debug information.
+
+Because Dolphin executes the ELF, its addresses match its debug information. For a
+disc-based game, always provide both the ISO and ELF as shown above.
+
+Source stepping and locals do not work reliably inside optimized source files
+(translation units).
+Optimization can combine or remove source lines and variables, so stepping may skip
+lines and locals may be missing or incorrect. Build the translation units you need to
+debug without optimization and leave unrelated code optimized.
+
+For code without DWARF, an `entrypoints.json` file beside the ELF can still provide
+function names and definition lines.
+
+### Connection options
+
+The examples use TCP port `5678`. To use a Unix socket on Linux or macOS, replace the
+port setting with:
+
+```bash
+-C Dolphin.General.DAPSocket=/tmp/dolphin-dap.sock
+```
+
+You can also persist either setting in `Dolphin.ini`:
 
 ```ini
 [General]
 DAPPort = 5678
+# DAPSocket = /tmp/dolphin-dap.sock
 ```
 
-**Unix socket** (`Dolphin.General.DAPSocket`, Linux/macOS only) takes priority
-over the port (mirrors `GDBSocket`):
+To let the game run immediately instead of pausing when the debugger connects, add:
 
 ```bash
-dolphin-emu-nogui -C Dolphin.General.DAPSocket=./dap.sock \
-  --exec ~/projects/ai/yolo/crowd-control/melee-iso/game.iso --platform headless
+-C Dolphin.General.DAPStopOnEntry=false
 ```
 
-```ini
-[General]
-DAPSocket = /tmp/dolphin-dap.sock
-```
-
-**Don't pause at entry** — let the game run immediately, only breaking when a
-breakpoint is hit or the client explicitly pauses. Set
-`Dolphin.General.DAPStopOnEntry=false` at dolphin launch; an explicit
-`stopOnEntry` field on a `launch`/`attach` request overrides it per session:
-
-```bash
-dolphin-emu-nogui -C Dolphin.General.DAPSocket=./dap.sock \
-  -C Dolphin.General.DAPStopOnEntry=false \
-  --exec ~/projects/ai/yolo/crowd-control/melee-iso/game.iso --platform headless
-```
-
-**With a sidecar debug ELF** for DWARF 1.1 line info (imported after boot; code
-in memory must match the ELF link layout for line mappings to be correct):
-
-```bash
-dolphin-emu-nogui -C Dolphin.General.DAPPort=5678 \
-  --debug-elf /path/to/build/GALE01/main.elf \
-  --exec /path/to/GALE01.iso --platform headless
-```
-
-Equivalent config form for the ELF: `-C Dolphin.Debug.DwarfElf=/path/to/main.elf`.
-For NonMatching decomp units, Melee `configure.py --debug` also generates
-`entrypoints.json` beside `main.elf`; pass `--debug-entrypoints` or rely on
-auto-discovery when the sibling file exists.
-
-GDB and DAP are mutually exclusive — do not set `GDBPort`/`GDBSocket` at the
-same time.
+The DAP client can override this setting with `stopOnEntry`. DAP and GDB are mutually
+exclusive, so do not enable both at the same time.
 
 ## Handshake test (no game required for transport check)
 
@@ -180,78 +196,70 @@ See [`nvim/README.md`](nvim/README.md) for `nvim-dap` + `nvim-dap-ui` setup,
 
 ## Tests
 
-The DAP server is validated by GoogleTest suites under
-`Source/UnitTests/Core/Debugger/DAP/` and `Source/UnitTests/Core/Debugger/DWARF/`.
-None of them require an ISO, a booted game, or the JIT — they follow the same
-pattern as `PageFaultTest` / `PageTableHostMappingTest`: initialize just the
-memory subsystem, declare the test thread as the CPU thread, and drive PPC
-state directly (with address translation off, so effective addresses map
-straight to physical RAM).
-
-| Suite | Layer | What it covers |
-|-------|-------|----------------|
-| `DapFramingTest` | transport | `Content-Length` framing encode/decode |
-| `DapJsonTest` | JSON | picojson parsing, hex addresses, base64 |
-| `DapProtocolTest` | protocol | request parsing + response/event building |
-| `DapControllerTest` | core integration | `DapDebugController` against a real `Core::System`: register read/write, memory read/write (incl. partial/invalid), disassembly, breakpoints, detour rollback, DWARF source mapping |
-| `DapSessionTest` | end-to-end | full `RunSession` command loop over a `socketpair`: handshake, `setBreakpoints`, `readMemory`, `writeMemory`, `disassemble`, `variables`, `setVariable`, step commands, unknown-command error |
-| `DwarfReaderTest` | DWARF parser | DWARF 1.1 `.debug`/`.line` parsing, malformed input |
-| `PPCSymbolDBLineTest` | symbol DB | line table queries, `ImportDwarf`, `Clear` |
-| `RealtimeWatchTest` | sampler | `RealtimeWatchSampler` subscriptions, change detection, freeze canon write-back |
-
-`DapSessionTest` connects a `socketpair` to `RunSession` running on a background
-thread (which declares itself the CPU thread, so the controller's
-`CPUThreadGuard`s are no-ops) and speaks real DAP over the socket — no TCP or
-network. This is the layer that exercises framing + JSON + dispatch + event
-serialization together.
-
-Build and run:
+Build and run the automated tests without starting a game:
 
 ```bash
-cmake --build build --target tests
-./build/Binaries/Tests/tests --gtest_filter='Dap*:Dwarf*:PPCSymbolDBLine*:RealtimeWatch*'
+cmake --build build --target unittests
 ```
-
-> The memory arena uses shared memory; restrictive sandboxes raise `SIGBUS` in
-> `Memory::Init` (also breaks `PageFaultHostMappingTest`) — run tests
-> unsandboxed.
 
 ## Known limitations
 
-- **Single global breakpoint store.** Dolphin has one PPC core and one shared
-  breakpoint/watchpoint store tied to it. Each DAP client's `setBreakpoints` /
-  `setDataBreakpoints` / `setInstructionBreakpoints` replaces the global set.
-  The intended topology is one DAP client per running core (DAP and GDB are
-  mutually exclusive). Concurrent DAP clients on the same core will clobber
-  each other's breakpoints/watchpoints — this is an architectural constraint,
-  not a per-session isolation bug.
-- **Realtime sample delivery cadence.** `dolphin_realtimeWatch` *samples* at
-  field rate (~60 Hz NTSC) but *delivers* `dolphin_memoryChanged` events on
-  the session loop's 50 ms poll, so a change is flushed to the socket within
-  ~50 ms of being observed. Burst changes within a single frame are coalesced
-  to one event per region.
-- **Freeze uses MMU write suppression + field-rate DMA fallback.**
-  `dolphin_freeze` installs an `is_freeze` memcheck on the watched range —
-  emulated CPU stores (`MMU::Write<T>`) that hit the range are silently
-  dropped before reaching RAM, so the game's own writes are perfectly
-  unobservable (no ~16 ms window). A field-rate `Tick()` re-applies the canon
-  as a fallback for DMA/peripheral writes that bypass `MMU::Write` (PI/DVD
-  transfers, `Memory::CopyToEmu`, etc.), where the ~16 ms window is DMA-only.
-  HostWrite (debugger/cheat writes, including DAP `WriteMemory`) bypasses the
-  memcheck by design, so the DAP client can update the frozen value itself.
-  Freeze is a layer on top of a watch subscription — clearing the freeze via
-  `dolphin_unfreeze` leaves the watch running and dispatching events normally.
+- Use one DAP client per running Dolphin instance. Multiple clients share the
+  same breakpoints and watchpoints and can overwrite each other's settings.
+- Realtime memory changes normally reach the client within about 50 ms. Multiple
+  changes during one frame may be combined into one update.
+- Frozen values block normal game writes immediately. Some hardware-driven writes
+  may appear briefly before Dolphin restores the frozen value on the next frame.
+  Clearing a freeze leaves its realtime watch active.
 
-## Source awareness (DWARF 1.1 + entrypoints)
+## Source debugging with DWARF
 
-When DWARF 1.1 line info (MWCC/CodeWarrior `.debug`+`.line` sections) is loaded,
-`stackTrace`, `loadedSources`, `source`, and `breakpointLocations` return real
-file:line mappings. Loading happens automatically when booting a debug ELF
-(`ElfReader::LoadSymbols`), programmatically via `Core::Debug::ImportDwarf` /
-`ImportDwarfFromElf`, or as a sidecar via `Dolphin.Debug.DwarfElf` (or
-`--debug-elf`). In the Qt UI: **Symbols → Load DWARF/Debug Info…**.
+Dolphin supports MWCC/CodeWarrior DWARF 1.1 in two different ways.
 
-Retail-linked units that omit MWCC DWARF can still expose function entrypoints
-+ definition lines via an **`entrypoints.json`** sidecar (normalized). This
-supplies entrypoint-level line info without faking body-level line tables.
-See [`../../.ai-doc-reference/entrypoints-format.md`](../../.ai-doc-reference/entrypoints-format.md).
+### Executed ELF
+
+This is the recommended mode for a fully linked decomp build. Start Dolphin with the
+ELF as `--exec` and mount the game ISO with `Dolphin.Core.DefaultISO`, as shown in
+[Mode 2](#mode-2-run-a-debug-elf-with-an-iso).
+
+The ELF supplies both the running code and its debug information, so source lines,
+breakpoints, globals, and variable addresses use the same memory layout. Dolphin loads
+the ELF's debug information automatically.
+
+### Sidecar ELF
+
+Sidecar mode is useful for projects that are only partially decompiled. In this mode,
+Dolphin executes the DOL from the ISO and loads debug information from a separate ELF:
+
+```bash
+dolphin-emu-nogui \
+  -C Dolphin.General.DAPPort=5678 \
+  --exec /path/to/game.iso \
+  --debug-elf /path/to/main.elf \
+  --platform headless
+```
+
+The sidecar ELF does not replace the DOL in the ISO. It can provide known types,
+expandable structures, globals, and source information for decompiled code. This is
+safe only when the sidecar ELF preserves the exact addresses used by the running DOL.
+If linking the ELF moves code or data, breakpoints and variable values can refer to the
+wrong memory.
+
+Sidecar debug information can also be loaded with `Dolphin.Debug.DwarfElf` or
+**Symbols → Load DWARF/Debug Info…** in the Qt interface.
+
+### Debug information limits
+
+The top stack frame exposes `Locals` and `Globals`. You can inspect pointers, fixed-size
+arrays, structures, and unions, and expand nested values. Values are read-only and
+usually displayed in hexadecimal. Very deeply nested or extremely large values are
+limited, and variables from older stack frames are not currently available.
+
+Source stepping and locals are not reliable for optimized source files. The compiler
+may remove variables, reuse their storage, or combine source lines. Compile the files
+you need to debug without optimization; unrelated files can remain optimized.
+
+An **`entrypoints.json`** file beside the ELF can add function names and definition
+lines for code without DWARF. It does not provide locals, structures, globals, or
+line-by-line stepping inside those functions. See
+[`../../.ai-doc-reference/entrypoints-format.md`](../../.ai-doc-reference/entrypoints-format.md).
