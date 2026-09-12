@@ -1,164 +1,131 @@
-# Neovim + Dolphin DAP
+# Neovim Client Setup
 
-Dolphin **is** the DAP adapter — there is no separate debug adapter binary. Neovim
-connects over TCP (or a Unix socket on Linux) after Dolphin is listening.
+[nvim-dap](https://github.com/mfussenegger/nvim-dap) can connect to a running Dolphin
+server directly or use the bundled integration to start Dolphin.
 
-## lazy.nvim setup
+## Requirements
 
-1. Copy the lazy spec into your Neovim config:
+Install `nvim-dap` with your preferred plugin manager.
 
-   ```bash
-   cp Tools/dap/nvim/lazy-dolphin-dap.lua ~/.config/nvim/lua/plugins/dolphin-dap.lua
-   ```
+## Basic Attach Configuration
 
-   Edit `DOLPHIN_DAP_RT` at the top of that file if your checkout path differs.
+This minimal configuration connects to Dolphin on TCP port `5678` and does not require
+the bundled integration:
 
-2. Remove or merge duplicate keymaps from an existing `lua/plugins/nvim-dap.lua`
-   (the dolphin plugin spec already registers `<leader>d*` maps).
+```lua
+local dap = require("dap")
 
-3. Add per-project settings at the game/decomp root:
+dap.adapters.dolphin = {
+  type = "server",
+  host = "127.0.0.1",
+  port = 5678,
+}
 
-   ```bash
-   cp Tools/dap/nvim/.dolphin-dap.example.lua /path/to/melee/.dolphin-dap.lua
-   # edit the ELF, ISO, and Dolphin binary paths
-   ```
+local config = {
+  name = "Attach to Dolphin",
+  type = "dolphin",
+  request = "attach",
+}
 
-Buffer diagnostics moved to `<leader>ld` so `<leader>d*` is free for DAP (see `dolphin-dap.lua`).
-
-4. `:Lazy sync`, restart Neovim, open a `.c` file in your decomp tree, then:
-
-   - `<leader>dA` — attach to a running Dolphin (manual terminal workflow)
-   - `<leader>da` — pick attach / launch configuration
-   - `<leader>dc` — attach if needed, then continue (unpause the game)
-   - `<leader>du` — toggle DAP UI
-   - `:DolphinDapCmd` — copy a manual terminal launch command (attach workflow)
-
-## Workflows
-
-### Attach (Dolphin already running)
-
-Terminal:
-
-```bash
-dolphin-emu-nogui \
-  -C Dolphin.General.DAPPort=5678 \
-  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
-  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
-  --exec /path/to/main.elf \
-  --platform headless
+for _, language in ipairs({ "c", "cpp" }) do
+  dap.configurations[language] = dap.configurations[language] or {}
+  table.insert(dap.configurations[language], config)
+end
 ```
 
-Wait for boot (or `ss -tlnp | grep 5678`), then in Neovim choose **Dolphin attach (:5678)**.
+Start Dolphin using one of the commands in
+[`Running the server`](../README.md#running-the-server), then use `:DapContinue` and
+select **Attach to Dolphin**.
 
-**Important:** `-C` must use the `Dolphin` system prefix (`Dolphin.General.DAPPort=5678`).
-`Main.General.DAPPort=5678` is silently ignored and DAP will not listen.
+## Bundled Integration
 
-GUI build (same flags, no `--platform headless`):
+The bundled integration can start Dolphin, resolve source paths, and create several
+launch and attach configurations. Its optional default debugger interface uses
+[`nvim-dap-ui`](https://github.com/rcarriga/nvim-dap-ui) and
+[`nvim-nio`](https://github.com/nvim-neotest/nvim-nio).
 
-```bash
-dolphin-emu \
-  -C Dolphin.General.DAPPort=5678 \
-  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
-  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
-  --exec /path/to/main.elf
+Add `Tools/dap/nvim` from this Dolphin checkout to Neovim's runtime path, then initialize
+the integration:
+
+```lua
+vim.opt.rtp:append("/path/to/dolphin/Tools/dap/nvim")
+require("dolphin-dap").setup()
 ```
 
-Or pick **Dolphin attach (Qt spawn, :5678)** in Neovim to start `dolphin-emu` and
-connect on the configured port.
+Use your preferred plugin manager or Neovim configuration layout. No particular keymaps
+are required. If you do not use `nvim-dap-ui`, initialize with:
 
-Nogui with an emulator window (no Qt UI, but video output):
-
-```bash
-dolphin-emu-nogui \
-  -C Dolphin.General.DAPPort=5678 \
-  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
-  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
-  --exec /path/to/main.elf \
-  --platform x11
+```lua
+require("dolphin-dap").setup({ setup_dap_ui = false })
 ```
 
-On Linux use `x11`; on Windows `win32`; on macOS `macos`. Or pick **Dolphin launch
-nogui (video, x11)** / **Dolphin attach (nogui video spawn, :5678)** in Neovim.
+A portable `lazy.nvim` example is available in [`lazy-dolphin-dap.lua`](lazy-dolphin-dap.lua).
 
-### Launch (Neovim starts Dolphin)
+## Project Configuration
 
-For source-level decomp debugging, specify both inputs: set `program` to the built ELF
-and `disc` to the corresponding game ISO. Neovim spawns Dolphin with a dynamic DAP
-port and connects automatically.
+Copy [`.dolphin-dap.example.lua`](.dolphin-dap.example.lua) to `.dolphin-dap.lua` in
+the root of the project you want to debug.
+
+For a fully linked decomp build, configure both the ELF and ISO:
 
 ```lua
 return {
-  dolphin = "/path/to/build/Binaries/dolphin-emu-nogui",
-  program = "/path/to/melee/build/GALE01/main.elf",
-  disc = "/path/to/melee.iso",
-  source_paths = { "/path/to/melee/src", "/path/to/melee/extern/dolphin/src" },
+  dolphin = "/path/to/dolphin-emu-nogui",
+  program = "/path/to/main.elf",
+  disc = "/path/to/game.iso",
+  source_paths = {
+    "/path/to/project/src",
+  },
   enable_cheats = false,
 }
 ```
 
-`disc` mounts the ISO and enables its bootstrap environment. Dolphin uses the ISO to
-establish the disc ID, FST, OS state, and DVD/filesystem access, but ignores the DOL in
-the ISO as the program to execute. It loads and executes `program` instead, so the ELF's
-memory layout, symbols, and embedded DWARF remain authoritative.
+The ISO supplies the game files and disc environment. Dolphin ignores the ISO's DOL and
+executes the ELF, whose symbols and DWARF match the running code.
 
-When `program` is the ISO and `elf` is set, the ISO's DOL executes and the ELF supplies
-metadata only. This supports partial decompilation, but it is safe only when the ELF has
-exactly the same link layout as the running DOL. The `program` field also accepts DOL
-and disc images for other workflows, and legacy `iso` is accepted as an alias for
-`program`.
-Set `enable_cheats = false` when codes saved for another executable layout must not run.
+For a partially decompiled project, run the ISO's DOL and use an address-matching ELF as
+a metadata sidecar:
 
-| Config | Binary | Platform |
-|--------|--------|----------|
-| **Dolphin launch headless** | `dolphin-emu-nogui` | `headless` (no video) |
-| **Dolphin launch nogui (video, …)** | `dolphin-emu-nogui` | `x11` / `win32` / `macos` |
-| **Dolphin launch (Qt)** | `dolphin-emu` | _(none — full Qt UI)_ |
-
-Set `platform = "x11"` (or `"auto"`) in `.dolphin-dap.lua` to override the default
-video backend. Optional `dolphin_gui` overrides the Qt binary path (defaults to
-`dolphin` with `-nogui` stripped).
-
-## Source paths / DWARF
-
-For a fully linked decomp build, set `program` to the ELF and `disc` to the ISO. The ELF
-then supplies both the running code and its debug information.
-
-For a partially decompiled project, you can instead set `program` to the ISO and `elf`
-to a sidecar ELF. Dolphin still executes the DOL in the ISO; the sidecar only supplies
-types, structures, globals, and source information for known code. Use this mode only
-when the sidecar ELF preserves the exact code and data addresses of the running DOL.
-If linking the ELF moves anything, breakpoints and variables may point at the wrong
-memory.
-
-Source stepping and locals do not work reliably in optimized source files (translation
-units). Build the files you need to debug without optimization; otherwise stepping may
-skip lines and locals may be missing or incorrect. Other files can remain optimized.
-
-Set ordered `source_paths` roots when old MWCC DWARF reports only basenames. The
-integration tries a direct relative path, then a recursive basename lookup within each
-root. It does not guess when a root contains multiple matching files; use a narrower
-root in that case.
-
-## Unix socket (Linux)
-
-Start Dolphin with:
-
-```bash
-dolphin-emu-nogui \
-  -C Dolphin.General.DAPSocket=/tmp/dolphin-dap.sock \
-  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
-  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
-  --exec /path/to/main.elf
+```lua
+return {
+  dolphin = "/path/to/dolphin-emu-nogui",
+  program = "/path/to/game.iso",
+  elf = "/path/to/main.elf",
+  source_paths = {
+    "/path/to/project/src",
+  },
+}
 ```
 
-Or set in `~/.config/dolphin-emu/Dolphin.ini`:
+The sidecar does not replace the ISO's DOL. Use it only when its code and data addresses
+exactly match the running DOL.
 
-```ini
-[General]
-DAPSocket = /tmp/dolphin-dap.sock
-```
+Source stepping and locals are unreliable in optimized source files. Build the files you
+need to inspect without optimization; unrelated files can remain optimized.
 
-Set the same path in `.dolphin-dap.lua` as `socket = "/tmp/dolphin-dap.sock"` and
-use **Dolphin attach (unix socket)**.
+## Starting a Session
 
-GDB and DAP are mutually exclusive — do not enable `GDBPort` at the same time.
+Use `:DapContinue` or another standard `nvim-dap` command and select one of the registered
+Dolphin configurations. Define keymaps using the normal `nvim-dap` functions if desired.
+
+To start Dolphin separately, use a command from the main
+[`Running the server`](../README.md#running-the-server) guide, then select the Dolphin
+attach configuration in Neovim. `:DolphinDapCmd` prints and copies a command generated
+from the current `.dolphin-dap.lua` file.
+
+The configuration supports:
+
+- `dolphin`: path to `dolphin-emu-nogui`.
+- `dolphin_gui`: optional path to the Qt Dolphin executable.
+- `program`: ELF, DOL, or ISO to execute.
+- `disc`: ISO mounted while executing an ELF or DOL.
+- `elf`: metadata-only debug ELF for the executable selected by `program`.
+- `source_paths`: ordered directories used to locate source files.
+- `host` and `port`: TCP attach address, defaulting to `127.0.0.1:5678`.
+- `socket`: Unix socket path for local attach.
+- `platform`: video platform for the NoGUI executable.
+- `enable_cheats`: whether saved cheats are enabled for this launch.
+- `cwd`: optional Dolphin working directory.
+
+See [Source debugging with DWARF](../README.md#source-debugging-with-dwarf) for the
+difference between executed and sidecar ELFs.

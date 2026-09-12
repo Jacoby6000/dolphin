@@ -7,27 +7,27 @@
 
 return {
   -- Built dolphin-emu-nogui (must include DAP support from feature/dap-server).
-  dolphin = "~/projects/ai/yolo/dolphin-dap/build/Binaries/dolphin-emu-nogui",
+  dolphin = "/path/to/dolphin-emu-nogui",
 
   -- Qt build for GUI attach/launch (defaults to dolphin path with "-nogui" stripped).
-  -- dolphin_gui = "~/projects/ai/yolo/dolphin-dap/build/Binaries/dolphin-emu",
+  -- dolphin_gui = "/path/to/dolphin-emu",
 
   -- The ELF to execute. Its memory layout, symbols, and embedded DWARF are authoritative.
-  program = "~/projects/ai/yolo/melee/build/GALE01/main.elf",
+  program = "/path/to/main.elf",
 
   -- The corresponding game ISO. Dolphin uses its bootstrap and filesystem environment,
   -- but ignores its embedded DOL and executes `program` instead.
-  disc = "~/games/melee.iso",
+  disc = "/path/to/game.iso",
 
   -- Advanced metadata-only sidecar mode for an executable with the exact same link layout.
   -- This does not replace the executable selected by `program`.
-  -- elf = "~/projects/ai/yolo/melee/build/GALE01/main.elf",
+  -- elf = "/path/to/main.elf",
 
   -- Ordered roots used to resolve basename-only source paths from older DWARF.
   -- Each root should contain unique basenames; ambiguous matches are not guessed.
   source_paths = {
-    "~/projects/ai/yolo/melee/src",
-    "~/projects/ai/yolo/melee/extern/dolphin/src",
+    "/path/to/project/src",
+    "/path/to/project/extern/dolphin/src",
   },
 
   -- Optional launch override; disable codes that target another executable layout.
@@ -44,13 +44,13 @@ return {
   -- socket = "/tmp/dolphin-dap.sock",
 
   -- Optional: working directory for the launch executable.
-  -- cwd = "~/projects/ai/yolo/melee",
+  -- cwd = "/path/to/project",
 }
 
 -- Manual attach example (paste in a terminal, then pick "Dolphin attach (:5678)" in Neovim):
 -- dolphin-emu-nogui \
 --   -C Dolphin.General.DAPPort=5678 \
---   -C Dolphin.Core.DefaultISO=~/games/melee.iso \
+--   -C Dolphin.Core.DefaultISO=/path/to/game.iso \
 --   -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
---   --exec ~/projects/ai/yolo/melee/build/GALE01/main.elf \
+--   --exec /path/to/main.elf \
 --   --platform x11

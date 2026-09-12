@@ -13,8 +13,9 @@ For the per-operation request/response reference, see
   - [Standard requests](#standard-requests)
   - [Dolphin-specific custom requests](#dolphin-specific-custom-requests)
 - [Running the server](#running-the-server)
+- [Configuring a DAP client](#configuring-a-dap-client)
 - [Handshake test (no game required for transport check)](#handshake-test-no-game-required-for-transport-check)
-- [Neovim (lazy.nvim)](#neovim-lazynvim)
+- [Neovim](#neovim)
 - [Tests](#tests)
 - [Known limitations](#known-limitations)
 - [Source debugging with DWARF](#source-debugging-with-dwarf)
@@ -171,6 +172,33 @@ To let the game run immediately instead of pausing when the debugger connects, a
 The DAP client can override this setting with `stopOnEntry`. DAP and GDB are mutually
 exclusive, so do not enable both at the same time.
 
+## Configuring a DAP client
+
+Configure your editor or debugger as a DAP client that connects to a server. The client
+needs:
+
+- The host and TCP port, such as `127.0.0.1:5678`, or the Unix socket path.
+- An `attach` configuration when Dolphin was started separately.
+- A `launch` configuration when the client starts Dolphin with one of the commands from
+  [Running the server](#running-the-server).
+
+Client configuration formats differ, but the connection is equivalent to:
+
+```text
+adapter: server
+host: 127.0.0.1
+port: 5678
+request: attach
+```
+
+For source debugging, configure the client to find the source files named by the ELF's
+DWARF information. Older builds may contain only a filename rather than a complete path,
+so add the project's source directories to the client's source search path.
+
+The client should send standard DAP requests. Dolphin-specific memory watches, freezes,
+scans, and code injection require client support for the custom requests documented in
+[`capabilities.md`](capabilities.md).
+
 ## Handshake test (no game required for transport check)
 
 With Dolphin running and waiting for a client, send an `initialize` request:
@@ -189,10 +217,10 @@ PY
 
 Expect a JSON `response` with `"command":"initialize"` and `"success":true`.
 
-## Neovim (lazy.nvim)
+## Neovim
 
-See [`nvim/README.md`](nvim/README.md) for `nvim-dap` + `nvim-dap-ui` setup,
-`.dolphin-dap.lua` per-project config, and keymaps.
+See [`nvim/README.md`](nvim/README.md) for a portable `nvim-dap` setup and optional
+project configuration.
 
 ## Tests
 
