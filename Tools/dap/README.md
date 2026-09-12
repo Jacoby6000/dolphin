@@ -220,8 +220,27 @@ Expect a JSON `response` with `"command":"initialize"` and `"success":true`.
 
 ## Visual Studio Code
 
-See [`vscode/README.md`](vscode/README.md) for installation and `launch.json`
-configuration.
+Use VS Code's standard `debugServer` setting to connect an installed debugger extension
+to Dolphin's TCP server:
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Attach to Dolphin",
+      "type": "<installed-debugger-type>",
+      "request": "attach",
+      "debugServer": 5678,
+      "stopOnEntry": true
+    }
+  ]
+}
+```
+
+Replace `type` with a debugger type registered by one of your installed extensions.
+VS Code does not include a generic DAP debugger type. Start Dolphin with the matching TCP
+port before starting this configuration.
 
 ## Neovim
 
