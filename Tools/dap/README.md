@@ -87,8 +87,7 @@ after an existing session exits.
 
 ## Running the server
 
-Build with the NoGUI target (DAP sources compile into the `core` static lib;
-there is no separate binary or compile flag):
+Build Dolphin's NoGUI target:
 
 ```bash
 cmake -B build -DENABLE_NOGUI=ON -DENABLE_QT=OFF
@@ -175,10 +174,8 @@ dolphin-emu-nogui -C Dolphin.General.DAPPort=5678 \
   --exec /path/to/build/GALE01/main.elf --platform headless
 ```
 
-Direct execution supports 32-bit big-endian PowerPC `ET_EXEC` files whose entry point
-is contained in an executable `PT_LOAD` segment. Dolphin loads each `PT_LOAD` segment,
-zero-fills its BSS (`p_memsz - p_filesz`), starts at `e_entry`, and imports embedded
-MWCC DWARF 1.1 `.debug`/`.line` sections before the DAP client can run guest code.
+When executing an ELF, Dolphin loads the program, starts at its entry point, and imports
+its embedded symbols and MWCC DWARF 1.1 debug information before the DAP client runs it.
 
 GDB and DAP are mutually exclusive — do not set `GDBPort`/`GDBSocket` at the
 same time.
@@ -208,67 +205,21 @@ See [`nvim/README.md`](nvim/README.md) for `nvim-dap` + `nvim-dap-ui` setup,
 
 ## Tests
 
-The DAP server is validated by GoogleTest suites under
-`Source/UnitTests/Core/Debugger/DAP/` and `Source/UnitTests/Core/Debugger/DWARF/`.
-None of them require an ISO, a booted game, or the JIT — they follow the same
-pattern as `PageFaultTest` / `PageTableHostMappingTest`: initialize just the
-memory subsystem, declare the test thread as the CPU thread, and drive PPC
-state directly (with address translation off, so effective addresses map
-straight to physical RAM).
-
-| Suite | Layer | What it covers |
-|-------|-------|----------------|
-| `DapFramingTest` | transport | `Content-Length` framing encode/decode |
-| `DapJsonTest` | JSON | picojson parsing, hex addresses, base64 |
-| `DapProtocolTest` | protocol | request parsing + response/event building |
-| `DapControllerTest` | core integration | `DapDebugController` against a real `Core::System`: register read/write, memory read/write (incl. partial/invalid), disassembly, breakpoints, detour rollback, DWARF source mapping |
-| `DapSessionTest` | end-to-end | full `RunSession` command loop over a `socketpair`: handshake, `setBreakpoints`, `readMemory`, `writeMemory`, `disassemble`, `variables`, `setVariable`, step commands, unknown-command error |
-| `DwarfReaderTest` | DWARF parser | DWARF 1.1 `.debug`/`.line` parsing, malformed input |
-| `PPCSymbolDBLineTest` | symbol DB | line table queries, `ImportDwarf`, `Clear` |
-| `RealtimeWatchTest` | sampler | `RealtimeWatchSampler` subscriptions, change detection, freeze canon write-back |
-
-`DapSessionTest` connects a `socketpair` to `RunSession` running on a background
-thread (which declares itself the CPU thread, so the controller's
-`CPUThreadGuard`s are no-ops) and speaks real DAP over the socket — no TCP or
-network. This is the layer that exercises framing + JSON + dispatch + event
-serialization together.
-
-Build and run:
+Build and run the automated tests without starting a game:
 
 ```bash
-cmake --build build --target tests
-./build/Binaries/Tests/tests --gtest_filter='Dap*:Dwarf*:PPCSymbolDBLine*:RealtimeWatch*'
+cmake --build build --target unittests
 ```
-
-> The memory arena uses shared memory; restrictive sandboxes raise `SIGBUS` in
-> `Memory::Init` (also breaks `PageFaultHostMappingTest`) — run tests
-> unsandboxed.
 
 ## Known limitations
 
-- **Single global breakpoint store.** Dolphin has one PPC core and one shared
-  breakpoint/watchpoint store tied to it. Each DAP client's `setBreakpoints` /
-  `setDataBreakpoints` / `setInstructionBreakpoints` replaces the global set.
-  The intended topology is one DAP client per running core (DAP and GDB are
-  mutually exclusive). Concurrent DAP clients on the same core will clobber
-  each other's breakpoints/watchpoints — this is an architectural constraint,
-  not a per-session isolation bug.
-- **Realtime sample delivery cadence.** `dolphin_realtimeWatch` *samples* at
-  field rate (~60 Hz NTSC) but *delivers* `dolphin_memoryChanged` events on
-  the session loop's 50 ms poll, so a change is flushed to the socket within
-  ~50 ms of being observed. Burst changes within a single frame are coalesced
-  to one event per region.
-- **Freeze uses MMU write suppression + field-rate DMA fallback.**
-  `dolphin_freeze` installs an `is_freeze` memcheck on the watched range —
-  emulated CPU stores (`MMU::Write<T>`) that hit the range are silently
-  dropped before reaching RAM, so the game's own writes are perfectly
-  unobservable (no ~16 ms window). A field-rate `Tick()` re-applies the canon
-  as a fallback for DMA/peripheral writes that bypass `MMU::Write` (PI/DVD
-  transfers, `Memory::CopyToEmu`, etc.), where the ~16 ms window is DMA-only.
-  HostWrite (debugger/cheat writes, including DAP `WriteMemory`) bypasses the
-  memcheck by design, so the DAP client can update the frozen value itself.
-  Freeze is a layer on top of a watch subscription — clearing the freeze via
-  `dolphin_unfreeze` leaves the watch running and dispatching events normally.
+- Use one DAP client per running Dolphin instance. Multiple clients share the
+  same breakpoints and watchpoints and can overwrite each other's settings.
+- Realtime memory changes normally reach the client within about 50 ms. Multiple
+  changes during one frame may be combined into one update.
+- Frozen values block normal game writes immediately. Some hardware-driven writes
+  may appear briefly before Dolphin restores the frozen value on the next frame.
+  Clearing a freeze leaves its realtime watch active.
 
 ## Source awareness (DWARF 1.1 + entrypoints)
 
@@ -276,21 +227,15 @@ When DWARF 1.1 line info (MWCC/CodeWarrior `.debug`+`.line` sections) is loaded,
 `stackTrace`, `loadedSources`, `source`, and `breakpointLocations` return real
 file:line mappings. For a disc-based decomp workflow, boot the debug ELF as the
 executable and mount the ISO as the default disc, as shown above. Loading happens
-automatically from the executed ELF (`ElfReader::LoadSymbols`), programmatically via
-`Core::Debug::ImportDwarf` / `ImportDwarfFromElf`, or in metadata-only mode via
-`Dolphin.Debug.DwarfElf` (or `--debug-elf`). In the Qt UI: **Symbols → Load
-DWARF/Debug Info…**.
+automatically from the executed ELF. Metadata-only loading is also available with
+`Dolphin.Debug.DwarfElf`, `--debug-elf`, or **Symbols → Load DWARF/Debug Info…**
+in the Qt interface.
 
-The top stack frame also exposes `Locals` and `Globals` scopes. Supported MWCC
-DWARF 1.1 values include fundamental types, typedefs, pointers, fixed-size arrays,
-structures, and unions at absolute, supported PPC-register (`r0`-`r31`, `lr`,
-`ctr`, or `xer`), or
-base-register-plus-constant locations. Values are read-only and rendered as raw
-hexadecimal; expansion is limited to 32 levels and 1000 children per value. Location lists, general DWARF
-expressions, bit fields, inherited members, dynamic arrays, and non-top-frame
-unwinding are not supported.
+The top stack frame exposes `Locals` and `Globals`. You can inspect pointers, fixed-size
+arrays, structures, and unions, and expand nested values. Values are read-only and
+usually displayed in hexadecimal. Very deeply nested or extremely large values are
+limited, and variables from older stack frames are not currently available.
 
-Retail-linked units that omit MWCC DWARF can still expose function entrypoints
-+ definition lines via an **`entrypoints.json`** sidecar (normalized). This
-supplies entrypoint-level line info without faking body-level line tables.
+Code without DWARF can still expose function names and definition lines through an
+**`entrypoints.json`** file beside the ELF.
 See [`../../.ai-doc-reference/entrypoints-format.md`](../../.ai-doc-reference/entrypoints-format.md).
