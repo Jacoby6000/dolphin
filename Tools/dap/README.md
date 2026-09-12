@@ -267,9 +267,10 @@ Open the source project in VS Code and create `.vscode/launch.json`:
 
 Open **Run and Debug**, select **Attach to Dolphin**, and start debugging.
 
-`sourcePaths` lists ordered directories used to resolve relative and basename-only paths
-recorded by the ELF's DWARF data. Omit it when DWARF paths already identify readable files.
-Ambiguous basename matches remain unresolved rather than selecting an arbitrary source file.
+`sourcePaths` lists ordered directories the connector uses to resolve relative and basename-only
+paths recorded by the ELF's DWARF data. Omit it when DWARF paths already identify readable files.
+Ambiguous basename matches within one root remain unresolved rather than selecting an arbitrary
+source file.
 
 The ISO supplies the disc environment, while Dolphin executes the ELF so its symbols and
 DWARF addresses match the running code. Build the source files you need to inspect without
@@ -333,6 +334,24 @@ wrong memory.
 
 Sidecar debug information can also be loaded with `Dolphin.Debug.DwarfElf` or
 **Symbols → Load DWARF/Debug Info…** in the Qt interface.
+
+### Source paths
+
+The optional global `Dolphin.Debug.SourcePaths` setting lets Dolphin resolve backend-provided
+source names to full host paths before exposing them to debuggers. Separate ordered roots with
+semicolons; the first root containing a unique best suffix match wins. For example:
+
+```bash
+dolphin-emu-nogui \
+  -C 'Dolphin.Debug.SourcePaths=/workspace/src;/workspace/extern/dolphin/src' \
+  --exec /path/to/main.elf \
+  --platform headless
+```
+
+The Neovim adapter passes its configured `source_paths` through this setting when it starts
+Dolphin. For an already running Dolphin instance, set `SourcePaths` in the `[Debug]` section of
+`Dolphin.ini` before booting the title. Source roots are shared by all debugger clients connected
+to that Dolphin process.
 
 ### Debug information limits
 

@@ -68,6 +68,8 @@ public:
   // the generic SymbolDB base and DSP symbol maps stay unchanged.
   u32 AddSourceFile(std::string file);
   u32 AddSourceFileInstance(std::string file);
+  // Optionally resolves backend-provided source names against host source roots.
+  void SetSourcePaths(std::vector<std::string> source_paths);
   void AddLineEntry(u32 address, u32 file_index, u32 line);
   void ClearSourceLineInfo();
   bool HasSourceLineInfo() const;
@@ -90,6 +92,7 @@ public:
 private:
   std::optional<u32> FindSourceFileIndexLocked(std::string_view file_query) const;
   std::optional<u32> GetLineAddressLocked(u32 file_index, u32 line) const;
+  std::string ResolveSourcePathLocked(std::string_view path) const;
   static void AddKnownSymbol(const Core::CPUThreadGuard& guard, u32 startAddr, u32 size,
                              const std::string& name, const std::string& object_name,
                              Common::Symbol::Type type, XFuncMap* functions,
@@ -100,6 +103,8 @@ private:
   static void FillInCallers(XFuncMap* functions);
 
   std::vector<std::string> m_source_files;
+  std::vector<std::string> m_resolved_source_files;
+  std::vector<std::map<std::string, std::vector<std::string>>> m_host_source_files_by_root;
   std::map<u32, LineEntry> m_line_table;
   std::shared_ptr<const Core::Debug::Dwarf::ParseResult> m_dwarf_debug_info;
 };

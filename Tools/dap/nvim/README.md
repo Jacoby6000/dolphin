@@ -120,7 +120,8 @@ The configuration supports:
 - `program`: ELF, DOL, or ISO to execute.
 - `disc`: ISO mounted while executing an ELF or DOL.
 - `elf`: metadata-only debug ELF for the executable selected by `program`.
-- `source_paths`: ordered directories used to locate source files.
+- `source_paths`: ordered directories used to locate source files; spawned Dolphin instances also
+  receive them through the global `Dolphin.Debug.SourcePaths` setting.
 - `host` and `port`: TCP attach address, defaulting to `127.0.0.1:5678`.
 - `socket`: Unix socket path for local attach.
 - `platform`: video platform for the NoGUI executable.

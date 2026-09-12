@@ -580,6 +580,7 @@ const Info<bool> MAIN_DEBUG_JIT_ENABLE_PROFILING{{System::Main, "Debug", "JitEna
                                                  false};
 const Info<std::string> MAIN_DEBUG_DWARF_ELF{{System::Main, "Debug", "DwarfElf"}, ""};
 const Info<std::string> MAIN_DEBUG_ENTRYPOINTS{{System::Main, "Debug", "Entrypoints"}, ""};
+const Info<std::string> MAIN_DEBUG_SOURCE_PATHS{{System::Main, "Debug", "SourcePaths"}, ""};
 
 // Main.BluetoothPassthrough
 

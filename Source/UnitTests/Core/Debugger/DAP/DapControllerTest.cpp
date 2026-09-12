@@ -18,6 +18,8 @@
 
 #include "../DWARF/DwarfTestFixture.h"
 #include "Common/CommonTypes.h"
+#include "Common/FileUtil.h"
+#include "Common/ScopeGuard.h"
 #include "Common/SymbolDB.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
@@ -1612,6 +1614,129 @@ TEST_F(DapControllerTest, GetLoadedSourcesStripsPathToBasename)
   ASSERT_EQ(sources.size(), 1u);
   EXPECT_EQ(sources[0].path, "src/melee/gm/gm_1BA8.c");
   EXPECT_EQ(sources[0].name, "gm_1BA8.c");
+}
+
+TEST_F(DapControllerTest, SourcePathsResolveDwarfSourcesToFullPaths)
+{
+  const std::string temp_dir = File::CreateTempDir();
+  ASSERT_FALSE(temp_dir.empty());
+  Common::ScopeGuard cleanup{[&temp_dir] { File::DeleteDirRecursively(temp_dir); }};
+  const std::string source_root = temp_dir + "/src";
+  const std::string source_path = source_root + "/melee/gm/gm_test.c";
+  ASSERT_TRUE(File::CreateFullPath(source_path));
+  ASSERT_TRUE(File::WriteStringToFile(source_path, "test line\n"));
+
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  symbol_db.AddSourceFile("melee/gm/gm_test.c");
+  symbol_db.AddLineEntry(TEST_ADDRESS, 0, 7);
+  System().GetPPCState().pc = TEST_ADDRESS;
+  LR(System().GetPPCState()) = 0;
+
+  DAP::DapDebugController controller(System());
+  symbol_db.SetSourcePaths({source_root});
+
+  const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
+  ASSERT_EQ(sources.size(), 1u);
+  EXPECT_EQ(sources[0].path, source_path);
+  EXPECT_EQ(sources[0].source_reference, 1u);
+
+  const DAP::StackTraceResult trace = controller.GetStackTrace();
+  ASSERT_EQ(trace.frames.size(), 1u);
+  EXPECT_EQ(trace.frames[0].source_file, source_path);
+  EXPECT_TRUE(controller.GetSource(1, 1, 1).has_value());
+
+  DAP::SourceBreakpointContext breakpoint;
+  breakpoint.source_path = source_path;
+  EXPECT_EQ(controller.ResolveSourceLineBreakpoint(breakpoint, 7), TEST_ADDRESS);
+}
+
+TEST_F(DapControllerTest, SourcePathsResolveSourcesImportedLater)
+{
+  const std::string temp_dir = File::CreateTempDir();
+  ASSERT_FALSE(temp_dir.empty());
+  Common::ScopeGuard cleanup{[&temp_dir] { File::DeleteDirRecursively(temp_dir); }};
+  const std::string source_root = temp_dir + "/src";
+  const std::string source_path = source_root + "/later.c";
+  ASSERT_TRUE(File::CreateFullPath(source_path));
+  ASSERT_TRUE(File::CreateEmptyFile(source_path));
+
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  symbol_db.SetSourcePaths({source_root});
+  symbol_db.AddSourceFile("later.c");
+  symbol_db.AddLineEntry(TEST_ADDRESS, 0, 1);
+
+  DAP::DapDebugController controller(System());
+  const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
+  ASSERT_EQ(sources.size(), 1u);
+  EXPECT_EQ(sources[0].path, source_path);
+}
+
+TEST_F(DapControllerTest, SourcePathsPreferTheFirstMatchingRoot)
+{
+  const std::string temp_dir = File::CreateTempDir();
+  ASSERT_FALSE(temp_dir.empty());
+  Common::ScopeGuard cleanup{[&temp_dir] { File::DeleteDirRecursively(temp_dir); }};
+  const std::string first_root = temp_dir + "/first";
+  const std::string second_root = temp_dir + "/second";
+  ASSERT_TRUE(File::CreateFullPath(first_root + "/duplicate.c"));
+  ASSERT_TRUE(File::CreateFullPath(second_root + "/duplicate.c"));
+  ASSERT_TRUE(File::CreateEmptyFile(first_root + "/duplicate.c"));
+  ASSERT_TRUE(File::CreateEmptyFile(second_root + "/duplicate.c"));
+
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  symbol_db.AddSourceFile("duplicate.c");
+  symbol_db.AddLineEntry(TEST_ADDRESS, 0, 1);
+
+  DAP::DapDebugController controller(System());
+  symbol_db.SetSourcePaths({"", first_root, second_root});
+  const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
+  ASSERT_EQ(sources.size(), 1u);
+  EXPECT_EQ(sources[0].path, first_root + "/duplicate.c");
+  EXPECT_EQ(sources[0].source_reference, 1u);
+}
+
+TEST_F(DapControllerTest, SourcePathsLeaveAmbiguousBasenamesWithinOneRootUnresolved)
+{
+  const std::string temp_dir = File::CreateTempDir();
+  ASSERT_FALSE(temp_dir.empty());
+  Common::ScopeGuard cleanup{[&temp_dir] { File::DeleteDirRecursively(temp_dir); }};
+  const std::string source_root = temp_dir + "/src";
+  ASSERT_TRUE(File::CreateFullPath(source_root + "/first/duplicate.c"));
+  ASSERT_TRUE(File::CreateFullPath(source_root + "/second/duplicate.c"));
+  ASSERT_TRUE(File::CreateEmptyFile(source_root + "/first/duplicate.c"));
+  ASSERT_TRUE(File::CreateEmptyFile(source_root + "/second/duplicate.c"));
+
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  symbol_db.AddSourceFile("duplicate.c");
+  symbol_db.AddLineEntry(TEST_ADDRESS, 0, 1);
+
+  DAP::DapDebugController controller(System());
+  symbol_db.SetSourcePaths({source_root});
+  const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
+  ASSERT_EQ(sources.size(), 1u);
+  EXPECT_EQ(sources[0].path, "duplicate.c");
+  EXPECT_EQ(sources[0].source_reference, 0u);
+}
+
+TEST_F(DapControllerTest, SourcePathsResolveWindowsStyleDwarfPaths)
+{
+  const std::string temp_dir = File::CreateTempDir();
+  ASSERT_FALSE(temp_dir.empty());
+  Common::ScopeGuard cleanup{[&temp_dir] { File::DeleteDirRecursively(temp_dir); }};
+  const std::string source_root = temp_dir + "/src";
+  const std::string source_path = source_root + "/melee/gm/gm_test.c";
+  ASSERT_TRUE(File::CreateFullPath(source_path));
+  ASSERT_TRUE(File::CreateEmptyFile(source_path));
+
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  symbol_db.AddSourceFile(R"(C:\BUILD\MELEE\GM\GM_TEST.C)");
+  symbol_db.AddLineEntry(TEST_ADDRESS, 0, 1);
+
+  DAP::DapDebugController controller(System());
+  symbol_db.SetSourcePaths({source_root});
+  const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
+  ASSERT_EQ(sources.size(), 1u);
+  EXPECT_EQ(sources[0].path, source_path);
 }
 
 TEST_F(DapControllerTest, GetStackTraceUsesNearestPrecedingDwarfLine)
