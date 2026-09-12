@@ -1118,8 +1118,10 @@ TEST_F(DapSessionTest, ThreadsAndStackTraceReturnPpcState)
   const auto& stack_frames =
       stack_response->at("body").get<picojson::object>().at("stackFrames").get<picojson::array>();
   ASSERT_GE(stack_frames.size(), 1u);
-  EXPECT_EQ(stack_frames[0].get<picojson::object>().at("instructionPointerReference").to_str(),
-            "0x00003100");
+  const auto& stack_frame = stack_frames[0].get<picojson::object>();
+  EXPECT_EQ(stack_frame.at("instructionPointerReference").to_str(), "0x00003100");
+  EXPECT_EQ(stack_frame.at("source").get<picojson::object>().at("sourceReference").get<double>(),
+            static_cast<double>(CODE_ADDRESS));
 
   client.Send(R"({
     "seq": 9,
@@ -1581,7 +1583,7 @@ TEST_F(DapSessionTest, SourceReturnsDisassembly)
     "type": "request",
     "command": "source",
     "arguments": {
-      "source": {"name": "0x00003100"},
+      "source": {"name": "0x00003100", "sourceReference": 12544},
       "startLine": 0,
       "endLine": 0
     }

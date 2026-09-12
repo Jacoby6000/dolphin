@@ -2031,6 +2031,7 @@ private:
         picojson::object source;
         source.emplace("name", Json::FormatAddress(*frame.source_base));
         source.emplace("path", Json::FormatAddress(*frame.source_base));
+        source.emplace("sourceReference", static_cast<double>(*frame.source_base));
         entry.emplace("source", std::move(source));
         entry.emplace("line", static_cast<double>(frame.source_line));
       }
