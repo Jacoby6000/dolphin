@@ -8,8 +8,8 @@
 --- Per-project settings: add `.dolphin-dap.lua` at the repo root, e.g.
 ---   return {
 ---     dolphin = "~/projects/dolphin-dap/build/Binaries/dolphin-emu-nogui",
----     iso = "~/roms/GALE01.iso",
----     elf = "~/melee/build/GALE01/main.elf", -- optional sidecar DWARF
+---     program = "~/melee/build/GALE01/main.elf", -- ELF, DOL, or disc image to execute
+---     elf = "~/melee/build/GALE01/main.elf", -- optional DWARF sidecar for a disc/DOL
 ---     port = 5678,
 ---   }
 
@@ -88,8 +88,10 @@ local function normalize_project(project)
   return {
     dolphin = dolphin,
     dolphin_gui = dolphin_gui,
-    iso = expand_path(project.iso),
+    -- `iso` remains accepted for existing project files; `program` also supports ELF/DOL.
+    program = expand_path(project.program or project.iso),
     elf = expand_path(project.elf),
+    entrypoints = expand_path(project.entrypoints),
     port = project.port or 5678,
     socket = expand_path(project.socket),
     host = project.host or "127.0.0.1",
@@ -133,30 +135,35 @@ local function resolve_launch_target(config, project)
 end
 
 local function build_launch_args(project, target, port)
-  if not project.iso or project.iso == "" then
-    return nil, "`.dolphin-dap.lua` must set `iso` for launch configs"
+  if not project.program or project.program == "" then
+    return nil, "`.dolphin-dap.lua` must set `program` for launch configs"
   end
 
   local args = {
     "-C",
     string.format(DAP_PORT_CONFIG, port),
     "--exec",
-    project.iso,
+    project.program,
   }
 
   if target.platform then
     vim.list_extend(args, { "--platform", target.platform })
   end
 
-  if project.elf and project.elf ~= "" then
+  if project.elf and project.elf ~= "" and project.elf ~= project.program then
     vim.list_extend(args, { "--debug-elf", project.elf })
-    local entrypoints = project.entrypoints
-    if not entrypoints or entrypoints == "" then
-      entrypoints = vim.fn.fnamemodify(project.elf, ":p:h") .. "/entrypoints.json"
-    end
-    if entrypoints ~= "" and vim.fn.filereadable(entrypoints) == 1 then
-      vim.list_extend(args, { "--debug-entrypoints", entrypoints })
-    end
+  end
+
+  local entrypoints = project.entrypoints
+  local debug_layout = project.elf
+  if not debug_layout or debug_layout == "" then
+    debug_layout = project.program:lower():match("%.elf$") and project.program or nil
+  end
+  if (not entrypoints or entrypoints == "") and debug_layout then
+    entrypoints = vim.fn.fnamemodify(debug_layout, ":p:h") .. "/entrypoints.json"
+  end
+  if entrypoints and entrypoints ~= "" and vim.fn.filereadable(entrypoints) == 1 then
+    vim.list_extend(args, { "--debug-entrypoints", entrypoints })
   end
 
   return args
@@ -243,7 +250,7 @@ end
 function M.build_configurations(project)
   project = normalize_project(project)
 
-  local video_platform = project.platform == "auto" or project.platform == "video"
+  local video_platform = (project.platform == "auto" or project.platform == "video")
       and default_nogui_platform()
     or project.platform
     or default_nogui_platform()
@@ -265,7 +272,7 @@ function M.build_configurations(project)
       platform = video_platform,
       port = project.port,
       host = project.host,
-      iso = project.iso,
+      program = project.program,
       elf = project.elf,
       cwd = project.cwd,
     },
@@ -277,7 +284,7 @@ function M.build_configurations(project)
       nogui = false,
       port = project.port,
       host = project.host,
-      iso = project.iso,
+      program = project.program,
       elf = project.elf,
       cwd = project.cwd,
     },
@@ -287,7 +294,7 @@ function M.build_configurations(project)
       name = "Dolphin launch headless",
       nogui = true,
       platform = "headless",
-      iso = project.iso,
+      program = project.program,
       elf = project.elf,
       cwd = project.cwd,
     },
@@ -297,7 +304,7 @@ function M.build_configurations(project)
       name = string.format("Dolphin launch nogui (video, %s)", video_platform),
       nogui = true,
       platform = video_platform,
-      iso = project.iso,
+      program = project.program,
       elf = project.elf,
       cwd = project.cwd,
     },
@@ -306,7 +313,7 @@ function M.build_configurations(project)
       request = "launch",
       name = "Dolphin launch (Qt)",
       nogui = false,
-      iso = project.iso,
+      program = project.program,
       elf = project.elf,
       cwd = project.cwd,
     },
@@ -407,11 +414,11 @@ function M.setup(opts)
   end
 
   if not opts.quiet then
-    if project.iso then
-      notify(string.format("project ISO: %s", project.iso))
+    if project.program then
+      notify(string.format("program: %s", project.program))
     else
       notify(
-        "no `.dolphin-dap.lua` found — add one with at least `iso` (and optional `elf`) for launch",
+        "no `.dolphin-dap.lua` found — add one with at least `program` (and optional `elf`) for launch",
         vim.log.levels.WARN
       )
     end

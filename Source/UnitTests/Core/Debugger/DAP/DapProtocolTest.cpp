@@ -15,6 +15,26 @@
 
 namespace
 {
+TEST(DapProtocolTest, ParseSteppingGranularityDefaultsToSource)
+{
+  EXPECT_EQ(DAP::Protocol::ParseSteppingGranularity({}),
+            DAP::Protocol::SteppingGranularity::Statement);
+  EXPECT_EQ(DAP::Protocol::ParseSteppingGranularity({{"granularity", picojson::value("line")}}),
+            DAP::Protocol::SteppingGranularity::Line);
+  EXPECT_EQ(
+      DAP::Protocol::ParseSteppingGranularity({{"granularity", picojson::value("statement")}}),
+      DAP::Protocol::SteppingGranularity::Statement);
+  EXPECT_EQ(
+      DAP::Protocol::ParseSteppingGranularity({{"granularity", picojson::value("instruction")}}),
+      DAP::Protocol::SteppingGranularity::Instruction);
+  EXPECT_FALSE(
+      DAP::Protocol::ParseSteppingGranularity({{"granularity", picojson::value("invalid")}}));
+  EXPECT_FALSE(DAP::Protocol::ParseSteppingGranularity({{"threadId", picojson::value(2.0)}}));
+  EXPECT_EQ(DAP::Protocol::ParseSteppingGranularity(
+                {{"threadId", picojson::value(1.0)}, {"singleThread", picojson::value(true)}}),
+            DAP::Protocol::SteppingGranularity::Statement);
+}
+
 using namespace DAP;
 
 picojson::object ParseObjectOrDie(const std::string& text)
@@ -896,7 +916,7 @@ TEST(DapProtocol, ParseBreakpointLocationsWithoutSourceIsUnresolved)
 TEST(DapProtocol, ParseBreakpointLocationsResolvesSourceReference)
 {
   const auto message = ParseObjectOrDie(R"({
-    "sourceReference": 1,
+    "source": {"sourceReference": 1},
     "line": 2,
     "endLine": 5
   })");

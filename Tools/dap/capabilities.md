@@ -134,8 +134,8 @@ hasn't already.
 //  → {"command": "pause"}
 //  → {"event": "stopped", "body": {"reason": "pause", "threadId": 1}}
 
-{"command": "next",      "arguments": {"threadId": 1}}   // step over
-{"command": "stepIn",    "arguments": {"threadId": 1}}
+{"command": "next",      "arguments": {"threadId": 1, "granularity": "line"}}
+{"command": "stepIn",    "arguments": {"threadId": 1, "granularity": "instruction"}}
 {"command": "stepOut",   "arguments": {"threadId": 1}}
 //  → {"event": "stopped", "body": {"reason": "step", "threadId": 1}}
 ```
@@ -143,6 +143,15 @@ hasn't already.
 On a spontaneous stop (breakpoint hit / watchpoint hit / step completion) the
 reason is classified: `"breakpoint"`, `"data breakpoint"`, or `"step"`.
 `hitBreakpointIds` is populated for code breakpoints.
+
+Omitted, `"statement"`, and `"line"` granularity run asynchronously in
+interpreter mode until the `(source file, line)` changes. `next` consumes linking
+calls through their return address while `stepIn` enters them. `"instruction"`
+preserves single-opcode stepping. When the current PC has no source row, source
+stepping falls back to one opcode (`stepIn`) or one logical call-over (`next`).
+Source stepping checks code breakpoints after every opcode and is bounded by a
+5-second deadline and 1000000 instructions; continue, pause, and disconnect cancel
+an in-flight step, and overlapping step requests are rejected.
 
 ## `setBreakpoints`
 
@@ -259,7 +268,8 @@ rather than wrapping and disassembling unrelated low memory.
 ```jsonc
 {"command": "stackTrace", "arguments": {"threadId": 1, "startFrame": 0, "levels": 20}}
 {"command": "threads"}
-{"command": "scopes", "arguments": {"frameId": 0}}     // → ["Registers", "PC"]
+{"command": "scopes", "arguments": {"frameId": 0}}
+// → ["Registers", "PC", "Locals", "Globals"] when typed DWARF is loaded
 {"command": "variables", "arguments": {"variablesReference": 1000}}  // 1000 = Registers
 {"command": "setVariable", "arguments":
   {"variablesReference": 1000, "name": "r3", "value": "0x12345678"}}
@@ -268,6 +278,16 @@ rather than wrapping and disassembling unrelated low memory.
 Frame `source.path`/`source.name` carry either a real source file path (when
 DWARF/entrypoints line info is loaded) or a hex anchor address for a
 disassembly pseudo-source.
+
+`Locals` and `Globals` are available only for frame 0 and only when MWCC DWARF
+1.1 debug information is loaded. `variables` can expand supported typedefs,
+pointers, fixed-size arrays, structures, and unions to at most 32 levels and 1000
+children. It resolves absolute, supported PPC-register (`r0`-`r31`, `lr`, `ctr`, or `xer`),
+base-register-plus-constant, and constant member-offset locations. Values are
+read-only raw hexadecimal; location
+lists, arbitrary DWARF expressions, bit fields, inheritance, dynamic arrays, and
+unwinding locals for older frames are not implemented. Expansion references are
+invalidated by resume, stepping, restart, terminate, or a new `scopes` request.
 
 ## `evaluate`
 

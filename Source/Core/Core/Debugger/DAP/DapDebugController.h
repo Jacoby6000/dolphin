@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <expected>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Core/Debugger/DWARF/DwarfReader.h"
 
 namespace Core
 {
@@ -24,6 +26,8 @@ namespace DAP
 {
 constexpr int REGISTERS_SCOPE = 1000;
 constexpr int PC_SCOPE = 1001;
+constexpr int LOCALS_SCOPE = 1002;
+constexpr int GLOBALS_SCOPE = 1003;
 
 struct RegisterSnapshot
 {
@@ -34,6 +38,21 @@ struct RegisterSnapshot
   u32 msr = 0;
   u32 cr = 0;
   u32 xer = 0;
+};
+
+struct DebugValueContext
+{
+  Core::Debug::Dwarf::TypeRef type;
+  u32 address = 0;
+  u32 depth = 0;
+};
+
+struct DebugVariable
+{
+  std::string name;
+  std::string value;
+  std::string type;
+  std::optional<DebugValueContext> children;
 };
 
 enum class StepOverResult
@@ -173,20 +192,27 @@ public:
   // correct response).
   bool StepInto();
   StepOverResult StepOver();
-  // Steps until the current function returns, a breakpoint is hit, or `timeout`
+  void StepSource(bool step_over, const std::atomic<bool>& cancelled,
+                  std::chrono::milliseconds timeout = std::chrono::seconds(5),
+                  size_t instruction_cap = 1000000);
+  // Steps until the current function returns, a breakpoint/watchpoint is hit,
+  // cancellation is requested, or `timeout`
   // wall-clock time elapses. The timeout bounds otherwise non-returning code
   // (e.g. an infinite loop) and is injectable so it can be exercised in tests.
-  void StepOut(std::chrono::milliseconds timeout = std::chrono::seconds(5));
+  void StepOut(const std::atomic<bool>& cancelled,
+               std::chrono::milliseconds timeout = std::chrono::seconds(5));
   void SetCodeBreakpoints(std::vector<CodeBreakpointRequest> breakpoints);
-  std::vector<std::optional<u32>> UpdateSourceBreakpoints(std::string_view source_key,
-                                                          const SourceBreakpointContext& context,
-                                                          std::vector<SourceBreakpointSpec> breakpoints);
+  std::vector<std::optional<u32>>
+  UpdateSourceBreakpoints(std::string_view source_key, const SourceBreakpointContext& context,
+                          std::vector<SourceBreakpointSpec> breakpoints);
   void UpdateInstructionBreakpoints(std::vector<CodeBreakpointRequest> breakpoints);
   void SetDataBreakpoints(std::vector<DataBreakpointRequest> breakpoints);
   // Evaluates a PPC debugger expression (same syntax as breakpoint conditions).
   std::optional<std::string> EvaluateExpression(std::string_view expression);
 
   RegisterSnapshot GetRegisters();
+  std::vector<DebugVariable> GetDebugVariables(bool globals);
+  std::vector<DebugVariable> GetDebugVariableChildren(const DebugValueContext& context);
   // Writes a register exposed by the `variables` scopes. Returns the new value
   // on success, or nullopt when the scope, name, value, or writability is invalid.
   std::optional<u32> SetRegister(int variables_reference, std::string_view name,
@@ -218,8 +244,8 @@ public:
   // Removes all freezes installed by this controller.
   void ClearFreezes();
   std::vector<u8> ReadMemory(u32 address, std::size_t size);
-  std::expected<PointerChainResult, std::string>
-  ResolvePointerChain(u32 base_address, std::span<const s32> offsets);
+  std::expected<PointerChainResult, std::string> ResolvePointerChain(u32 base_address,
+                                                                     std::span<const s32> offsets);
   // Writes as many leading bytes of `data` as map to valid addresses and
   // returns the number written; stops at the first invalid address. After
   // the bytes land, invalidates the iCache and JIT block cache for every

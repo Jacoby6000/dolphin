@@ -12,6 +12,25 @@
 
 namespace DAP::Protocol
 {
+std::optional<SteppingGranularity> ParseSteppingGranularity(const picojson::object& arguments)
+{
+  if (arguments.contains("threadId"))
+  {
+    const std::optional<int> thread_id = ReadNumericFromJson<int>(arguments, "threadId");
+    if (!thread_id || *thread_id != 1)
+      return std::nullopt;
+  }
+  const std::string granularity =
+      ReadStringFromJson(arguments, "granularity").value_or("statement");
+  if (granularity == "statement")
+    return SteppingGranularity::Statement;
+  if (granularity == "line")
+    return SteppingGranularity::Line;
+  if (granularity == "instruction")
+    return SteppingGranularity::Instruction;
+  return std::nullopt;
+}
+
 namespace
 {
 using DAP::MemoryScanDataType;
@@ -95,25 +114,27 @@ bool HasInvalidOptionalBool(const picojson::object& obj, const std::string& key)
   return it != obj.end() && !it->second.is<bool>();
 }
 
-// Resolve a Dolphin "source" object to a base address. A source is anchored at
-// an address encoded as a hex string in either `name` or `path`.
-std::optional<u32> ResolveSourceBase(const picojson::object& arguments)
+std::optional<u32> ResolveSourceObjectBase(const picojson::object& source)
 {
-  const picojson::object* source = GetObject(arguments, "source");
-  if (source == nullptr)
-    return std::nullopt;
-
-  if (const std::optional<std::string> name = ReadStringFromJson(*source, "name"))
+  if (const std::optional<std::string> name = ReadStringFromJson(source, "name"))
   {
     if (const std::optional<u32> base = Json::ParseHexAddress(*name))
       return base;
   }
-  if (const std::optional<std::string> path = ReadStringFromJson(*source, "path"))
+  if (const std::optional<std::string> path = ReadStringFromJson(source, "path"))
   {
     if (const std::optional<u32> base = Json::ParseHexAddress(*path))
       return base;
   }
   return std::nullopt;
+}
+
+// Resolve a Dolphin "source" object to a base address. A source is anchored at
+// an address encoded as a hex string in either `name` or `path`.
+std::optional<u32> ResolveSourceBase(const picojson::object& arguments)
+{
+  const picojson::object* source = GetObject(arguments, "source");
+  return source ? ResolveSourceObjectBase(*source) : std::nullopt;
 }
 
 std::optional<u32> ResolveMemoryReference(const picojson::object& arguments)
@@ -138,7 +159,16 @@ std::optional<u32> ResolveSourceReference(const picojson::object& arguments)
       return std::nullopt;
     return static_cast<u32>(*reference);
   }
-  return ResolveSourceBase(arguments);
+  const picojson::object* source = GetObject(arguments, "source");
+  if (source == nullptr)
+    return std::nullopt;
+  if (const std::optional<s64> reference = ReadNumericFromJson<s64>(*source, "sourceReference"))
+  {
+    if (*reference < 0 || *reference > static_cast<s64>(std::numeric_limits<u32>::max()))
+      return std::nullopt;
+    return static_cast<u32>(*reference);
+  }
+  return ResolveSourceObjectBase(*source);
 }
 
 std::optional<DAP::MemoryScanDataType> ParseMemoryScanDataType(std::string_view type)

@@ -250,6 +250,14 @@ std::unique_ptr<BootParameters> BootParameters::GenerateFromFile(std::vector<std
     if (extension == ".elf")
     {
       auto elf_reader = std::make_unique<ElfReader>(path);
+      if (!elf_reader->IsPPCExecutable())
+      {
+        PanicAlertFmtT(
+            "\"{0}\" is not a supported executable. Dolphin requires a 32-bit big-endian "
+            "PowerPC ELF with an executable load segment containing its entry point.",
+            path);
+        return {};
+      }
       return std::make_unique<BootParameters>(Executable{std::move(path), std::move(elf_reader)},
                                               std::move(boot_session_data_));
     }
@@ -583,17 +591,6 @@ bool CBoot::BootUp(Core::System& system, const Core::CPUThreadGuard& guard,
 
       AchievementManager::GetInstance().LoadGame(nullptr);
 
-      // DESNOTE(jbarber, 2026-07-21): The previous order called
-      // OnTitleDirectlyBooted (which imports the configured DwarfElf and
-      // entrypoints sidecars) and then ran ppc_symbol_db.Clear() before
-      // LoadSymbols, silently discarding the sidecar imports. Order is now:
-      // set PC, clear the symbol DB, load the executable's own symbols
-      // (and any .debug DWARF it carries), THEN hand off to
-      // OnTitleDirectlyBooted so the sidecar imports layer on top. The
-      // symbol DB is additive -- OnTitleDirectlyBooted calls
-      // ImportConfiguredDwarfElf / ImportConfiguredEntrypoints without
-      // clearing, and its HLE::Reload re-runs PatchFunctions with all
-      // symbols available.
       ppc_state.pc = executable.reader->GetEntryPoint();
 
       const std::string filename = PathToFileName(executable.path);
@@ -601,16 +598,16 @@ bool CBoot::BootUp(Core::System& system, const Core::CPUThreadGuard& guard,
       auto& ppc_symbol_db = system.GetPPCSymbolDB();
       bool symbols_changed = ppc_symbol_db.Clear();
 
+      // Title setup can clear or replace the symbol DB while loading a map, so it must finish
+      // before the executable's intrinsic symbols and DWARF are imported.
+      SConfig::OnTitleDirectlyBooted(guard);
+
       if (executable.reader->LoadSymbols(guard, ppc_symbol_db, filename))
       {
         symbols_changed = true;
         HLE::PatchFunctions(system);
       }
 
-      SConfig::OnTitleDirectlyBooted(guard);
-      // OnTitleDirectlyBooted may have imported sidecar symbols; surface
-      // any change to the host UI. PatchFunctions already ran above and
-      // inside OnTitleDirectlyBooted's HLE::Reload, so symbols are live.
       if (symbols_changed)
         Host_PPCSymbolsChanged();
 

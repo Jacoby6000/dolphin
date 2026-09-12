@@ -65,6 +65,19 @@ void PPCSymbolDB::ClearSourceLineInfo()
   std::lock_guard lock(m_mutex);
   m_source_files.clear();
   m_line_table.clear();
+  m_dwarf_debug_info.reset();
+}
+
+void PPCSymbolDB::SetDwarfDebugInfo(Core::Debug::Dwarf::ParseResult info)
+{
+  std::lock_guard lock(m_mutex);
+  m_dwarf_debug_info = std::move(info);
+}
+
+std::optional<Core::Debug::Dwarf::ParseResult> PPCSymbolDB::GetDwarfDebugInfo() const
+{
+  std::lock_guard lock(m_mutex);
+  return m_dwarf_debug_info;
 }
 
 bool PPCSymbolDB::HasSourceLineInfo() const
@@ -142,7 +155,8 @@ bool SourcePathsMatch(std::string_view registered, std::string_view query)
   if (query.size() > registered.size())
   {
     const char separator = query[query.size() - registered.size() - 1];
-    if ((separator == '/' || separator == '\\') && query.substr(query.size() - registered.size()) == registered)
+    if ((separator == '/' || separator == '\\') &&
+        query.substr(query.size() - registered.size()) == registered)
       return true;
   }
 
@@ -165,7 +179,7 @@ std::optional<u32> PPCSymbolDB::FindSourceFileIndex(const std::string_view file_
 }
 
 std::optional<u32> PPCSymbolDB::GetLineAddressForQuery(const std::string_view file_query,
-                                                        const u32 line) const
+                                                       const u32 line) const
 {
   const std::optional<u32> file_index = FindSourceFileIndex(file_query);
   if (!file_index)

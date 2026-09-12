@@ -38,6 +38,7 @@
 #include "Core/Debugger/DAP/DapRealtimeWatch.h"
 #include "Core/Debugger/DAP/DapTransport.h"
 #include "Core/HW/CPU.h"
+#include "Core/PowerPC/PPCSymbolDB.h"
 #include "Core/System.h"
 
 namespace DAP
@@ -94,14 +95,13 @@ std::optional<std::string> ReadSourceString(const picojson::object& source, cons
 SourceBreakpointContext ParseSourceBreakpointContext(const picojson::object& arguments)
 {
   SourceBreakpointContext context;
-  if (const std::optional<int> source_reference =
-          ReadNumericFromJson<int>(arguments, "sourceReference"))
-  {
-    context.source_reference = *source_reference;
-  }
-
   if (const picojson::object* source = GetObject(arguments, "source"))
   {
+    if (const std::optional<int> source_reference =
+            ReadNumericFromJson<int>(*source, "sourceReference"))
+    {
+      context.source_reference = *source_reference;
+    }
     context.source_name = ReadSourceString(*source, "name");
     context.source_path = ReadSourceString(*source, "path");
   }
@@ -165,6 +165,13 @@ std::atomic<int> s_active_session_count{0};
 // a DAP re-init within the same process boot starts fresh. Bugbot #67.
 std::atomic<bool> s_entry_stop_handled{false};
 
+enum class DeferredStepAction
+{
+  None,
+  Continue,
+  Pause,
+};
+
 class Session : public std::enable_shared_from_this<Session>
 {
 public:
@@ -176,6 +183,7 @@ public:
   // would terminate the process on a still-joinable handle.
   ~Session()
   {
+    m_step_cancelled.store(true);
     if (m_step_out_thread.joinable())
       m_step_out_thread.join();
   }
@@ -314,6 +322,7 @@ public:
     // install a temporary breakpoint that ClearBreakpoints wipes, or vice
     // versa. The destructor also joins, but it runs AFTER this teardown
     // path, so ClearBreakpoints would have already raced. Bugbot #72.
+    m_step_cancelled.store(true);
     if (m_step_out_thread.joinable())
       m_step_out_thread.join();
     // DESNOTE(jbarber, 2026-07-22): Clear debugger state this session
@@ -500,6 +509,7 @@ private:
   // attribute someone else's resume to us.
   void ContinueCore()
   {
+    ClearDebugValueHandles();
     const CPU::State before = m_system.GetCPU().GetState();
     m_owns_next_continue.store(true);
     m_controller.Continue();
@@ -510,6 +520,39 @@ private:
     // flag and this store is a no-op; if not, transition didn't happen.
     if (m_system.GetCPU().GetState() == before)
       m_owns_next_continue.store(false);
+  }
+
+  bool JoinCompletedStepWorker(const Protocol::Request& request)
+  {
+    if (!m_step_out_thread.joinable())
+      return true;
+    if (!m_step_out_done.load())
+    {
+      RespondError(request.seq, request.command, "step already in progress");
+      return false;
+    }
+    m_step_out_thread.join();
+    return true;
+  }
+
+  void StartSourceStep(const Protocol::Request& request, const bool step_over)
+  {
+    if (!JoinCompletedStepWorker(request))
+      return;
+    if (!m_system.GetCPU().IsStepping())
+      m_controller.Pause();
+    {
+      std::lock_guard lock(m_stop_info_mutex);
+      m_pending_stop_info.reset();
+    }
+    m_step_cancelled.store(false);
+    m_deferred_step_action.store(DeferredStepAction::None);
+    m_step_out_done.store(false);
+    m_step_out_thread = std::thread([self = shared_from_this(), step_over] {
+      self->m_controller.StepSource(step_over, self->m_step_cancelled);
+      self->m_step_out_done.store(true);
+    });
+    Respond(request.seq, request.command, picojson::object{});
   }
 
   // Emits a `stopped` event whose reason is classified from the current PC
@@ -678,15 +721,12 @@ private:
       // session thread on the stepping lock until the worker's 5s
       // timeout elapsed.
       //
-      // DESNOTE(jbarber, 2026-07-21): If both flags are set (client asked to
-      // continue THEN pause during the step-out window), pause wins: the
-      // user's most recent intent was to halt. The earlier form ran Continue
-      // first and returned, silently dropping the deferred pause so the core
-      // kept running despite the client requesting a halt. Drain both flags
-      // and apply pause when both were requested.
-      const bool want_continue = m_pending_continue.exchange(false);
-      const bool want_pause = m_pending_pause.exchange(false);
-      if (want_pause)
+      // A single atomic action preserves the client's latest intent. Separate
+      // booleans could not distinguish continue-then-pause from
+      // pause-then-continue and therefore applied the wrong final state.
+      const DeferredStepAction action =
+          m_deferred_step_action.exchange(DeferredStepAction::None);
+      if (action == DeferredStepAction::Pause)
       {
         // DESNOTE(jbarber, 2026-07-21): A user-initiated pause that
         // happened during async step-out should be reported to the client
@@ -700,7 +740,7 @@ private:
         SyncSteppingBaseline();
         return;
       }
-      if (want_continue)
+      if (action == DeferredStepAction::Continue)
       {
         ContinueCore();
         SyncSteppingBaseline();
@@ -821,6 +861,7 @@ private:
 
     if (command == "disconnect")
     {
+      m_step_cancelled.store(true);
       m_running = false;
       Respond(request->seq, command, picojson::object{});
       return;
@@ -852,7 +893,8 @@ private:
       // request; PollBreakpointStop picks it up once the worker has joined.
       if (m_step_out_thread.joinable() && !m_step_out_done.load())
       {
-        m_pending_continue.store(true);
+        m_step_cancelled.store(true);
+        m_deferred_step_action.store(DeferredStepAction::Continue);
         // DESNOTE(jbarber, 2026-07-21): Ack the request with an empty body
         // and NO allThreadsContinued flag. The core is still stepping out
         // (the worker holds the CPUThreadGuard for up to its 5s timeout),
@@ -888,7 +930,8 @@ private:
       // it bails. Queue it for PollBreakpointStop to apply post-join.
       if (m_step_out_thread.joinable() && !m_step_out_done.load())
       {
-        m_pending_pause.store(true);
+        m_step_cancelled.store(true);
+        m_deferred_step_action.store(DeferredStepAction::Pause);
         Respond(request->seq, command, picojson::object{});
         return;
       }
@@ -901,6 +944,20 @@ private:
 
     if (command == "next")
     {
+      ClearDebugValueHandles();
+      const auto granularity = Protocol::ParseSteppingGranularity(request->arguments);
+      if (!granularity)
+      {
+        RespondError(request->seq, command, "invalid stepping granularity");
+        return;
+      }
+      if (*granularity != Protocol::SteppingGranularity::Instruction)
+      {
+        StartSourceStep(*request, true);
+        return;
+      }
+      if (!JoinCompletedStepWorker(*request))
+        return;
       // DESNOTE(jbarber, 2026-07-21): DAP stepping requires the core to be
       // paused. If a client sends `next` while running (a client error), the
       // controller's StepOver early-returns without advancing -- don't emit a
@@ -954,6 +1011,20 @@ private:
 
     if (command == "stepIn")
     {
+      ClearDebugValueHandles();
+      const auto granularity = Protocol::ParseSteppingGranularity(request->arguments);
+      if (!granularity)
+      {
+        RespondError(request->seq, command, "invalid stepping granularity");
+        return;
+      }
+      if (*granularity != Protocol::SteppingGranularity::Instruction)
+      {
+        StartSourceStep(*request, false);
+        return;
+      }
+      if (!JoinCompletedStepWorker(*request))
+        return;
       if (!m_system.GetCPU().IsStepping())
         m_controller.Pause();
       // DESNOTE(jbarber, 2026-07-21): Drop any stashed stop reason from the
@@ -999,6 +1070,9 @@ private:
 
     if (command == "stepOut")
     {
+      ClearDebugValueHandles();
+      if (!JoinCompletedStepWorker(*request))
+        return;
       if (!m_system.GetCPU().IsStepping())
         m_controller.Pause();
       // DESNOTE(jbarber, 2026-07-21): Run StepOut on a worker thread so the
@@ -1035,22 +1109,15 @@ private:
       // classified stop will arrive. Reject the duplicate explicitly so
       // the client knows the second step-out didn't start -- it can retry
       // once the in-flight worker's stopped event arrives.
-      if (m_step_out_thread.joinable())
-      {
-        if (!m_step_out_done.load())
-        {
-          RespondError(request->seq, command, "stepOut already in progress");
-          return;
-        }
-        m_step_out_thread.join();
-      }
       {
         std::lock_guard lock(m_stop_info_mutex);
         m_pending_stop_info.reset();
       }
       m_step_out_done.store(false);
+      m_step_cancelled.store(false);
+      m_deferred_step_action.store(DeferredStepAction::None);
       m_step_out_thread = std::thread([self = shared_from_this()]() {
-        self->m_controller.StepOut();
+        self->m_controller.StepOut(self->m_step_cancelled);
         self->m_step_out_done.store(true);
       });
       Respond(request->seq, command, picojson::object{});
@@ -1134,7 +1201,8 @@ private:
 
     if (command == "scopes")
     {
-      Respond(request->seq, command, MakeScopes());
+      const int frame_id = ReadNumericFromJson<int>(request->arguments, "frameId").value_or(-1);
+      Respond(request->seq, command, MakeScopes(frame_id));
       return;
     }
 
@@ -1142,6 +1210,12 @@ private:
     {
       const std::optional<int> variables_reference =
           ReadNumericFromJson<int>(request->arguments, "variablesReference");
+      if (variables_reference && *variables_reference >= 0x10000 &&
+          !m_debug_value_handles.contains(*variables_reference))
+      {
+        RespondError(request->seq, command, "unknown or stale variablesReference");
+        return;
+      }
       Respond(request->seq, command, MakeVariables(variables_reference.value_or(0)));
       return;
     }
@@ -1698,6 +1772,7 @@ private:
     // do before emitting a stopped event.
     if (!m_system.GetCPU().IsStepping())
       m_controller.Pause();
+    ClearDebugValueHandles();
     m_controller.SetPC(arguments->target);
     Respond(request.seq, "goto", picojson::object{});
     SendStoppedEvent("goto");
@@ -1787,6 +1862,7 @@ private:
 
   void HandleTerminate(const Protocol::Request& request)
   {
+    ClearDebugValueHandles();
     m_controller.Terminate();
     Respond(request.seq, "terminate", picojson::object{});
 
@@ -1798,6 +1874,7 @@ private:
 
   void HandleRestart(const Protocol::Request& request)
   {
+    ClearDebugValueHandles();
     m_controller.Restart();
     Respond(request.seq, "restart", picojson::object{});
     SendStoppedEvent("restart");
@@ -1926,6 +2003,7 @@ private:
       return;
     }
 
+    ClearDebugValueHandles();
     picojson::object body;
     body.emplace("value", fmt::format("0x{:08x}", *value));
     Respond(request.seq, "setVariable", std::move(body));
@@ -2477,15 +2555,44 @@ private:
     return scope;
   }
 
-  picojson::object MakeScopes()
+  void ClearDebugValueHandles()
   {
+    m_debug_value_handles.clear();
+  }
+
+  picojson::object MakeScopes(const int frame_id)
+  {
+    ClearDebugValueHandles();
     picojson::array scopes;
     scopes.emplace_back(MakeScope("Registers", REGISTERS_SCOPE));
     scopes.emplace_back(MakeScope("PC", PC_SCOPE));
+    const auto debug_info = m_system.GetPPCSymbolDB().GetDwarfDebugInfo();
+    if (frame_id == 0 && debug_info && !debug_info->variables.empty())
+    {
+      scopes.emplace_back(MakeScope("Locals", LOCALS_SCOPE));
+      scopes.emplace_back(MakeScope("Globals", GLOBALS_SCOPE));
+    }
 
     picojson::object body;
     body.emplace("scopes", std::move(scopes));
     return body;
+  }
+
+  picojson::object MakeDebugVariable(DebugVariable variable)
+  {
+    picojson::object result;
+    result.emplace("name", std::move(variable.name));
+    result.emplace("value", std::move(variable.value));
+    result.emplace("type", std::move(variable.type));
+    int reference = 0;
+    if (variable.children && m_debug_value_handles.size() < 100000 &&
+        m_next_debug_value_handle < std::numeric_limits<int>::max())
+    {
+      reference = m_next_debug_value_handle++;
+      m_debug_value_handles.emplace(reference, std::move(*variable.children));
+    }
+    result.emplace("variablesReference", static_cast<double>(reference));
+    return result;
   }
 
   picojson::object MakeVariables(int variables_reference)
@@ -2507,6 +2614,18 @@ private:
       variables.emplace_back(MakeVariable("cr", registers.cr));
       variables.emplace_back(MakeVariable("xer", registers.xer));
     }
+    else if (variables_reference == LOCALS_SCOPE || variables_reference == GLOBALS_SCOPE)
+    {
+      for (DebugVariable& variable :
+           m_controller.GetDebugVariables(variables_reference == GLOBALS_SCOPE))
+        variables.emplace_back(MakeDebugVariable(std::move(variable)));
+    }
+    else if (const auto it = m_debug_value_handles.find(variables_reference);
+             it != m_debug_value_handles.end())
+    {
+      for (DebugVariable& variable : m_controller.GetDebugVariableChildren(it->second))
+        variables.emplace_back(MakeDebugVariable(std::move(variable)));
+    }
 
     picojson::object body;
     body.emplace("variables", std::move(variables));
@@ -2524,6 +2643,8 @@ private:
   // RemoveFreeze to tear down the MMU-level `is_freeze` memcheck that
   // suppresses CPU writes to the frozen range.
   std::map<int, u32> m_watch_to_freeze;
+  std::map<int, DebugValueContext> m_debug_value_handles;
+  int m_next_debug_value_handle = 0x10000;
   std::atomic<bool> m_running{true};
   // DESNOTE(jbarber, 2026-07-22): Set just before this session calls
   // m_controller.Continue(); the state hook consumes it via exchange so
@@ -2604,15 +2725,15 @@ private:
   // The worker captures a shared_ptr<Session> (rather than `this`) so a late
   // tear-down can't free the Session while the worker still holds the guard.
   //
-  // `m_pending_continue` / `m_pending_pause` are set when the client issues
-  // continue/pause while a step-out worker is still holding the stepping lock.
+  // `m_deferred_step_action` stores the latest continue/pause intent while a
+  // worker still holds the stepping lock.
   // We respond success immediately and defer the actual SetState call to
   // PollBreakpointStop (which runs after the worker joins), so the session
   // thread never blocks on the stepping lock.
   std::thread m_step_out_thread;
   std::atomic<bool> m_step_out_done{true};
-  std::atomic<bool> m_pending_continue{false};
-  std::atomic<bool> m_pending_pause{false};
+  std::atomic<bool> m_step_cancelled{false};
+  std::atomic<DeferredStepAction> m_deferred_step_action{DeferredStepAction::None};
 };
 }  // namespace
 

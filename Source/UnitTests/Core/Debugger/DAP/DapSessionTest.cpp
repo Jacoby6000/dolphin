@@ -960,6 +960,101 @@ TEST_F(DapSessionTest, VariablesReturnsRegisters)
   (void)client.Receive();
 }
 
+TEST_F(DapSessionTest, FrameZeroScopesExposeExpandableDwarfVariablesAndExpireHandles)
+{
+  auto& system = Core::System::GetInstance();
+  system.GetPPCSymbolDB().SetDwarfDebugInfo(DwarfTestFixture::MakeTypedParseResult());
+  system.GetPPCState().pc = DwarfTestFixture::kFunctionAddress;
+  const std::array<u8, 8> point{{0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x40, 0x00}};
+  system.GetMemory().CopyToEmu(DwarfTestFixture::kTypedDataAddress, point.data(), point.size());
+
+  TestClient client(m_client_fd());
+  Handshake(client);
+
+  client.Send(R"({
+    "seq": 10, "type": "request", "command": "scopes", "arguments": {"frameId": 0}
+  })");
+  const auto scopes_response = client.Receive();
+  ASSERT_TRUE(scopes_response);
+  const auto& scopes =
+      scopes_response->at("body").get<picojson::object>().at("scopes").get<picojson::array>();
+  ASSERT_EQ(scopes.size(), 4U);
+  EXPECT_EQ(scopes[2].get<picojson::object>().at("name").to_str(), "Locals");
+  EXPECT_EQ(scopes[3].get<picojson::object>().at("name").to_str(), "Globals");
+
+  client.Send(R"({
+    "seq": 11, "type": "request", "command": "variables",
+    "arguments": {"variablesReference": 1003}
+  })");
+  const auto globals_response = client.Receive();
+  ASSERT_TRUE(globals_response);
+  const auto& globals =
+      globals_response->at("body").get<picojson::object>().at("variables").get<picojson::array>();
+  ASSERT_EQ(globals.size(), 2U);
+  const auto& global = globals[0].get<picojson::object>();
+  EXPECT_EQ(global.at("name").to_str(), "global_point");
+  const int children_reference = static_cast<int>(global.at("variablesReference").get<double>());
+  EXPECT_GE(children_reference, 0x10000);
+
+  client.Send(fmt::format(
+      R"({{"seq":12,"type":"request","command":"variables","arguments":{{"variablesReference":{}}}}})",
+      children_reference));
+  const auto children_response = client.Receive();
+  ASSERT_TRUE(children_response);
+  const auto& children =
+      children_response->at("body").get<picojson::object>().at("variables").get<picojson::array>();
+  ASSERT_EQ(children.size(), 2U);
+  EXPECT_EQ(children[0].get<picojson::object>().at("value").to_str(), "0x11223344");
+
+  client.Send(R"({
+    "seq": 13, "type": "request", "command": "scopes", "arguments": {"frameId": 1}
+  })");
+  const auto non_top_scopes_response = client.Receive();
+  ASSERT_TRUE(non_top_scopes_response);
+  EXPECT_EQ(non_top_scopes_response->at("body")
+                .get<picojson::object>()
+                .at("scopes")
+                .get<picojson::array>()
+                .size(),
+            2U);
+
+  client.Send(fmt::format(
+      R"({{"seq":14,"type":"request","command":"variables","arguments":{{"variablesReference":{}}}}})",
+      children_reference));
+  const auto stale_response = client.Receive();
+  ASSERT_TRUE(stale_response);
+  EXPECT_FALSE(stale_response->at("success").get<bool>());
+
+  client.Send(R"({
+    "seq": 15, "type": "request", "command": "scopes", "arguments": {"frameId": 0}
+  })");
+  ASSERT_TRUE(client.Receive());
+  client.Send(R"({
+    "seq": 16, "type": "request", "command": "variables",
+    "arguments": {"variablesReference": 1003}
+  })");
+  const auto refreshed_globals_response = client.Receive();
+  ASSERT_TRUE(refreshed_globals_response);
+  const auto& refreshed_globals = refreshed_globals_response->at("body")
+                                      .get<picojson::object>()
+                                      .at("variables")
+                                      .get<picojson::array>();
+  ASSERT_FALSE(refreshed_globals.empty());
+  const int refreshed_reference = static_cast<int>(
+      refreshed_globals[0].get<picojson::object>().at("variablesReference").get<double>());
+  EXPECT_NE(refreshed_reference, children_reference);
+
+  client.Send(fmt::format(
+      R"({{"seq":17,"type":"request","command":"variables","arguments":{{"variablesReference":{}}}}})",
+      children_reference));
+  const auto aliased_stale_response = client.Receive();
+  ASSERT_TRUE(aliased_stale_response);
+  EXPECT_FALSE(aliased_stale_response->at("success").get<bool>());
+
+  client.Send(R"({"seq": 18, "type": "request", "command": "disconnect"})");
+  (void)client.Receive();
+}
+
 TEST_F(DapSessionTest, SetVariableUpdatesRegisterAndReturnsFormattedValue)
 {
   TestClient client(m_client_fd());
@@ -1568,7 +1663,7 @@ TEST_F(DapSessionTest, BreakpointLocationsWithDwarfSourceReference)
     "type": "request",
     "command": "breakpointLocations",
     "arguments": {
-      "sourceReference": 1,
+      "source": {"sourceReference": 1},
       "line": 1,
       "endLine": 2
     }
@@ -1607,7 +1702,7 @@ TEST_F(DapSessionTest, SetBreakpointsWithDwarfSourceReference)
     "type": "request",
     "command": "setBreakpoints",
     "arguments": {
-      "sourceReference": 1,
+      "source": {"sourceReference": 1},
       "breakpoints": [{"line": 2}]
     }
   })");

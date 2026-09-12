@@ -12,11 +12,11 @@ return {
   -- Qt build for GUI attach/launch (defaults to dolphin path with "-nogui" stripped).
   -- dolphin_gui = "~/projects/ai/yolo/dolphin-dap/build/Binaries/dolphin-emu",
 
-  -- Game disc image to boot.
-  iso = "~/roms/GALE01.iso",
+  -- ELF, DOL, or disc image to execute. A directly booted ELF supplies its own DWARF.
+  program = "~/projects/ai/yolo/melee/build/GALE01/main.elf",
 
-  -- Sidecar debug ELF for DWARF line info (same build as the running DOL).
-  elf = "~/projects/ai/yolo/melee/build/GALE01/main.elf",
+  -- Optional sidecar debug ELF when program is a retail disc image or DOL.
+  -- elf = "~/projects/ai/yolo/melee/build/GALE01/main.elf",
 
   -- TCP port for attach configs (launch uses a dynamic port via nvim-dap).
   port = 5678,
@@ -35,6 +35,5 @@ return {
 -- Manual attach example (paste in a terminal, then pick "Dolphin attach (:5678)" in Neovim):
 -- dolphin-emu-nogui \
 --   -C Dolphin.General.DAPPort=5678 \
---   --exec ~/roms/GALE01.iso \
---   --platform x11 \
---   --debug-elf ~/projects/ai/yolo/melee/build/GALE01/main.elf
+--   --exec ~/projects/ai/yolo/melee/build/GALE01/main.elf \
+--   --platform x11

@@ -18,6 +18,7 @@
 #include "Common/Event.h"
 #include "Common/FileUtil.h"
 #include "Common/IOFile.h"
+#include "Common/ScopeGuard.h"
 #include "Common/StringUtil.h"
 #include "Common/SymbolDB.h"
 #include "Core/Core.h"
@@ -73,8 +74,8 @@ constexpr std::optional<u32> MakeBranchInstruction(u32 pc, u32 target)
 
 constexpr std::array<u8, 4> BigEndianBytes(u32 word)
 {
-  return {static_cast<u8>(word >> 24), static_cast<u8>(word >> 16),
-          static_cast<u8>(word >> 8), static_cast<u8>(word)};
+  return {static_cast<u8>(word >> 24), static_cast<u8>(word >> 16), static_cast<u8>(word >> 8),
+          static_cast<u8>(word)};
 }
 
 constexpr u32 ReadBigEndianU32(std::span<const u8> bytes)
@@ -140,6 +141,7 @@ DapDebugController::DapDebugController(Core::System& system) : m_system(system)
 
 void DapDebugController::Continue()
 {
+  m_system.GetPowerPC().ClearSteppingMemcheckHit();
   Core::SetState(m_system, Core::State::Running);
 }
 
@@ -224,7 +226,77 @@ StepOverResult DapDebugController::StepOver()
   return stepped ? StepOverResult::Stepped : StepOverResult::NotStepped;
 }
 
-void DapDebugController::StepOut(std::chrono::milliseconds timeout_ms)
+void DapDebugController::StepSource(const bool step_over, const std::atomic<bool>& cancelled,
+                                    const std::chrono::milliseconds timeout,
+                                    const size_t instruction_cap)
+{
+  auto& cpu = m_system.GetCPU();
+  if (!cpu.IsStepping() || instruction_cap == 0)
+    return;
+
+  using clock = std::chrono::steady_clock;
+  const clock::time_point deadline = clock::now() + timeout;
+  auto& power_pc = m_system.GetPowerPC();
+  auto& state = m_system.GetPPCState();
+  const std::optional<PPCSymbolDB::SourceLine> start_line =
+      m_system.GetPPCSymbolDB().GetSourceLine(state.pc);
+  Core::CPUThreadGuard guard(m_system);
+  const PowerPC::CoreMode old_mode = power_pc.GetMode();
+  power_pc.SetMode(PowerPC::CoreMode::Interpreter);
+  const bool resume_watchpoint =
+      (state.Exceptions & EXCEPTION_FAKE_MEMCHECK_HIT) != 0;
+  power_pc.ClearSteppingMemcheckHit();
+  power_pc.SetSteppingMemchecksEnabled(!resume_watchpoint);
+  Common::ScopeGuard restore_mode{[&] {
+    power_pc.SetSteppingMemchecksEnabled(false);
+    power_pc.SetMode(old_mode);
+  }};
+
+  size_t instruction_count = 0;
+  bool hit_breakpoint = false;
+  const auto can_continue = [&] {
+    return !cancelled.load() && instruction_count < instruction_cap && clock::now() < deadline &&
+           !hit_breakpoint;
+  };
+  const auto step_one = [&] {
+    power_pc.SingleStep();
+    power_pc.SetSteppingMemchecksEnabled(true);
+    ++instruction_count;
+    hit_breakpoint = power_pc.DidSteppingMemcheckHit() || power_pc.CheckBreakPoints();
+  };
+  const auto step_logical = [&] {
+    const u32 old_pc = state.pc;
+    const UGeckoInstruction inst = PowerPC::MMU::HostRead_Instruction(guard, state.pc);
+    if (!step_over || !inst.LK)
+    {
+      step_one();
+      return !step_over && inst.LK && state.pc != old_pc + 4;
+    }
+
+    const u32 return_pc = state.pc + 4;
+    do
+    {
+      step_one();
+    } while (can_continue() && state.pc != return_pc);
+    return false;
+  };
+
+  bool entered_call = false;
+  if (can_continue())
+    entered_call = step_logical();
+  while (start_line && can_continue() && !entered_call)
+  {
+    const std::optional<PPCSymbolDB::SourceLine> current_line =
+        m_system.GetPPCSymbolDB().GetSourceLine(state.pc);
+    if (!current_line || current_line->file != start_line->file ||
+        current_line->line != start_line->line)
+      break;
+    entered_call = step_logical();
+  }
+}
+
+void DapDebugController::StepOut(const std::atomic<bool>& cancelled,
+                                 std::chrono::milliseconds timeout_ms)
 {
   auto& cpu = m_system.GetCPU();
   if (!cpu.IsStepping())
@@ -239,13 +311,30 @@ void DapDebugController::StepOut(std::chrono::milliseconds timeout_ms)
 
   const PowerPC::CoreMode old_mode = power_pc.GetMode();
   power_pc.SetMode(PowerPC::CoreMode::Interpreter);
+  const bool resume_watchpoint =
+      (ppc_state.Exceptions & EXCEPTION_FAKE_MEMCHECK_HIT) != 0;
+  power_pc.ClearSteppingMemcheckHit();
+  power_pc.SetSteppingMemchecksEnabled(!resume_watchpoint);
+  Common::ScopeGuard restore_mode{[&] {
+    power_pc.SetSteppingMemchecksEnabled(false);
+    power_pc.SetMode(old_mode);
+  }};
+
+  const auto can_continue = [&] {
+    return !cancelled.load() && clock::now() < timeout &&
+           !power_pc.DidSteppingMemcheckHit() && !power_pc.CheckBreakPoints();
+  };
+  const auto step_one = [&] {
+    power_pc.SingleStep();
+    power_pc.SetSteppingMemchecksEnabled(true);
+  };
 
   UGeckoInstruction inst = PowerPC::MMU::HostRead_Instruction(guard, ppc_state.pc);
-  do
+  while (can_continue())
   {
     if (WillInstructionReturn(m_system, inst))
     {
-      power_pc.SingleStep();
+      step_one();
       break;
     }
 
@@ -254,18 +343,16 @@ void DapDebugController::StepOut(std::chrono::milliseconds timeout_ms)
       const u32 next_pc = ppc_state.pc + 4;
       do
       {
-        power_pc.SingleStep();
-      } while (ppc_state.pc != next_pc && clock::now() < timeout && !power_pc.CheckBreakPoints());
+        step_one();
+      } while (ppc_state.pc != next_pc && can_continue());
     }
     else
     {
-      power_pc.SingleStep();
+      step_one();
     }
 
     inst = PowerPC::MMU::HostRead_Instruction(guard, ppc_state.pc);
-  } while (clock::now() < timeout && !power_pc.CheckBreakPoints());
-
-  power_pc.SetMode(old_mode);
+  }
 }
 
 void DapDebugController::ApplyCodeBreakpoints(const std::vector<CodeBreakpointRequest>& breakpoints)
@@ -301,8 +388,9 @@ void DapDebugController::SetCodeBreakpoints(std::vector<CodeBreakpointRequest> b
   ApplyCodeBreakpoints(breakpoints);
 }
 
-std::optional<u32> DapDebugController::ResolveSourceLineBreakpoint(
-    const SourceBreakpointContext& context, const u32 line)
+std::optional<u32>
+DapDebugController::ResolveSourceLineBreakpoint(const SourceBreakpointContext& context,
+                                                const u32 line)
 {
   Core::CPUThreadGuard guard(m_system);
   auto& symbol_db = m_system.GetPowerPC().GetSymbolDB();
@@ -353,9 +441,10 @@ std::optional<u32> DapDebugController::ResolveSourceLineBreakpoint(
   return static_cast<u32>(effective);
 }
 
-std::vector<std::optional<u32>> DapDebugController::UpdateSourceBreakpoints(
-    const std::string_view source_key, const SourceBreakpointContext& context,
-    std::vector<SourceBreakpointSpec> breakpoints)
+std::vector<std::optional<u32>>
+DapDebugController::UpdateSourceBreakpoints(const std::string_view source_key,
+                                            const SourceBreakpointContext& context,
+                                            std::vector<SourceBreakpointSpec> breakpoints)
 {
   std::vector<CodeBreakpointRequest> resolved;
   resolved.reserve(breakpoints.size());
@@ -476,6 +565,368 @@ RegisterSnapshot DapDebugController::GetRegisters()
   snapshot.cr = ppc_state.cr.Get();
   snapshot.xer = ppc_state.GetXER().Hex;
   return snapshot;
+}
+
+namespace
+{
+constexpr u32 MAX_DEBUG_VALUE_DEPTH = 32;
+constexpr size_t MAX_DEBUG_CHILDREN = 1000;
+
+const Core::Debug::Dwarf::Type* FindType(const Core::Debug::Dwarf::ParseResult& info,
+                                         const u32 offset)
+{
+  const auto it = std::ranges::find(info.types, offset, &Core::Debug::Dwarf::Type::die_offset);
+  return it == info.types.end() ? nullptr : &*it;
+}
+
+std::optional<u32> FundamentalSize(const u16 type)
+{
+  switch (type)
+  {
+  case 1:
+  case 2:
+  case 3:
+  case 21:
+    return 1;
+  case 4:
+  case 5:
+  case 6:
+    return 2;
+  case 7:
+  case 8:
+  case 9:
+  case 10:
+  case 11:
+  case 12:
+  case 13:
+  case 14:
+    return 4;
+  case 15:
+  case 0x8008:
+  case 0x8108:
+  case 0x8208:
+    return 8;
+  default:
+    return std::nullopt;
+  }
+}
+
+std::string FundamentalName(const u16 type)
+{
+  switch (type)
+  {
+  case 1:
+    return "char";
+  case 2:
+    return "signed char";
+  case 3:
+    return "unsigned char";
+  case 4:
+  case 5:
+    return "short";
+  case 6:
+    return "unsigned short";
+  case 7:
+  case 8:
+    return "int";
+  case 9:
+    return "unsigned int";
+  case 10:
+  case 11:
+    return "long";
+  case 12:
+    return "unsigned long";
+  case 13:
+    return "void*";
+  case 14:
+    return "float";
+  case 15:
+    return "double";
+  case 20:
+    return "void";
+  case 21:
+    return "bool";
+  case 0x8008:
+  case 0x8108:
+    return "long long";
+  case 0x8208:
+    return "unsigned long long";
+  default:
+    return "unknown";
+  }
+}
+
+std::string TypeName(const Core::Debug::Dwarf::ParseResult& info,
+                     const Core::Debug::Dwarf::TypeRef& ref, u32 depth = 0)
+{
+  if (depth >= MAX_DEBUG_VALUE_DEPTH)
+    return "unknown";
+  if (!ref.modifiers.empty())
+  {
+    auto modified = ref;
+    const auto modifier = modified.modifiers.front();
+    modified.modifiers.erase(modified.modifiers.begin());
+    if (modifier == Core::Debug::Dwarf::TypeModifier::Pointer)
+      return TypeName(info, modified, depth + 1) + "*";
+    if (modifier == Core::Debug::Dwarf::TypeModifier::Reference)
+      return TypeName(info, modified, depth + 1) + "&";
+    return TypeName(info, modified, depth + 1);
+  }
+  if (const auto* fundamental = std::get_if<Core::Debug::Dwarf::FundamentalTypeRef>(&ref.type))
+    return FundamentalName(fundamental->type);
+  const auto* user = std::get_if<Core::Debug::Dwarf::UserTypeRef>(&ref.type);
+  const auto* type = user ? FindType(info, user->die_offset) : nullptr;
+  if (!type)
+    return "unknown";
+  if (!type->name.empty())
+    return type->name;
+  if (type->kind == Core::Debug::Dwarf::TypeKind::Pointer)
+    return TypeName(info, type->referenced_type, depth + 1) + "*";
+  if (type->kind == Core::Debug::Dwarf::TypeKind::Array)
+    return fmt::format("{}[{}]", TypeName(info, type->referenced_type, depth + 1),
+                       type->array_count.value_or(0));
+  return type->kind == Core::Debug::Dwarf::TypeKind::Union ? "union" : "struct";
+}
+
+std::optional<u64> ReadRegisterValue(const PowerPC::PowerPCState& state, const u32 reg)
+{
+  if (reg < 32)
+    return state.gpr[reg];
+  if (reg == 65)
+    return LR(state);
+  if (reg == 66)
+    return CTR(state);
+  if (reg == 76)
+    return state.GetXER().Hex;
+  return std::nullopt;
+}
+
+std::optional<u64> ReadBigEndianValue(const Core::CPUThreadGuard& guard, const u32 address,
+                                      const u32 size)
+{
+  if (size == 0 || size > 8 || address > std::numeric_limits<u32>::max() - (size - 1))
+    return std::nullopt;
+  const auto* accessors = AddressSpace::GetAccessors(AddressSpace::Type::Effective);
+  if (!accessors || !accessors->IsValidAddress(guard, address) ||
+      !accessors->IsValidAddress(guard, address + size - 1))
+    return std::nullopt;
+  u64 value = 0;
+  for (u32 i = 0; i < size; ++i)
+    value = value << 8 | accessors->ReadU8(guard, address + i);
+  return value;
+}
+
+DebugVariable UnavailableVariable(std::string name, std::string type)
+{
+  return {std::move(name), "<unavailable>", std::move(type), std::nullopt};
+}
+
+DebugVariable MaterializeDebugValue(const Core::CPUThreadGuard& guard,
+                                    const Core::Debug::Dwarf::ParseResult& info, std::string name,
+                                    Core::Debug::Dwarf::TypeRef ref, std::optional<u32> address,
+                                    std::optional<u64> direct_value, const u32 depth)
+{
+  const std::string display_type = TypeName(info, ref);
+  if (depth >= MAX_DEBUG_VALUE_DEPTH)
+    return UnavailableVariable(std::move(name), display_type);
+
+  while (!ref.modifiers.empty() &&
+         (ref.modifiers.front() == Core::Debug::Dwarf::TypeModifier::Const ||
+          ref.modifiers.front() == Core::Debug::Dwarf::TypeModifier::Volatile))
+  {
+    ref.modifiers.erase(ref.modifiers.begin());
+  }
+  if (!ref.modifiers.empty() &&
+      ref.modifiers.front() == Core::Debug::Dwarf::TypeModifier::Reference)
+  {
+    return UnavailableVariable(std::move(name), display_type);
+  }
+  if (!ref.modifiers.empty() && ref.modifiers.front() == Core::Debug::Dwarf::TypeModifier::Pointer)
+  {
+    const std::optional<u64> value = direct_value ? direct_value :
+                                     address      ? ReadBigEndianValue(guard, *address, 4) :
+                                                    std::nullopt;
+    if (!value || *value > std::numeric_limits<u32>::max())
+      return UnavailableVariable(std::move(name), display_type);
+    ref.modifiers.erase(ref.modifiers.begin());
+    if (*value == 0)
+      return {std::move(name), "0x00000000", display_type, std::nullopt};
+    return {std::move(name), fmt::format("0x{:08x}", static_cast<u32>(*value)), display_type,
+            DebugValueContext{std::move(ref), static_cast<u32>(*value), depth + 1}};
+  }
+
+  if (const auto* fundamental = std::get_if<Core::Debug::Dwarf::FundamentalTypeRef>(&ref.type))
+  {
+    const auto size = FundamentalSize(fundamental->type);
+    std::optional<u64> value = direct_value    ? direct_value :
+                               address && size ? ReadBigEndianValue(guard, *address, *size) :
+                                                 std::nullopt;
+    if (!size || !value)
+      return UnavailableVariable(std::move(name), display_type);
+    if (*size < 8)
+      *value &= (u64{1} << (*size * 8)) - 1;
+    return {std::move(name), fmt::format("0x{:0{}x}", *value, *size * 2), display_type,
+            std::nullopt};
+  }
+
+  const auto* user = std::get_if<Core::Debug::Dwarf::UserTypeRef>(&ref.type);
+  const auto* type = user ? FindType(info, user->die_offset) : nullptr;
+  if (!type)
+    return UnavailableVariable(std::move(name), display_type);
+  if (type->kind == Core::Debug::Dwarf::TypeKind::Typedef)
+    return MaterializeDebugValue(guard, info, std::move(name), type->referenced_type, address,
+                                 direct_value, depth + 1);
+  if (type->kind == Core::Debug::Dwarf::TypeKind::Pointer)
+  {
+    const std::optional<u64> value = direct_value ? direct_value :
+                                     address      ? ReadBigEndianValue(guard, *address, 4) :
+                                                    std::nullopt;
+    if (!value || *value > std::numeric_limits<u32>::max())
+      return UnavailableVariable(std::move(name), display_type);
+    if (*value == 0)
+      return {std::move(name), "0x00000000", display_type, std::nullopt};
+    return {std::move(name), fmt::format("0x{:08x}", static_cast<u32>(*value)), display_type,
+            DebugValueContext{type->referenced_type, static_cast<u32>(*value), depth + 1}};
+  }
+  if (!address || (type->kind == Core::Debug::Dwarf::TypeKind::Array && !type->array_count))
+    return UnavailableVariable(std::move(name), display_type);
+  return {std::move(name), fmt::format("@ 0x{:08x}", *address), display_type,
+          DebugValueContext{std::move(ref), *address, depth + 1}};
+}
+
+std::optional<u32> TypeSize(const Core::Debug::Dwarf::ParseResult& info,
+                            const Core::Debug::Dwarf::TypeRef& ref, u32 depth = 0)
+{
+  if (depth >= MAX_DEBUG_VALUE_DEPTH)
+    return std::nullopt;
+  if (!ref.modifiers.empty() &&
+      (ref.modifiers.front() == Core::Debug::Dwarf::TypeModifier::Const ||
+       ref.modifiers.front() == Core::Debug::Dwarf::TypeModifier::Volatile))
+  {
+    auto unqualified = ref;
+    unqualified.modifiers.erase(unqualified.modifiers.begin());
+    return TypeSize(info, unqualified, depth + 1);
+  }
+  if (!ref.modifiers.empty() && ref.modifiers.front() == Core::Debug::Dwarf::TypeModifier::Pointer)
+    return 4;
+  if (!ref.modifiers.empty())
+    return std::nullopt;
+  if (const auto* fundamental = std::get_if<Core::Debug::Dwarf::FundamentalTypeRef>(&ref.type))
+    return FundamentalSize(fundamental->type);
+  const auto* user = std::get_if<Core::Debug::Dwarf::UserTypeRef>(&ref.type);
+  const auto* type = user ? FindType(info, user->die_offset) : nullptr;
+  if (!type)
+    return std::nullopt;
+  if (type->kind == Core::Debug::Dwarf::TypeKind::Pointer)
+    return 4;
+  if (type->byte_size != 0)
+    return type->byte_size;
+  if (type->kind == Core::Debug::Dwarf::TypeKind::Typedef)
+    return TypeSize(info, type->referenced_type, depth + 1);
+  if (type->kind == Core::Debug::Dwarf::TypeKind::Array && type->array_count)
+  {
+    const auto element = TypeSize(info, type->referenced_type, depth + 1);
+    if (element && *type->array_count <= std::numeric_limits<u32>::max() / *element)
+      return *element * *type->array_count;
+  }
+  return std::nullopt;
+}
+}  // namespace
+
+std::vector<DebugVariable> DapDebugController::GetDebugVariables(const bool globals)
+{
+  Core::CPUThreadGuard guard(m_system);
+  const auto& stored = m_system.GetPPCSymbolDB().GetDwarfDebugInfo();
+  if (!stored)
+    return {};
+  const auto& state = m_system.GetPPCState();
+  std::vector<DebugVariable> result;
+  for (const auto& variable : stored->variables)
+  {
+    const bool is_global = variable.kind == Core::Debug::Dwarf::VariableKind::Global;
+    if (is_global != globals ||
+        (!globals && (variable.low_pc >= variable.high_pc || state.pc < variable.low_pc ||
+                      state.pc >= variable.high_pc)))
+      continue;
+    std::optional<u32> address;
+    std::optional<u64> direct;
+    if (variable.location.kind == Core::Debug::Dwarf::LocationKind::Address)
+      address = variable.location.value;
+    else if (variable.location.kind == Core::Debug::Dwarf::LocationKind::Register)
+      direct = ReadRegisterValue(state, variable.location.value);
+    else if (variable.location.kind == Core::Debug::Dwarf::LocationKind::BaseRegisterOffset)
+    {
+      if (const auto base = ReadRegisterValue(state, variable.location.value);
+          base && *base <= UINT32_MAX)
+      {
+        const s64 resolved = static_cast<s64>(*base) + variable.location.offset;
+        if (resolved >= 0 && resolved <= UINT32_MAX)
+          address = static_cast<u32>(resolved);
+      }
+    }
+    result.push_back(
+        MaterializeDebugValue(guard, *stored, variable.name, variable.type, address, direct, 0));
+  }
+  return result;
+}
+
+std::vector<DebugVariable>
+DapDebugController::GetDebugVariableChildren(const DebugValueContext& context)
+{
+  Core::CPUThreadGuard guard(m_system);
+  const auto& stored = m_system.GetPPCSymbolDB().GetDwarfDebugInfo();
+  if (!stored || context.depth >= MAX_DEBUG_VALUE_DEPTH)
+    return {};
+  if (!context.type.modifiers.empty() ||
+      std::holds_alternative<Core::Debug::Dwarf::FundamentalTypeRef>(context.type.type))
+  {
+    return {MaterializeDebugValue(guard, *stored, "*", context.type, context.address, std::nullopt,
+                                  context.depth)};
+  }
+  const auto* user = std::get_if<Core::Debug::Dwarf::UserTypeRef>(&context.type.type);
+  const auto* type = user ? FindType(*stored, user->die_offset) : nullptr;
+  if (!type)
+    return {};
+  if (type->kind == Core::Debug::Dwarf::TypeKind::Typedef)
+    return {MaterializeDebugValue(guard, *stored, "value", type->referenced_type, context.address,
+                                  std::nullopt, context.depth)};
+
+  std::vector<DebugVariable> result;
+  if (type->kind == Core::Debug::Dwarf::TypeKind::Structure ||
+      type->kind == Core::Debug::Dwarf::TypeKind::Union)
+  {
+    for (const auto& member : type->members)
+    {
+      if (result.size() >= MAX_DEBUG_CHILDREN)
+        break;
+      if (member.location.kind != Core::Debug::Dwarf::LocationKind::MemberOffset ||
+          member.location.value > UINT32_MAX - context.address)
+      {
+        result.push_back(UnavailableVariable(member.name, TypeName(*stored, member.type)));
+        continue;
+      }
+      result.push_back(MaterializeDebugValue(guard, *stored, member.name, member.type,
+                                             context.address + member.location.value, std::nullopt,
+                                             context.depth));
+    }
+  }
+  else if (type->kind == Core::Debug::Dwarf::TypeKind::Array && type->array_count)
+  {
+    const auto element_size = TypeSize(*stored, type->referenced_type);
+    if (!element_size || *element_size == 0)
+      return {};
+    const u32 count = std::min<u32>(*type->array_count, MAX_DEBUG_CHILDREN);
+    for (u32 i = 0; i < count; ++i)
+    {
+      const u64 address = static_cast<u64>(context.address) + static_cast<u64>(i) * *element_size;
+      if (address > UINT32_MAX)
+        break;
+      result.push_back(MaterializeDebugValue(guard, *stored, fmt::format("[{}]", i),
+                                             type->referenced_type, static_cast<u32>(address),
+                                             std::nullopt, context.depth));
+    }
+  }
+  return result;
 }
 
 std::optional<u32> DapDebugController::SetRegister(const int variables_reference,
@@ -677,6 +1128,11 @@ std::optional<SourceContent> DapDebugController::GetSource(const u32 base_addres
   auto& symbol_db = m_system.GetPowerPC().GetSymbolDB();
 
   const int first_line = std::max(start_line, 0);
+  const auto add_lines_clamped = [](const int line, const int count) {
+    return line > std::numeric_limits<int>::max() - count ?
+               std::numeric_limits<int>::max() :
+               line + count;
+  };
   // DESNOTE(jbarber, 2026-07-21): DAP's `endLine` defaults to -1 when the
   // client means "through end of file/source". The previous form
   // `end_line > first_line ? end_line : first_line + 63` collapsed -1 to
@@ -685,7 +1141,8 @@ std::optional<SourceContent> DapDebugController::GetSource(const u32 base_addres
   // the line_count cap (256) below, whichever comes first. The cap keeps
   // responses bounded; clients paging past it just send another request.
   const int last_line = end_line < 0 ? std::numeric_limits<int>::max() :
-                     (end_line > first_line ? end_line : first_line + 63);
+                                        (end_line > first_line ? end_line :
+                                                                 add_lines_clamped(first_line, 63));
   // DESNOTE(jbarber, 2026-07-21): For the disassembly case below we bound
   // the result at 256 lines via `line_count`. The DWARF source-file path
   // above reads lines from disk in a `while (fgets)` loop -- the only
@@ -732,6 +1189,8 @@ std::optional<SourceContent> DapDebugController::GetSource(const u32 base_addres
         result.content.append(line);
         ++emitted_lines;
       }
+      if (current_line == std::numeric_limits<int>::max())
+        break;
       ++current_line;
     }
 
@@ -754,7 +1213,11 @@ std::optional<SourceContent> DapDebugController::GetSource(const u32 base_addres
 
   for (int i = 0; i < line_count; ++i)
   {
-    const u32 addr = base_address + static_cast<u32>((first_line + i) * 4);
+    const u64 addr64 = static_cast<u64>(base_address) +
+                       (static_cast<u64>(first_line) + static_cast<u64>(i)) * 4ull;
+    if (addr64 > std::numeric_limits<u32>::max())
+      break;
+    const u32 addr = static_cast<u32>(addr64);
     if (!PowerPC::MMU::HostIsRAMAddress(guard, addr))
       break;
     if (i > 0)
@@ -775,6 +1238,11 @@ std::vector<BreakpointLocation> DapDebugController::GetBreakpointLocations(const
   std::vector<BreakpointLocation> locations;
 
   const int first_line = std::max(start_line, 0);
+  const auto add_lines_clamped = [](const int line, const int count) {
+    return line > std::numeric_limits<int>::max() - count ?
+               std::numeric_limits<int>::max() :
+               line + count;
+  };
   // DESNOTE(jbarber, 2026-07-21): DAP's `endLine` defaults to -1 meaning
   // "through end". Treat negative end_line as unbounded so we enumerate
   // every instruction slot / line entry in the range rather than stopping
@@ -783,25 +1251,33 @@ std::vector<BreakpointLocation> DapDebugController::GetBreakpointLocations(const
   // doesn't spin the session thread for billions of GetLineAddress calls.
   constexpr int kMaxLocationEnumerations = 65536;
   const int last_line = end_line < 0 ? std::numeric_limits<int>::max() :
-                     (end_line >= first_line ? end_line : first_line + 63);
-  const int capped_last = std::min(last_line, first_line + kMaxLocationEnumerations - 1);
+                                        (end_line >= first_line ? end_line :
+                                                                  add_lines_clamped(first_line, 63));
+  const int capped_last =
+      std::min(last_line, add_lines_clamped(first_line, kMaxLocationEnumerations - 1));
+  const u64 line_count = static_cast<u64>(capped_last) - static_cast<u64>(first_line) + 1;
 
   auto& symbol_db = m_system.GetPowerPC().GetSymbolDB();
   if (symbol_db.HasSourceLineInfo() && base_address > 0 &&
       base_address <= symbol_db.GetSourceFiles().size())
   {
     const std::string& file = symbol_db.GetSourceFiles()[base_address - 1];
-    for (int line = first_line; line <= capped_last; ++line)
+    for (u64 i = 0; i < line_count; ++i)
     {
+      const int line = static_cast<int>(static_cast<u64>(first_line) + i);
       if (symbol_db.GetLineAddress(file, static_cast<u32>(line)))
         locations.push_back({line});
     }
     return locations;
   }
 
-  for (int line = first_line; line <= capped_last; ++line)
+  for (u64 i = 0; i < line_count; ++i)
   {
-    const u32 addr = base_address + static_cast<u32>(line * 4);
+    const int line = static_cast<int>(static_cast<u64>(first_line) + i);
+    const u64 addr64 = static_cast<u64>(base_address) + static_cast<u64>(line) * 4ull;
+    if (addr64 > std::numeric_limits<u32>::max())
+      break;
+    const u32 addr = static_cast<u32>(addr64);
     if (!PowerPC::MMU::HostIsRAMAddress(guard, addr))
       break;
     locations.push_back({line});
@@ -904,9 +1380,7 @@ u32 DapDebugController::InstallFreeze(u32 address, u32 count, std::span<const u8
 bool DapDebugController::RemoveFreeze(u32 freeze_id)
 {
   auto it = std::find_if(m_freezes.begin(), m_freezes.end(),
-                         [freeze_id](const FreezeEntry& e) {
-                           return e.freeze_id == freeze_id;
-                         });
+                         [freeze_id](const FreezeEntry& e) { return e.freeze_id == freeze_id; });
   if (it == m_freezes.end())
     return false;
   {
@@ -952,8 +1426,7 @@ std::vector<u8> DapDebugController::ReadMemory(u32 address, std::size_t size)
   // top-of-MEM1 read of exactly 1 byte at 0xFFFFFFFF was incorrectly
   // rejected.
   if (size > static_cast<std::size_t>(std::numeric_limits<u32>::max()) ||
-      (size > 0 &&
-       static_cast<u32>(size - 1) > std::numeric_limits<u32>::max() - address))
+      (size > 0 && static_cast<u32>(size - 1) > std::numeric_limits<u32>::max() - address))
   {
     return {};
   }
@@ -984,8 +1457,8 @@ DapDebugController::ResolvePointerChain(u32 base_address, std::span<const s32> o
   for (const s32 offset : offsets)
   {
     if (result.final_address > std::numeric_limits<u32>::max() - 3)
-      return std::unexpected(fmt::format("pointer at 0x{:08x} crosses the address boundary",
-                                         result.final_address));
+      return std::unexpected(
+          fmt::format("pointer at 0x{:08x} crosses the address boundary", result.final_address));
     for (u32 byte = 0; byte < 4; ++byte)
     {
       if (!accessors->IsValidAddress(guard, result.final_address + byte))
@@ -1113,7 +1586,6 @@ std::optional<u32> DapDebugController::FindFreeMemory(u32 count)
   // 4-byte-aligned offset, mirroring what a real allocator would return
   // for a code-cave request. Iterating by word keeps the start address
   // naturally 4-byte-aligned.
-  const u32 need_words = (count + 3u) / 4u;
   std::optional<u32> best_addr;
   std::optional<u32> best_bytes;
   u32 run_start = 0;
@@ -1212,8 +1684,7 @@ DapDebugController::Detour(u32 target_address, std::optional<u32> detour_address
     if (end_byte_64 > static_cast<u64>(std::numeric_limits<u32>::max()))
       return std::nullopt;
     const u32 end_byte = static_cast<u32>(end_byte_64);
-    AddressSpace::Accessors* accessors =
-        AddressSpace::GetAccessors(AddressSpace::Type::Effective);
+    AddressSpace::Accessors* accessors = AddressSpace::GetAccessors(AddressSpace::Type::Effective);
     {
       Core::CPUThreadGuard guard(m_system);
       if (!accessors->IsValidAddress(guard, detour_addr) ||
@@ -1261,9 +1732,8 @@ DapDebugController::Detour(u32 target_address, std::optional<u32> detour_address
       (void)WriteMemory(it->address, std::span<const u8>{it->snapshot});
   };
   const auto stage_or_fail = [&](u32 address, const std::vector<u8>& snapshot,
-                                  std::span<const u8> new_bytes) -> bool {
-    if (snapshot.size() != new_bytes.size() ||
-        WriteMemory(address, new_bytes) != new_bytes.size())
+                                 std::span<const u8> new_bytes) -> bool {
+    if (snapshot.size() != new_bytes.size() || WriteMemory(address, new_bytes) != new_bytes.size())
     {
       restore();
       return false;
@@ -1357,6 +1827,13 @@ StopInfo DapDebugController::GetStopInfo()
   // Step rather than mis-reporting, which is safe for the DAP `stopped` reason.
   if ((ppc_state.Exceptions & EXCEPTION_FAKE_MEMCHECK_HIT) != 0)
   {
+    info.reason = StopReason::DataBreakpoint;
+    return info;
+  }
+
+  if (m_system.GetPowerPC().DidSteppingMemcheckHit())
+  {
+    m_system.GetPowerPC().ClearSteppingMemcheckHit();
     info.reason = StopReason::DataBreakpoint;
     return info;
   }

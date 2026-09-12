@@ -34,8 +34,8 @@ Each operation below links to its detailed reference section in
 | [`configurationDone`](capabilities.md#configurationdone) | Concludes the launch handshake. |
 | [`continue`](capabilities.md#continue-pause-step) | Resume execution. `allThreadsContinued: true` reported. |
 | [`pause`](capabilities.md#continue-pause-step) | Halt the core; emits `stopped`/`"pause"`. |
-| [`next`](capabilities.md#continue-pause-step) | Step over (interpreter mode). |
-| [`stepIn`](capabilities.md#continue-pause-step) | Step into (interpreter mode). |
+| [`next`](capabilities.md#continue-pause-step) | Step to the next source row without entering calls; instruction granularity remains available. |
+| [`stepIn`](capabilities.md#continue-pause-step) | Step to the next source row, entering calls; instruction granularity remains available. |
 | [`stepOut`](capabilities.md#continue-pause-step) | Step out (async worker, classified stop on completion). |
 | [`setBreakpoints`](capabilities.md#setbreakpoints) | Source/line code breakpoints. Conditional via `condition`. |
 | [`setInstructionBreakpoints`](capabilities.md#setinstructionbreakpoints) | Address-keyed code breakpoints; replaces the whole list. |
@@ -45,8 +45,8 @@ Each operation below links to its detailed reference section in
 | [`disassemble`](capabilities.md#disassemble) | Per-instruction disassembly. `instructionCount` capped at 65536. |
 | [`stackTrace`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | PPC call stack. |
 | [`threads`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | OS thread enumeration. |
-| [`scopes`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | Variable scopes for a frame (`Registers`, `PC`). |
-| [`variables`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | Enumerate variables in a scope. |
+| [`scopes`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | Registers/PC, plus frame-0 DWARF locals and globals. |
+| [`variables`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | Enumerate scopes and expand supported DWARF structs, pointers, and arrays. |
 | [`setVariable`](capabilities.md#stacktrace-threads-scopes-variables-setvariable) | Mutate a variable (registers, etc.). |
 | [`evaluate`](capabilities.md#evaluate) | Evaluate a PPC debugger expression. |
 | [`goto`](capabilities.md#goto-gototargets) | Set PC; re-emits `stopped`/`"goto"`. |
@@ -152,6 +152,18 @@ For NonMatching decomp units, Melee `configure.py --debug` also generates
 `entrypoints.json` beside `main.elf`; pass `--debug-entrypoints` or rely on
 auto-discovery when the sibling file exists.
 
+**Execute a debug ELF directly** and use its embedded symbols and DWARF:
+
+```bash
+dolphin-emu-nogui -C Dolphin.General.DAPPort=5678 \
+  --exec /path/to/build/GALE01/main.elf --platform headless
+```
+
+Direct execution supports 32-bit big-endian PowerPC `ET_EXEC` files whose entry point
+is contained in an executable `PT_LOAD` segment. Dolphin loads each `PT_LOAD` segment,
+zero-fills its BSS (`p_memsz - p_filesz`), starts at `e_entry`, and imports embedded
+MWCC DWARF 1.1 `.debug`/`.line` sections before the DAP client can run guest code.
+
 GDB and DAP are mutually exclusive — do not set `GDBPort`/`GDBSocket` at the
 same time.
 
@@ -250,6 +262,15 @@ file:line mappings. Loading happens automatically when booting a debug ELF
 (`ElfReader::LoadSymbols`), programmatically via `Core::Debug::ImportDwarf` /
 `ImportDwarfFromElf`, or as a sidecar via `Dolphin.Debug.DwarfElf` (or
 `--debug-elf`). In the Qt UI: **Symbols → Load DWARF/Debug Info…**.
+
+The top stack frame also exposes `Locals` and `Globals` scopes. Supported MWCC
+DWARF 1.1 values include fundamental types, typedefs, pointers, fixed-size arrays,
+structures, and unions at absolute, supported PPC-register (`r0`-`r31`, `lr`,
+`ctr`, or `xer`), or
+base-register-plus-constant locations. Values are read-only and rendered as raw
+hexadecimal; expansion is limited to 32 levels and 1000 children per value. Location lists, general DWARF
+expressions, bit fields, inherited members, dynamic arrays, and non-top-frame
+unwinding are not supported.
 
 Retail-linked units that omit MWCC DWARF can still expose function entrypoints
 + definition lines via an **`entrypoints.json`** sidecar (normalized). This

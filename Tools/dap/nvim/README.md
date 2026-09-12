@@ -20,7 +20,7 @@ connects over TCP (or a Unix socket on Linux) after Dolphin is listening.
 
    ```bash
    cp Tools/dap/nvim/.dolphin-dap.example.lua /path/to/melee/.dolphin-dap.lua
-   # edit iso / elf / dolphin binary paths
+   # edit program / dolphin binary paths
    ```
 
 Buffer diagnostics moved to `<leader>ld` so `<leader>d*` is free for DAP (see `dolphin-dap.lua`).
@@ -79,8 +79,18 @@ nogui (video, x11)** / **Dolphin attach (nogui video spawn, :5678)** in Neovim.
 
 ### Launch (Neovim starts Dolphin)
 
-Requires `iso` in `.dolphin-dap.lua`. Neovim spawns Dolphin with a dynamic DAP port
-and connects automatically:
+Set `program` in `.dolphin-dap.lua` to an ELF, DOL, or disc image. Neovim spawns Dolphin
+with a dynamic DAP port and connects automatically. Existing configurations using `iso`
+remain accepted as an alias for `program`.
+
+To execute a doldecomp build directly with its embedded DWARF:
+
+```lua
+return {
+  dolphin = "/path/to/build/Binaries/dolphin-emu-nogui",
+  program = "/path/to/melee/build/GALE01/main.elf",
+}
+```
 
 | Config | Binary | Platform |
 |--------|--------|----------|
@@ -94,14 +104,9 @@ video backend. Optional `dolphin_gui` overrides the Qt binary path (defaults to
 
 ## Source paths / DWARF
 
-For real file:line stack traces, load DWARF via `--debug-elf` (sidecar) or boot a
-debug ELF. Source paths in DWARF must match your editor paths — open the decomp
+For real file:line stack traces, boot a debug ELF directly or load one as a
+`--debug-elf` sidecar for a disc/DOL. Source paths in DWARF must match your editor paths — open the decomp
 tree so `loadedSources` paths resolve (e.g. `src/melee/gm/foo.c`).
-
-**Note:** line breakpoints in source files still use the disassembly fallback in
-Dolphin's `setBreakpoints` handler; instruction breakpoints and DWARF stack/source
-views work today. Prefer `<leader>dt` on a line for breakpoints until source
-breakpoints are wired through the line table.
 
 ## Unix socket (Linux)
 

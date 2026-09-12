@@ -5,8 +5,10 @@
 
 #include <array>
 #include <cstddef>
+#include <utility>
 
 #include "Common/CommonTypes.h"
+#include "Core/Debugger/DWARF/DwarfReader.h"
 
 namespace DwarfTestFixture
 {
@@ -22,9 +24,9 @@ inline constexpr std::array<u8, 73> kDebugSection = {
 };
 
 inline constexpr std::array<u8, 38> kLineSection = {
-    0x00, 0x00, 0x00, 0x26, 0x00, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xff, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c,
+    0x00, 0x00, 0x00, 0x26, 0x00, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff,
+    0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xff, 0x00, 0x00,
+    0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c,
 };
 
 inline constexpr u32 kFunctionAddress = 0x00003100;
@@ -61,4 +63,56 @@ inline constexpr char kSecondCompileUnitName[] = "two.c";
 inline constexpr char kFirstFunctionName[] = "foo";
 inline constexpr char kSecondFunctionName[] = "bar";
 inline constexpr u32 kSecondFunctionAddress = 0x00003200;
+
+inline constexpr u32 kTypedStructOffset = 0x100;
+inline constexpr u32 kTypedArrayOffset = 0x200;
+inline constexpr u32 kTypedDataAddress = 0x00004000;
+
+inline Core::Debug::Dwarf::ParseResult MakeTypedParseResult()
+{
+  using namespace Core::Debug::Dwarf;
+
+  Type point;
+  point.die_offset = kTypedStructOffset;
+  point.kind = TypeKind::Structure;
+  point.name = "Point";
+  point.byte_size = 8;
+  point.members.push_back(
+      {"x", TypeRef{FundamentalTypeRef{7}, {}}, {LocationKind::MemberOffset, 0, 0}});
+  point.members.push_back({"next",
+                           TypeRef{UserTypeRef{kTypedStructOffset}, {TypeModifier::Pointer}},
+                           {LocationKind::MemberOffset, 4, 0}});
+
+  Type numbers;
+  numbers.die_offset = kTypedArrayOffset;
+  numbers.kind = TypeKind::Array;
+  numbers.byte_size = 12;
+  numbers.referenced_type = TypeRef{FundamentalTypeRef{7}, {}};
+  numbers.array_count = 3;
+
+  ParseResult result;
+  result.types.push_back(std::move(point));
+  result.types.push_back(std::move(numbers));
+  result.variables.push_back({"argument",
+                              TypeRef{FundamentalTypeRef{7}, {}},
+                              {LocationKind::Register, 3, 0},
+                              VariableKind::Parameter,
+                              kFunctionAddress,
+                              kFunctionAddress + 0x20});
+  result.variables.push_back({"local_point",
+                              TypeRef{UserTypeRef{kTypedStructOffset}, {}},
+                              {LocationKind::BaseRegisterOffset, 1, -8},
+                              VariableKind::Local,
+                              kFunctionAddress,
+                              kFunctionAddress + 0x20});
+  result.variables.push_back({"global_point",
+                              TypeRef{UserTypeRef{kTypedStructOffset}, {}},
+                              {LocationKind::Address, kTypedDataAddress, 0},
+                              VariableKind::Global});
+  result.variables.push_back({"numbers",
+                              TypeRef{UserTypeRef{kTypedArrayOffset}, {}},
+                              {LocationKind::Address, kTypedDataAddress + 0x10, 0},
+                              VariableKind::Global});
+  return result;
+}
 }  // namespace DwarfTestFixture
