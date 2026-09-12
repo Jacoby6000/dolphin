@@ -330,7 +330,7 @@ bool ElfReader::LoadSymbols(const Core::CPUThreadGuard& guard, PPCSymbolDB& ppc_
   if (!m_is_valid || bRelocate)
     return false;
 
-  bool hasSymbols = false;
+  size_t loaded_symbols = 0;
   SectionID sec = GetSectionByName(".symtab");
   if (sec != -1)
   {
@@ -375,11 +375,12 @@ bool ElfReader::LoadSymbols(const Core::CPUThreadGuard& guard, PPCSymbolDB& ppc_
           continue;
         }
         ppc_symbol_db.AddKnownSymbol(guard, value, size, name, filename, symtype);
-        hasSymbols = true;
+        ++loaded_symbols;
       }
     }
   }
   ppc_symbol_db.Index();
+  NOTICE_LOG_FMT(SYMBOLS, "{} symbols loaded from ELF file '{}'.", loaded_symbols, filename);
 
   bool dwarf_loaded = false;
   const SectionID debug_section = GetSectionByName(".debug");
@@ -398,7 +399,7 @@ bool ElfReader::LoadSymbols(const Core::CPUThreadGuard& guard, PPCSymbolDB& ppc_
     }
   }
 
-  return hasSymbols || dwarf_loaded;
+  return loaded_symbols != 0 || dwarf_loaded;
 }
 
 bool ElfReader::IsWii() const

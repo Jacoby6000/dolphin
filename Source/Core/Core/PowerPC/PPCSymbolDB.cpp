@@ -875,7 +875,8 @@ bool PPCSymbolDB::LoadMap(const Core::CPUThreadGuard& guard, std::string filenam
   std::swap(m_checksum_to_function, checksum_to_function);
   std::swap(m_map_name, filename);
 
-  NOTICE_LOG_FMT(SYMBOLS, "{} symbols loaded, {} symbols ignored.", good_count, bad_count);
+  NOTICE_LOG_FMT(SYMBOLS, "{} symbols loaded, {} symbols ignored from map file '{}'.", good_count,
+                 bad_count, m_map_name);
   return true;
 }
 
