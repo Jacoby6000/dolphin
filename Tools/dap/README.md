@@ -15,6 +15,7 @@ For the per-operation request/response reference, see
 - [Running the server](#running-the-server)
 - [Configuring a DAP client](#configuring-a-dap-client)
 - [Handshake test (no game required for transport check)](#handshake-test-no-game-required-for-transport-check)
+- [Visual Studio Code](#visual-studio-code)
 - [Neovim](#neovim)
 - [Tests](#tests)
 - [Known limitations](#known-limitations)
@@ -216,6 +217,11 @@ PY
 ```
 
 Expect a JSON `response` with `"command":"initialize"` and `"success":true`.
+
+## Visual Studio Code
+
+See [`vscode/README.md`](vscode/README.md) for installation and `launch.json`
+configuration.
 
 ## Neovim
 
