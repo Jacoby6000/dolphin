@@ -220,9 +220,19 @@ Expect a JSON `response` with `"command":"initialize"` and `"success":true`.
 
 ## Visual Studio Code
 
-Install [`CodeLLDB`](https://open-vsx.org/extension/vadimcn/vscode-lldb)
-(`vadimcn.vscode-lldb`). Start the NoGUI executable in a terminal with the debug ELF and
-matching ISO:
+Package and install the bundled connector:
+
+```bash
+cd /path/to/dolphin/Tools/dap/vscode
+npx @vscode/vsce package
+code --install-extension dolphin-dap-client-0.1.0.vsix
+```
+
+Code - OSS users should replace `code` with `code-oss`. The connector only registers the
+`dolphin` debugger type and connects the editor directly to Dolphin; it does not run LLDB
+or GDB.
+
+Start the NoGUI executable in a terminal with the debug ELF and matching ISO:
 
 ```bash
 /path/to/dolphin-emu-nogui \
@@ -241,18 +251,17 @@ Open the source project in VS Code and create `.vscode/launch.json`:
   "configurations": [
     {
       "name": "Attach to Dolphin",
-      "type": "lldb",
+      "type": "dolphin",
       "request": "attach",
-      "program": "/path/to/main.elf",
-      "debugServer": 5678
+      "host": "127.0.0.1",
+      "port": 5678,
+      "stopOnEntry": true
     }
   ]
 }
 ```
 
-CodeLLDB registers the `lldb` type and enables source breakpoints. Because `debugServer`
-is set, VS Code connects to Dolphin instead of starting CodeLLDB's own debug adapter. Open
-**Run and Debug**, select **Attach to Dolphin**, and start debugging.
+Open **Run and Debug**, select **Attach to Dolphin**, and start debugging.
 
 The ISO supplies the disc environment, while Dolphin executes the ELF so its symbols and
 DWARF addresses match the running code. Build the source files you need to inspect without
