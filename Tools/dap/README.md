@@ -15,8 +15,7 @@ For the per-operation request/response reference, see
 - [Running the server](#running-the-server)
 - [Configuring a DAP client](#configuring-a-dap-client)
 - [Handshake test (no game required for transport check)](#handshake-test-no-game-required-for-transport-check)
-- [Visual Studio Code](#visual-studio-code)
-- [Neovim](#neovim)
+- [Client integrations](#client-integrations)
 - [Tests](#tests)
 - [Known limitations](#known-limitations)
 - [Source debugging with DWARF](#source-debugging-with-dwarf)
@@ -218,68 +217,12 @@ PY
 
 Expect a JSON `response` with `"command":"initialize"` and `"success":true`.
 
-## Visual Studio Code
+## Client integrations
 
-Package and install the bundled connector:
+Client installation and editor-specific configuration are maintained with each integration:
 
-```bash
-cd /path/to/dolphin/Tools/dap/vscode
-npx @vscode/vsce package
-code --install-extension dolphin-dap-client-0.1.1.vsix
-```
-
-Code - OSS users should replace `code` with `code-oss`. The connector only registers the
-`dolphin` debugger type and connects the editor directly to Dolphin; it does not run LLDB
-or GDB.
-
-Start the NoGUI executable in a terminal with the debug ELF and matching ISO:
-
-```bash
-/path/to/dolphin-emu-nogui \
-  -C Dolphin.General.DAPPort=5678 \
-  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
-  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
-  --exec /path/to/main.elf \
-  --platform headless
-```
-
-Open the source project in VS Code and create `.vscode/launch.json`:
-
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "Attach to Dolphin",
-      "type": "dolphin",
-      "request": "attach",
-      "host": "127.0.0.1",
-      "port": 5678,
-      "sourcePaths": [
-        "${workspaceFolder}/src",
-        "${workspaceFolder}/extern/dolphin/src"
-      ],
-      "stopOnEntry": true
-    }
-  ]
-}
-```
-
-Open **Run and Debug**, select **Attach to Dolphin**, and start debugging.
-
-`sourcePaths` lists ordered directories the connector uses to resolve relative and basename-only
-paths recorded by the ELF's DWARF data. Omit it when DWARF paths already identify readable files.
-Ambiguous basename matches within one root remain unresolved rather than selecting an arbitrary
-source file.
-
-The ISO supplies the disc environment, while Dolphin executes the ELF so its symbols and
-DWARF addresses match the running code. Build the source files you need to inspect without
-optimization for reliable stepping and locals.
-
-## Neovim
-
-See [`nvim/README.md`](nvim/README.md) for a portable `nvim-dap` setup and optional
-project configuration.
+- [Neovim integration](https://github.com/LiveMindIO/dolphin-dap-nvim)
+- [Visual Studio Code integration](https://github.com/LiveMindIO/dolphin-dap-vscode)
 
 ## Tests
 
@@ -348,8 +291,7 @@ dolphin-emu-nogui \
   --platform headless
 ```
 
-The Neovim adapter passes its configured `source_paths` through this setting when it starts
-Dolphin. For an already running Dolphin instance, set `SourcePaths` in the `[Debug]` section of
+For an already running Dolphin instance, set `SourcePaths` in the `[Debug]` section of
 `Dolphin.ini` before booting the title. Source roots are shared by all debugger clients connected
 to that Dolphin process.
 
