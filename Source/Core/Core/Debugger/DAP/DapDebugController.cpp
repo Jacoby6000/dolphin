@@ -284,8 +284,8 @@ void DapDebugController::StepSource(const bool step_over, const std::atomic<bool
   {
     const std::optional<PPCSymbolDB::SourceLine> current_line =
         m_system.GetPPCSymbolDB().GetSourceLine(state.pc);
-    if (current_line &&
-        (current_line->file != start_line->file || current_line->line != start_line->line))
+    if (current_line && (current_line->file_index != start_line->file_index ||
+                         current_line->line != start_line->line))
       break;
     step_logical();
   }
@@ -393,14 +393,17 @@ DapDebugController::ResolveSourceLineBreakpoint(const SourceBreakpointContext& c
 
   if (symbol_db.HasSourceLineInfo())
   {
+    if (context.source_id)
+      return symbol_db.GetLineAddress(*context.source_id - 1, line);
+
     if (context.source_reference)
     {
       const auto& files = symbol_db.GetSourceFiles();
       if (*context.source_reference <= files.size())
       {
         is_file_reference = true;
-        if (const std::optional<u32> address = symbol_db.GetLineAddress(
-                files[static_cast<size_t>(*context.source_reference - 1)], line))
+        if (const std::optional<u32> address =
+                symbol_db.GetLineAddress(static_cast<u32>(*context.source_reference - 1), line))
           return address;
       }
     }
@@ -1109,6 +1112,7 @@ StackTraceResult DapDebugController::GetStackTrace(const int start_frame, const 
     if (source_line)
     {
       frame.source_file = source_line->file;
+      frame.source_id = source_line->file_index + 1;
       frame.source_line = static_cast<int>(
           std::clamp<u32>(source_line->line, 1, static_cast<u32>(std::numeric_limits<int>::max())));
     }
@@ -1189,6 +1193,7 @@ std::vector<LoadedSource> DapDebugController::GetLoadedSources()
     {
       LoadedSource source;
       source.source_reference = File::Exists(files[i]) ? i + 1 : 0;
+      source.source_id = i + 1;
       source.path = files[i];
       source.name = files[i];
       const size_t slash = source.name.find_last_of("/\\");
@@ -1249,10 +1254,11 @@ std::optional<SourceContent> DapDebugController::GetSource(const SourceReference
   const u64 span = static_cast<u64>(last_line) - static_cast<u64>(first_line) + 1ull;
   const int line_count = static_cast<int>(std::min(span, static_cast<u64>(kMaxResponseLines)));
 
+  const std::vector<std::string> source_files = symbol_db.GetSourceFiles();
   if (symbol_db.HasSourceLineInfo() && source_reference > 0 &&
-      source_reference <= symbol_db.GetSourceFiles().size())
+      source_reference <= source_files.size())
   {
-    const std::string& path = symbol_db.GetSourceFiles()[static_cast<size_t>(source_reference - 1)];
+    const std::string& path = source_files[static_cast<size_t>(source_reference - 1)];
     File::IOFile file(path, "r");
     if (!file)
       return std::nullopt;
@@ -1356,11 +1362,10 @@ DapDebugController::GetBreakpointLocations(const SourceReference source_referenc
   if (symbol_db.HasSourceLineInfo() && source_reference > 0 &&
       source_reference <= symbol_db.GetSourceFiles().size())
   {
-    const std::string& file = symbol_db.GetSourceFiles()[static_cast<size_t>(source_reference - 1)];
     for (u64 i = 0; i < line_count; ++i)
     {
       const int line = static_cast<int>(static_cast<u64>(first_line) + i);
-      if (symbol_db.GetLineAddress(file, static_cast<u32>(line)))
+      if (symbol_db.GetLineAddress(static_cast<u32>(source_reference - 1), static_cast<u32>(line)))
         locations.push_back({line});
     }
     return locations;

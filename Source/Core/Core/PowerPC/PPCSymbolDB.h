@@ -26,6 +26,7 @@ public:
   struct SourceLine
   {
     u32 address = 0;
+    u32 file_index = 0;
     std::string file;
     u32 line = 0;
   };
@@ -66,14 +67,16 @@ public:
   // DESNOTE(jbarber, 2026-07-03): Source line info is PPC-scoped (not on Common::Symbol) so
   // the generic SymbolDB base and DSP symbol maps stay unchanged.
   u32 AddSourceFile(std::string file);
+  u32 AddSourceFileInstance(std::string file);
   void AddLineEntry(u32 address, u32 file_index, u32 line);
   void ClearSourceLineInfo();
   bool HasSourceLineInfo() const;
   std::optional<SourceLine> GetSourceLine(u32 addr) const;
+  std::optional<u32> GetLineAddress(u32 file_index, u32 line) const;
   std::optional<u32> GetLineAddress(std::string_view file, u32 line) const;
   std::optional<u32> FindSourceFileIndex(std::string_view file_query) const;
   std::optional<u32> GetLineAddressForQuery(std::string_view file_query, u32 line) const;
-  const std::vector<std::string>& GetSourceFiles() const;
+  std::vector<std::string> GetSourceFiles() const;
   bool HasDenseLineInfoInRange(u32 start, u32 size) const;
   void SetDwarfDebugInfo(Core::Debug::Dwarf::ParseResult info);
   std::shared_ptr<const Core::Debug::Dwarf::ParseResult> GetDwarfDebugInfo() const;
@@ -85,6 +88,8 @@ public:
   static bool FindMapFile(std::string* existing_map_file, std::string* writable_map_file);
 
 private:
+  std::optional<u32> FindSourceFileIndexLocked(std::string_view file_query) const;
+  std::optional<u32> GetLineAddressLocked(u32 file_index, u32 line) const;
   static void AddKnownSymbol(const Core::CPUThreadGuard& guard, u32 startAddr, u32 size,
                              const std::string& name, const std::string& object_name,
                              Common::Symbol::Type type, XFuncMap* functions,

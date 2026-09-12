@@ -1703,6 +1703,8 @@ TEST_F(DapSessionTest, LoadedSourcesReturnsDwarfFileAfterImport)
   const auto& source = sources[0].get<picojson::object>();
   EXPECT_EQ(source.at("path").to_str(), DwarfTestFixture::kCompileUnitName);
   EXPECT_EQ(source.count("sourceReference"), 0u);
+  EXPECT_EQ(source.at("adapterData").get<picojson::object>().at("dolphinSourceId").get<double>(),
+            1.0);
 
   client.Send(R"({
     "seq": 9,
@@ -1751,7 +1753,7 @@ TEST_F(DapSessionTest, BreakpointLocationsWithDwarfSourceReference)
   (void)client.Receive();
 }
 
-TEST_F(DapSessionTest, SetBreakpointsWithDwarfSourceReference)
+TEST_F(DapSessionTest, SetBreakpointsWithDwarfAdapterData)
 {
   {
     Core::CPUThreadGuard guard(Core::System::GetInstance());
@@ -1768,7 +1770,7 @@ TEST_F(DapSessionTest, SetBreakpointsWithDwarfSourceReference)
     "type": "request",
     "command": "setBreakpoints",
     "arguments": {
-      "source": {"sourceReference": 1},
+      "source": {"path": "/workspace/test.c", "adapterData": {"dolphinSourceId": 1}},
       "breakpoints": [{"line": 2}]
     }
   })");
@@ -1820,6 +1822,13 @@ TEST_F(DapSessionTest, StackTraceWithDwarfSourceLine)
   EXPECT_EQ(frame.at("line").get<double>(), 2.0);
   EXPECT_EQ(frame.at("source").get<picojson::object>().at("path").to_str(),
             DwarfTestFixture::kCompileUnitName);
+  EXPECT_EQ(frame.at("source")
+                .get<picojson::object>()
+                .at("adapterData")
+                .get<picojson::object>()
+                .at("dolphinSourceId")
+                .get<double>(),
+            1.0);
 
   client.Send(R"({
     "seq": 9,

@@ -82,6 +82,7 @@ struct StackFrame
   // is the 1-based source line. Otherwise source_base + source_line map to a
   // disassembly pseudo-source (instruction index from base).
   std::optional<std::string> source_file;
+  std::optional<u32> source_id;
   std::optional<u32> source_base;
   int source_line = 0;
 };
@@ -95,6 +96,7 @@ struct StackTraceResult
 struct LoadedSource
 {
   SourceReference source_reference = 0;
+  std::optional<u32> source_id;
   std::string name;
   std::string path;
 };
@@ -119,6 +121,7 @@ struct CodeBreakpointRequest
 struct SourceBreakpointContext
 {
   std::optional<SourceReference> source_reference;
+  std::optional<u32> source_id;
   std::optional<std::string> source_path;
   std::optional<std::string> source_name;
 };

@@ -179,6 +179,46 @@ TEST_F(PPCSymbolDBLineTest, AddSourceFileDeduplicatesPaths)
   EXPECT_EQ(SymbolDB().GetSourceFiles().size(), 1U);
 }
 
+TEST_F(PPCSymbolDBLineTest, GetSourceFilesReturnsStableSnapshot)
+{
+  SymbolDB().AddSourceFile("first.c");
+  const std::vector<std::string> snapshot = SymbolDB().GetSourceFiles();
+  SymbolDB().AddSourceFile("second.c");
+
+  ASSERT_EQ(snapshot.size(), 1U);
+  EXPECT_EQ(snapshot[0], "first.c");
+  EXPECT_EQ(SymbolDB().GetSourceFiles().size(), 2U);
+}
+
+TEST_F(PPCSymbolDBLineTest, DuplicateSourceFileInstancesRemainDistinctAndAmbiguousByName)
+{
+  const u32 first = SymbolDB().AddSourceFileInstance("foo.c");
+  const u32 second = SymbolDB().AddSourceFileInstance("foo.c");
+  SymbolDB().AddLineEntry(0x80001000, first, 7);
+  SymbolDB().AddLineEntry(0x80002000, second, 7);
+
+  EXPECT_NE(first, second);
+  EXPECT_FALSE(SymbolDB().FindSourceFileIndex("foo.c"));
+  EXPECT_FALSE(SymbolDB().GetLineAddressForQuery("/workspace/src/foo.c", 7));
+  EXPECT_EQ(SymbolDB().GetLineAddress(first, 7), 0x80001000U);
+  EXPECT_EQ(SymbolDB().GetLineAddress(second, 7), 0x80002000U);
+  ASSERT_TRUE(SymbolDB().GetSourceLine(0x80002000));
+  EXPECT_EQ(SymbolDB().GetSourceLine(0x80002000)->file_index, second);
+}
+
+TEST_F(PPCSymbolDBLineTest, SourceFileLookupPrefersUniqueQualifiedSuffix)
+{
+  const u32 first = SymbolDB().AddSourceFileInstance("first/other/foo.c");
+  const u32 second = SymbolDB().AddSourceFileInstance("second/src/foo.c");
+  SymbolDB().AddLineEntry(0x80001000, first, 7);
+  SymbolDB().AddLineEntry(0x80002000, second, 7);
+
+  EXPECT_FALSE(SymbolDB().FindSourceFileIndex("foo.c"));
+  EXPECT_EQ(SymbolDB().FindSourceFileIndex("/workspace/src/foo.c"), second);
+  EXPECT_EQ(SymbolDB().FindSourceFileIndex("C:\\workspace\\src\\foo.c"), second);
+  EXPECT_EQ(SymbolDB().GetLineAddressForQuery("/workspace/src/foo.c", 7), 0x80002000U);
+}
+
 TEST_F(PPCSymbolDBLineTest, ImportDwarfReturnsFalseForEmptyDebugSection)
 {
   Core::CPUThreadGuard guard(Core::System::GetInstance());
@@ -194,5 +234,20 @@ TEST_F(PPCSymbolDBLineTest, ImportDwarfAddsFunctionSymbol)
   const Common::Symbol* symbol = SymbolDB().GetSymbolFromAddr(DwarfTestFixture::kFunctionAddress);
   ASSERT_NE(symbol, nullptr);
   EXPECT_EQ(symbol->name, DwarfTestFixture::kFunctionName);
+}
+
+TEST_F(PPCSymbolDBLineTest, ImportDwarfPreservesDuplicateCompileUnitOccurrences)
+{
+  Core::CPUThreadGuard guard(Core::System::GetInstance());
+  const std::vector<u8> debug = DwarfTestFixture::MakeDuplicateCuNameDebugSection();
+  ASSERT_TRUE(
+      Core::Debug::ImportDwarf(guard, SymbolDB(), debug, DwarfTestFixture::kMultiCuLineSection));
+
+  const auto& files = SymbolDB().GetSourceFiles();
+  ASSERT_EQ(files.size(), 2U);
+  EXPECT_EQ(files[0], DwarfTestFixture::kFirstCompileUnitName);
+  EXPECT_EQ(files[1], DwarfTestFixture::kFirstCompileUnitName);
+  ASSERT_TRUE(SymbolDB().GetSourceLine(DwarfTestFixture::kSecondFunctionAddress));
+  EXPECT_EQ(SymbolDB().GetSourceLine(DwarfTestFixture::kSecondFunctionAddress)->file_index, 1U);
 }
 }  // namespace

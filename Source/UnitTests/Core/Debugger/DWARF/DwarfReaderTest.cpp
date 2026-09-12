@@ -1,6 +1,7 @@
 // Copyright 2026 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <limits>
 #include <string_view>
 #include <vector>
@@ -253,6 +254,22 @@ std::vector<u8> MakeFunctionWithoutSiblingSection()
   return bytes;
 }
 
+std::vector<u8> MakeEmptyNameLineTableDebugSection()
+{
+  std::vector<u8> bytes;
+  const size_t compile_unit = BeginDie(&bytes, 0x0011);
+  AppendU16(&bytes, 0x0038);
+  AppendString(&bytes, "");
+  AppendU16(&bytes, 0x0111);
+  AppendU32(&bytes, DwarfTestFixture::kFunctionAddress);
+  AppendU16(&bytes, 0x0121);
+  AppendU32(&bytes, DwarfTestFixture::kFunctionAddress + 0x20);
+  AppendU16(&bytes, 0x0106);
+  AppendU32(&bytes, 0);
+  FinishDie(&bytes, compile_unit);
+  return bytes;
+}
+
 TEST(DwarfReaderTest, ParseGoldenFixtureExtractsFunctionsAndLines)
 {
   const std::optional<Core::Debug::Dwarf::ParseResult> result = Core::Debug::Dwarf::Parse(
@@ -313,9 +330,21 @@ TEST(DwarfReaderTest, ParseToleratesUnknownAttributeFormAndContinues)
   EXPECT_EQ(result->functions.size(), 1U);
   EXPECT_EQ(result->functions[0].name, DwarfTestFixture::kFunctionName);
   EXPECT_EQ(result->functions[0].low_pc, DwarfTestFixture::kFunctionAddress);
-  // The CU header's AT_name was unreadable (we bailed out of its attribute
-  // loop early), so no file entry is recorded for it.
-  EXPECT_TRUE(result->files.empty());
+  // The CU header's AT_name was unreadable, but its empty occurrence remains
+  // reserved so later compilation-unit file indices stay stable.
+  ASSERT_EQ(result->files.size(), 1U);
+  EXPECT_TRUE(result->files[0].empty());
+}
+
+TEST(DwarfReaderTest, ParseReservesIdentityForEmptyNameLineTable)
+{
+  const std::vector<u8> debug = MakeEmptyNameLineTableDebugSection();
+  const auto result = Core::Debug::Dwarf::Parse(debug, DwarfTestFixture::kLineSection, true);
+  ASSERT_TRUE(result);
+  ASSERT_EQ(result->files.size(), 1U);
+  EXPECT_TRUE(result->files[0].empty());
+  ASSERT_FALSE(result->lines.empty());
+  EXPECT_EQ(result->lines[0].file_index, 0U);
 }
 
 TEST(DwarfReaderTest, ParseIgnoresLineTableWhenStmtListOutOfBounds)
@@ -349,6 +378,20 @@ TEST(DwarfReaderTest, ParseMultiCompileUnitSiblingChain)
   EXPECT_EQ(result->functions[1].name, DwarfTestFixture::kSecondFunctionName);
   EXPECT_EQ(result->functions[1].low_pc, DwarfTestFixture::kSecondFunctionAddress);
   ASSERT_GE(result->lines.size(), 4U);
+  EXPECT_EQ(std::ranges::count(result->lines, 0U, &Core::Debug::Dwarf::LineEntry::file_index), 2);
+  EXPECT_EQ(std::ranges::count(result->lines, 1U, &Core::Debug::Dwarf::LineEntry::file_index), 2);
+}
+
+TEST(DwarfReaderTest, ParsePreservesDuplicateCompileUnitOccurrences)
+{
+  const std::vector<u8> debug = DwarfTestFixture::MakeDuplicateCuNameDebugSection();
+  const auto result = Core::Debug::Dwarf::Parse(debug, DwarfTestFixture::kMultiCuLineSection, true);
+  ASSERT_TRUE(result);
+  ASSERT_EQ(result->files.size(), 2U);
+  EXPECT_EQ(result->files[0], DwarfTestFixture::kFirstCompileUnitName);
+  EXPECT_EQ(result->files[1], DwarfTestFixture::kFirstCompileUnitName);
+  EXPECT_EQ(std::ranges::count(result->lines, 0U, &Core::Debug::Dwarf::LineEntry::file_index), 2);
+  EXPECT_EQ(std::ranges::count(result->lines, 1U, &Core::Debug::Dwarf::LineEntry::file_index), 2);
 }
 
 TEST(DwarfReaderTest, ParseTypedVariablesAcrossPaddingDiesAndLeafSiblings)

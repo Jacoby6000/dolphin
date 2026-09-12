@@ -902,6 +902,17 @@ TEST(DapProtocol, ParseSourceRequestFromSourceObject)
   EXPECT_EQ(parsed.end_line, -1);
 }
 
+TEST(DapProtocol, ParseSourceRequestFromDolphinSourceIdentity)
+{
+  const auto message = ParseObjectOrDie(R"({
+    "source": {"adapterData": {"dolphinSourceId": 2}},
+    "startLine": 1
+  })");
+  const auto parsed = Protocol::ParseSourceRequest(message);
+  ASSERT_TRUE(parsed.source_reference.has_value());
+  EXPECT_EQ(*parsed.source_reference, 2U);
+}
+
 TEST(DapProtocol, ParseBreakpointLocationsResolvesLineRange)
 {
   const auto message = ParseObjectOrDie(R"({

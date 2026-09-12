@@ -269,6 +269,7 @@ Open **Run and Debug**, select **Attach to Dolphin**, and start debugging.
 
 `sourcePaths` lists ordered directories used to resolve relative and basename-only paths
 recorded by the ELF's DWARF data. Omit it when DWARF paths already identify readable files.
+Ambiguous basename matches remain unresolved rather than selecting an arbitrary source file.
 
 The ISO supplies the disc environment, while Dolphin executes the ELF so its symbols and
 DWARF addresses match the running code. Build the source files you need to inspect without

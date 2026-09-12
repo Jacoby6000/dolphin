@@ -163,6 +163,13 @@ std::optional<SourceReference> ResolveSourceReference(const picojson::object& ar
     return std::nullopt;
   if (const std::optional<SourceReference> reference = read_reference(*source))
     return reference;
+  if (const picojson::object* adapter_data = GetObject(*source, "adapterData"))
+  {
+    const std::optional<u32> source_id =
+        ReadStrictUnsignedInteger<u32>(*adapter_data, "dolphinSourceId");
+    if (source_id && *source_id > 0)
+      return *source_id;
+  }
   if (const std::optional<u32> base = ResolveSourceObjectBase(*source))
     return MakeDisassemblySourceReference(*base);
   return std::nullopt;

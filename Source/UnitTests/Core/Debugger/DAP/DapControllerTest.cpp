@@ -607,6 +607,28 @@ TEST_F(DapControllerTest, ResolveSourceLineBreakpointDoesNotTreatDwarfFileHandle
   EXPECT_FALSE(controller.ResolveSourceLineBreakpoint(context, 3));
 }
 
+TEST_F(DapControllerTest, ResolveSourceLineBreakpointRejectsAmbiguousBasename)
+{
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  const u32 first = symbol_db.AddSourceFileInstance("foo.c");
+  const u32 second = symbol_db.AddSourceFileInstance("foo.c");
+  symbol_db.AddLineEntry(TEST_ADDRESS, first, 7);
+  symbol_db.AddLineEntry(TEST_ADDRESS + 0x100, second, 7);
+  DAP::DapDebugController controller(System());
+
+  const DAP::SourceBreakpointContext ambiguous{.source_path = "/workspace/src/foo.c"};
+  EXPECT_FALSE(controller.ResolveSourceLineBreakpoint(ambiguous, 7));
+
+  const DAP::SourceBreakpointContext exact{.source_id = second + 1};
+  EXPECT_EQ(controller.ResolveSourceLineBreakpoint(exact, 7), TEST_ADDRESS + 0x100);
+
+  const DAP::SourceBreakpointContext handle{.source_reference = second + 1};
+  EXPECT_EQ(controller.ResolveSourceLineBreakpoint(handle, 7), TEST_ADDRESS + 0x100);
+  const auto locations = controller.GetBreakpointLocations(second + 1, 7, 7);
+  ASSERT_EQ(locations.size(), 1U);
+  EXPECT_EQ(locations[0].line, 7);
+}
+
 TEST_F(DapControllerTest, ResolveSourceLineBreakpointFallbackRejectsOverflowingLine)
 {
   // DESNOTE(jbarber, 2026-07-22): When DWARF line lookup fails, the fallback
@@ -925,6 +947,23 @@ TEST_F(DapControllerTest, SourceStepIntoAdvancesUntilLineChanges)
   DAP::DapDebugController controller(System());
   controller.StepSource(false, cancelled);
   EXPECT_EQ(System().GetPPCState().pc, TEST_ADDRESS + 8);
+}
+
+TEST_F(DapControllerTest, SourceStepIntoStopsWhenDuplicateFilenameIdentityChanges)
+{
+  const std::array<u8, 8> code{{0x60, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00}};
+  System().GetMemory().CopyToEmu(TEST_ADDRESS, code.data(), code.size());
+  auto& symbols = System().GetPPCSymbolDB();
+  const u32 first = symbols.AddSourceFileInstance("step.c");
+  const u32 second = symbols.AddSourceFileInstance("step.c");
+  symbols.AddLineEntry(TEST_ADDRESS, first, 1);
+  symbols.AddLineEntry(TEST_ADDRESS + 4, second, 1);
+  System().GetPPCState().pc = TEST_ADDRESS;
+
+  std::atomic<bool> cancelled{false};
+  DAP::DapDebugController controller(System());
+  controller.StepSource(false, cancelled);
+  EXPECT_EQ(System().GetPPCState().pc, TEST_ADDRESS + 4);
 }
 
 TEST_F(DapControllerTest, SourceNextStepsOverCallAndStopsAtNextLine)

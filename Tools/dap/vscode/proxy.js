@@ -23,13 +23,13 @@ function findByBasename(root, basename, matches) {
   for (const entry of entries) {
     const candidate = path.join(root, entry.name);
     if (entry.isFile() && entry.name === basename) {
-      matches.push(candidate);
-      if (matches.length > 1) {
+      matches.add(candidate);
+      if (matches.size > 1) {
         return;
       }
     } else if (entry.isDirectory()) {
       findByBasename(candidate, basename, matches);
-      if (matches.length > 1) {
+      if (matches.size > 1) {
         return;
       }
     }
@@ -53,23 +53,35 @@ function resolveSourcePath(sourcePath, sourcePaths) {
 
   const relative = sourcePath.replace(/^[/\\]+/, "");
   const parts = relative.split(/[\\/]+/).filter(Boolean);
+  const qualifiedMatches = new Map();
   for (const root of sourcePaths) {
     for (let index = 0; index < parts.length; index += 1) {
       const candidate = path.resolve(root, ...parts.slice(index));
       const relativeToRoot = path.relative(root, candidate);
       if (!relativeToRoot.startsWith("..") && !path.isAbsolute(relativeToRoot) && isFile(candidate)) {
-        return cache(candidate);
+        qualifiedMatches.set(
+          candidate,
+          Math.max(qualifiedMatches.get(candidate) || 0, parts.length - index)
+        );
       }
     }
+  }
 
-    const matches = [];
+  if (parts.length > 1 && qualifiedMatches.size > 0) {
+    const bestQuality = Math.max(...qualifiedMatches.values());
+    const bestMatches = [...qualifiedMatches].filter(([, quality]) => quality === bestQuality);
+    return cache(bestMatches.length === 1 ? bestMatches[0][0] : sourcePath);
+  }
+
+  const matches = new Set();
+  for (const root of sourcePaths) {
     findByBasename(root, path.basename(relative), matches);
-    if (matches.length === 1) {
-      return cache(matches[0]);
-    }
-    if (matches.length > 1) {
+    if (matches.size > 1) {
       return cache(sourcePath);
     }
+  }
+  if (matches.size === 1) {
+    return cache(matches.values().next().value);
   }
   return cache(sourcePath);
 }

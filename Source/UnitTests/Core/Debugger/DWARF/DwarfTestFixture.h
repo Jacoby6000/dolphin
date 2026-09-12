@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include "Common/CommonTypes.h"
 #include "Core/Debugger/DWARF/DwarfReader.h"
@@ -63,6 +66,23 @@ inline constexpr char kSecondCompileUnitName[] = "two.c";
 inline constexpr char kFirstFunctionName[] = "foo";
 inline constexpr char kSecondFunctionName[] = "bar";
 inline constexpr u32 kSecondFunctionAddress = 0x00003200;
+
+inline std::vector<u8> MakeDuplicateCuNameDebugSection()
+{
+  std::vector<u8> section(kMultiCuDebugSection.begin(), kMultiCuDebugSection.end());
+  constexpr std::string_view old_name = kSecondCompileUnitName;
+  constexpr std::string_view new_name = kFirstCompileUnitName;
+  static_assert(old_name.size() == new_name.size());
+  const auto name =
+      std::search(section.begin(), section.end(), old_name.begin(), old_name.end(),
+                  [](u8 byte, char character) { return byte == static_cast<u8>(character); });
+  if (name != section.end())
+  {
+    for (size_t i = 0; i < new_name.size(); ++i)
+      name[static_cast<ptrdiff_t>(i)] = static_cast<u8>(new_name[i]);
+  }
+  return section;
+}
 
 inline constexpr u32 kTypedStructOffset = 0x100;
 inline constexpr u32 kTypedArrayOffset = 0x200;

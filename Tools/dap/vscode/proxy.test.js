@@ -40,6 +40,20 @@ test("leaves ambiguous basenames unresolved", (t) => {
   assert.strictEqual(resolveSourcePath("mnevent.c", [root]), "mnevent.c");
 });
 
+test("does not use source root order to guess between duplicate basenames", (t) => {
+  const firstRoot = fixture();
+  const secondRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dolphin-dap-source-"));
+  t.after(() => fs.rmSync(firstRoot, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(secondRoot, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(secondRoot, "other"), { recursive: true });
+  fs.writeFileSync(path.join(secondRoot, "other", "mnevent.c"), "");
+
+  assert.strictEqual(
+    resolveSourcePath("mnevent.c", [path.join(firstRoot, "src"), secondRoot]),
+    "mnevent.c"
+  );
+});
+
 test("rewrites stack trace and loaded source responses", (t) => {
   const root = fixture();
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

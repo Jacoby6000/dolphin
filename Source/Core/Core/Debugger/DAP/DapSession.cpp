@@ -108,12 +108,25 @@ SourceBreakpointContext ParseSourceBreakpointContext(const picojson::object& arg
     }
     context.source_name = ReadSourceString(*source, "name");
     context.source_path = ReadSourceString(*source, "path");
+    if (const picojson::object* adapter_data = GetObject(*source, "adapterData"))
+    {
+      if (const std::optional<double> source_id =
+              ReadNumericFromJson<double>(*adapter_data, "dolphinSourceId");
+          source_id && std::isfinite(*source_id) && *source_id > 0 &&
+          std::floor(*source_id) == *source_id &&
+          *source_id <= static_cast<double>(std::numeric_limits<u32>::max()))
+      {
+        context.source_id = static_cast<u32>(*source_id);
+      }
+    }
   }
   return context;
 }
 
 std::string MakeBreakpointSourceKey(const SourceBreakpointContext& context)
 {
+  if (context.source_id)
+    return fmt::format("source:{}", *context.source_id);
   if (context.source_reference && *context.source_reference > 0)
     return fmt::format("ref:{}", *context.source_reference);
 
@@ -1775,6 +1788,12 @@ private:
       picojson::object entry;
       if (source.source_reference > 0)
         entry.emplace("sourceReference", static_cast<double>(source.source_reference));
+      if (source.source_id)
+      {
+        picojson::object adapter_data;
+        adapter_data.emplace("dolphinSourceId", static_cast<double>(*source.source_id));
+        entry.emplace("adapterData", std::move(adapter_data));
+      }
       entry.emplace("name", source.name);
       if (!source.path.empty())
         entry.emplace("path", source.path);
@@ -2030,6 +2049,12 @@ private:
         const std::string name =
             slash != std::string::npos ? frame.source_file->substr(slash + 1) : *frame.source_file;
         source.emplace("name", name);
+        if (frame.source_id)
+        {
+          picojson::object adapter_data;
+          adapter_data.emplace("dolphinSourceId", static_cast<double>(*frame.source_id));
+          source.emplace("adapterData", std::move(adapter_data));
+        }
         entry.emplace("source", std::move(source));
         entry.emplace("line", static_cast<double>(frame.source_line));
       }

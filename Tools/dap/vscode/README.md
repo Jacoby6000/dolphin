@@ -21,3 +21,7 @@ Add ordered source roots when the ELF's DWARF contains relative or basename-only
   "${workspaceFolder}/extern/dolphin/src"
 ]
 ```
+
+Resolution succeeds only when the best matching file is unique across all roots. If an ELF
+contains only a basename shared by multiple files, the connector leaves it unresolved instead
+of opening the wrong file.
