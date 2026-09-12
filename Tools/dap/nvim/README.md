@@ -101,11 +101,11 @@ establish the disc ID, FST, OS state, and DVD/filesystem access, but ignores the
 the ISO as the program to execute. It loads and executes `program` instead, so the ELF's
 memory layout, symbols, and embedded DWARF remain authoritative.
 
-Do not set `program` to the ISO and `elf` to a separately linked decomp ELF. In that
-configuration the ISO's DOL executes and `elf` supplies metadata only; source addresses
-are wrong unless the ELF has exactly the same link layout as that DOL. The `program`
-field still accepts ELF, DOL, and disc images for other workflows, and legacy `iso` is
-accepted as an alias for `program`.
+When `program` is the ISO and `elf` is set, the ISO's DOL executes and the ELF supplies
+metadata only. This supports partial decompilation, but it is safe only when the ELF has
+exactly the same link layout as the running DOL. The `program` field also accepts DOL
+and disc images for other workflows, and legacy `iso` is accepted as an alias for
+`program`.
 Set `enable_cheats = false` when codes saved for another executable layout must not run.
 
 | Config | Binary | Platform |
@@ -120,10 +120,15 @@ video backend. Optional `dolphin_gui` overrides the Qt binary path (defaults to
 
 ## Source paths / DWARF
 
-The recommended decomp workflow boots the ELF as `program` and mounts the ISO as
-`disc`; the ELF supplies both the executed code and its embedded symbols/DWARF.
-`--debug-elf` and the `elf` setting are metadata-only sidecar modes and do not replace
-the executable loaded from `program`.
+For a fully linked decomp build, set `program` to the ELF and `disc` to the ISO. The ELF
+then supplies both the running code and its debug information.
+
+For a partially decompiled project, you can instead set `program` to the ISO and `elf`
+to a sidecar ELF. Dolphin still executes the DOL in the ISO; the sidecar only supplies
+types, structures, globals, and source information for known code. Use this mode only
+when the sidecar ELF preserves the exact code and data addresses of the running DOL.
+If linking the ELF moves anything, breakpoints and variables may point at the wrong
+memory.
 
 Source stepping and locals do not work reliably in optimized source files (translation
 units). Build the files you need to debug without optimization; otherwise stepping may

@@ -17,7 +17,7 @@ For the per-operation request/response reference, see
 - [Neovim (lazy.nvim)](#neovim-lazynvim)
 - [Tests](#tests)
 - [Known limitations](#known-limitations)
-- [Source awareness (DWARF 1.1 + entrypoints)](#source-awareness-dwarf-11-entrypoints)
+- [Source debugging with DWARF](#source-debugging-with-dwarf)
 
 ## Features
 
@@ -212,26 +212,54 @@ cmake --build build --target unittests
   may appear briefly before Dolphin restores the frozen value on the next frame.
   Clearing a freeze leaves its realtime watch active.
 
-## Source awareness (DWARF 1.1 + entrypoints)
+## Source debugging with DWARF
 
-When DWARF 1.1 line info (MWCC/CodeWarrior `.debug`+`.line` sections) is loaded,
-`stackTrace`, `loadedSources`, `source`, and `breakpointLocations` return real
-file:line mappings. For a disc-based decomp workflow, boot the debug ELF as the
-executable and mount the ISO as the default disc, as shown above. Loading happens
-automatically from the executed ELF. Metadata-only loading is also available with
-`Dolphin.Debug.DwarfElf`, `--debug-elf`, or **Symbols → Load DWARF/Debug Info…**
-in the Qt interface.
+Dolphin supports MWCC/CodeWarrior DWARF 1.1 in two different ways.
+
+### Executed ELF
+
+This is the recommended mode for a fully linked decomp build. Start Dolphin with the
+ELF as `--exec` and mount the game ISO with `Dolphin.Core.DefaultISO`, as shown in
+[Mode 2](#mode-2-run-a-debug-elf-with-an-iso).
+
+The ELF supplies both the running code and its debug information, so source lines,
+breakpoints, globals, and variable addresses use the same memory layout. Dolphin loads
+the ELF's debug information automatically.
+
+### Sidecar ELF
+
+Sidecar mode is useful for projects that are only partially decompiled. In this mode,
+Dolphin executes the DOL from the ISO and loads debug information from a separate ELF:
+
+```bash
+dolphin-emu-nogui \
+  -C Dolphin.General.DAPPort=5678 \
+  --exec /path/to/game.iso \
+  --debug-elf /path/to/main.elf \
+  --platform headless
+```
+
+The sidecar ELF does not replace the DOL in the ISO. It can provide known types,
+expandable structures, globals, and source information for decompiled code. This is
+safe only when the sidecar ELF preserves the exact addresses used by the running DOL.
+If linking the ELF moves code or data, breakpoints and variable values can refer to the
+wrong memory.
+
+Sidecar debug information can also be loaded with `Dolphin.Debug.DwarfElf` or
+**Symbols → Load DWARF/Debug Info…** in the Qt interface.
+
+### Debug information limits
 
 The top stack frame exposes `Locals` and `Globals`. You can inspect pointers, fixed-size
 arrays, structures, and unions, and expand nested values. Values are read-only and
 usually displayed in hexadecimal. Very deeply nested or extremely large values are
 limited, and variables from older stack frames are not currently available.
 
-Source stepping and locals are not reliable for optimized source files. The
-compiler may remove variables, reuse their storage, or combine source lines. Compile
-the specific files you want to debug without optimization for accurate stepping and
-locals; unrelated files can remain optimized.
+Source stepping and locals are not reliable for optimized source files. The compiler
+may remove variables, reuse their storage, or combine source lines. Compile the files
+you need to debug without optimization; unrelated files can remain optimized.
 
-Code without DWARF can still expose function names and definition lines through an
-**`entrypoints.json`** file beside the ELF.
-See [`../../.ai-doc-reference/entrypoints-format.md`](../../.ai-doc-reference/entrypoints-format.md).
+An **`entrypoints.json`** file beside the ELF can add function names and definition
+lines for code without DWARF. It does not provide locals, structures, globals, or
+line-by-line stepping inside those functions. See
+[`../../.ai-doc-reference/entrypoints-format.md`](../../.ai-doc-reference/entrypoints-format.md).
