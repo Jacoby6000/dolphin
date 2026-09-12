@@ -125,6 +125,10 @@ The recommended decomp workflow boots the ELF as `program` and mounts the ISO as
 `--debug-elf` and the `elf` setting are metadata-only sidecar modes and do not replace
 the executable loaded from `program`.
 
+Source stepping and locals do not work reliably in optimized source files (translation
+units). Build the files you need to debug without optimization; otherwise stepping may
+skip lines and locals may be missing or incorrect. Other files can remain optimized.
+
 Set ordered `source_paths` roots when old MWCC DWARF reports only basenames. The
 integration tries a direct relative path, then a recursive basename lookup within each
 root. It does not guess when a root contains multiple matching files; use a narrower

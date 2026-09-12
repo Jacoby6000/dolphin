@@ -29,7 +29,7 @@ Each operation below links to its detailed reference section in
 | Request | Summary |
 |---------|---------|
 | [`initialize`](capabilities.md#initialize) | Capability handshake — advertises standard + Dolphin-specific extensions. |
-| [`launch`](capabilities.md#launch-attach) | Boot the configured ISO/DOL. Emulation starts paused. |
+| [`launch`](capabilities.md#launch-attach) | Start the configured game. Emulation starts paused. |
 | [`attach`](capabilities.md#launch-attach) | Attach to an already-running core. |
 | [`configurationDone`](capabilities.md#configurationdone) | Concludes the launch handshake. |
 | [`continue`](capabilities.md#continue-pause-step) | Resume execution. `allThreadsContinued: true` reported. |
@@ -94,91 +94,82 @@ cmake -B build -DENABLE_NOGUI=ON -DENABLE_QT=OFF
 cmake --build build --target dolphin-nogui
 ```
 
-The server is **inert** unless a DAP port or socket is configured at runtime
-(mirrors `GDBPort`). DAP and GDB are mutually exclusive. `stdout` stays free
-for normal logging. The DAP client (VS Code / Cursor / Neovim) then attaches
-over the socket.
+Choose one of these modes when starting Dolphin.
 
-**TCP** (`Dolphin.General.DAPPort`):
+### Mode 1: Run the ISO
+
+Use this mode to debug the game contained in the ISO:
 
 ```bash
-dolphin-emu-nogui -C Dolphin.General.DAPPort=5678 \
-  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
-  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
-  --exec /path/to/main.elf --platform headless
+dolphin-emu-nogui \
+  -C Dolphin.General.DAPPort=5678 \
+  --exec /path/to/game.iso \
+  --platform headless
 ```
 
-Or persist in `Dolphin.ini`:
+Dolphin executes the DOL stored in the ISO. Address breakpoints, instruction stepping,
+registers, and memory tools work normally. Source stepping and locals require debug
+information that matches this exact DOL, which retail ISOs usually do not contain.
+
+An ELF supplied with `--debug-elf` is metadata only in this mode. It does not replace
+the ISO's DOL. Use it only when its addresses exactly match the DOL in the ISO.
+
+### Mode 2: Run a debug ELF with an ISO
+
+Use this mode for source-level debugging of a decomp build:
+
+```bash
+dolphin-emu-nogui \
+  -C Dolphin.General.DAPPort=5678 \
+  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/main.elf \
+  --platform headless
+```
+
+Both files have a separate purpose:
+
+- The ISO provides the disc bootstrap, game files, and filesystem environment.
+- The DOL stored in the ISO is not executed.
+- The ELF provides the executable code, symbols, and DWARF debug information.
+
+Because Dolphin executes the ELF, its addresses match its debug information. For a
+disc-based game, always provide both the ISO and ELF as shown above.
+
+Source stepping and locals do not work reliably inside optimized source files
+(translation units).
+Optimization can combine or remove source lines and variables, so stepping may skip
+lines and locals may be missing or incorrect. Build the translation units you need to
+debug without optimization and leave unrelated code optimized.
+
+For code without DWARF, an `entrypoints.json` file beside the ELF can still provide
+function names and definition lines.
+
+### Connection options
+
+The examples use TCP port `5678`. To use a Unix socket on Linux or macOS, replace the
+port setting with:
+
+```bash
+-C Dolphin.General.DAPSocket=/tmp/dolphin-dap.sock
+```
+
+You can also persist either setting in `Dolphin.ini`:
 
 ```ini
 [General]
 DAPPort = 5678
+# DAPSocket = /tmp/dolphin-dap.sock
 ```
 
-**Unix socket** (`Dolphin.General.DAPSocket`, Linux/macOS only) takes priority
-over the port (mirrors `GDBSocket`):
+To let the game run immediately instead of pausing when the debugger connects, add:
 
 ```bash
-dolphin-emu-nogui -C Dolphin.General.DAPSocket=./dap.sock \
-  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
-  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
-  --exec /path/to/main.elf --platform headless
+-C Dolphin.General.DAPStopOnEntry=false
 ```
 
-```ini
-[General]
-DAPSocket = /tmp/dolphin-dap.sock
-```
-
-**Don't pause at entry** — let the game run immediately, only breaking when a
-breakpoint is hit or the client explicitly pauses. Set
-`Dolphin.General.DAPStopOnEntry=false` at dolphin launch; an explicit
-`stopOnEntry` field on a `launch`/`attach` request overrides it per session:
-
-```bash
-dolphin-emu-nogui -C Dolphin.General.DAPSocket=./dap.sock \
-  -C Dolphin.General.DAPStopOnEntry=false \
-  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
-  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
-  --exec /path/to/main.elf --platform headless
-```
-
-**Debug a decomp ELF with its corresponding ISO.** Both inputs are required for a
-disc-based game: the ISO supplies the disc bootstrap, ID, FST, OS state, and filesystem,
-while the ELF supplies the executable code, symbols, and embedded DWARF:
-
-```bash
-dolphin-emu-nogui -C Dolphin.General.DAPPort=5678 \
-  -C Dolphin.Core.DefaultISO=/path/to/GALE01.iso \
-  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
-  --exec /path/to/build/GALE01/main.elf --platform headless
-```
-
-Dolphin ignores the DOL in the ISO as the program to execute and loads the specified
-ELF instead. This keeps runtime addresses synchronized with the ELF's DWARF. Do not use
-`--exec game.iso --debug-elf main.elf` for a separately linked decomp build: that executes
-the ISO's DOL and uses the ELF as metadata only, so its addresses are valid only when both
-executables have exactly the same link layout.
-
-The metadata-only sidecar mode remains available as `--debug-elf /path/to/main.elf` or
-`-C Dolphin.Debug.DwarfElf=/path/to/main.elf` when the running executable does match.
-For NonMatching decomp units, Melee `configure.py --debug` also generates
-`entrypoints.json` beside `main.elf`; pass `--debug-entrypoints` or rely on
-auto-discovery when the sibling file exists.
-
-**Execute a standalone debug ELF without a disc** for software that does not need a
-retail disc environment:
-
-```bash
-dolphin-emu-nogui -C Dolphin.General.DAPPort=5678 \
-  --exec /path/to/build/GALE01/main.elf --platform headless
-```
-
-When executing an ELF, Dolphin loads the program, starts at its entry point, and imports
-its embedded symbols and MWCC DWARF 1.1 debug information before the DAP client runs it.
-
-GDB and DAP are mutually exclusive — do not set `GDBPort`/`GDBSocket` at the
-same time.
+The DAP client can override this setting with `stopOnEntry`. DAP and GDB are mutually
+exclusive, so do not enable both at the same time.
 
 ## Handshake test (no game required for transport check)
 
@@ -235,6 +226,11 @@ The top stack frame exposes `Locals` and `Globals`. You can inspect pointers, fi
 arrays, structures, and unions, and expand nested values. Values are read-only and
 usually displayed in hexadecimal. Very deeply nested or extremely large values are
 limited, and variables from older stack frames are not currently available.
+
+Source stepping and locals are not reliable for optimized source files. The
+compiler may remove variables, reuse their storage, or combine source lines. Compile
+the specific files you want to debug without optimization for accurate stepping and
+locals; unrelated files can remain optimized.
 
 Code without DWARF can still expose function names and definition lines through an
 **`entrypoints.json`** file beside the ELF.
