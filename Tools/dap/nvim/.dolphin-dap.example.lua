@@ -12,13 +12,15 @@ return {
   -- Qt build for GUI attach/launch (defaults to dolphin path with "-nogui" stripped).
   -- dolphin_gui = "~/projects/ai/yolo/dolphin-dap/build/Binaries/dolphin-emu",
 
-  -- ELF, DOL, or disc image to execute. A directly booted ELF supplies its own DWARF.
+  -- The ELF to execute. Its memory layout, symbols, and embedded DWARF are authoritative.
   program = "~/projects/ai/yolo/melee/build/GALE01/main.elf",
 
-  -- Optional game disc mounted for DVD/filesystem reads when directly booting an ELF or DOL.
+  -- The corresponding game ISO. Dolphin uses its bootstrap and filesystem environment,
+  -- but ignores its embedded DOL and executes `program` instead.
   disc = "~/games/melee.iso",
 
-  -- Optional sidecar debug ELF when program is a retail disc image or DOL.
+  -- Advanced metadata-only sidecar mode for an executable with the exact same link layout.
+  -- This does not replace the executable selected by `program`.
   -- elf = "~/projects/ai/yolo/melee/build/GALE01/main.elf",
 
   -- Ordered roots used to resolve basename-only source paths from older DWARF.

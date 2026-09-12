@@ -8,9 +8,9 @@
 --- Per-project settings: add `.dolphin-dap.lua` at the repo root, e.g.
 ---   return {
 ---     dolphin = "~/projects/dolphin-dap/build/Binaries/dolphin-emu-nogui",
----     program = "~/melee/build/GALE01/main.elf", -- ELF, DOL, or disc image to execute
----     disc = "~/games/melee.iso", -- optional disc mounted when booting an ELF/DOL
----     elf = "~/melee/build/GALE01/main.elf", -- optional DWARF sidecar for a disc/DOL
+---     program = "~/melee/build/GALE01/main.elf", -- ELF to execute; supplies symbols/DWARF
+---     disc = "~/games/melee.iso", -- bootstrap/filesystem source; its DOL is not executed
+---     elf = "~/melee/build/GALE01/main.elf", -- advanced metadata-only sidecar mode
 ---     source_paths = { "~/melee/src", "~/melee/extern/dolphin/src" },
 ---     enable_cheats = false,
 ---     port = 5678,
@@ -508,7 +508,7 @@ function M.setup(opts)
       notify(string.format("program: %s", project.program))
     else
       notify(
-        "no `.dolphin-dap.lua` found — add one with at least `program` (and optional `elf`) for launch",
+        "no `.dolphin-dap.lua` found — set `program` to the ELF and `disc` to the ISO for launch",
         vim.log.levels.WARN
       )
     end

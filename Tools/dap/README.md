@@ -104,7 +104,9 @@ over the socket.
 
 ```bash
 dolphin-emu-nogui -C Dolphin.General.DAPPort=5678 \
-  --exec ~/projects/ai/yolo/crowd-control/melee-iso/game.iso --platform headless
+  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/main.elf --platform headless
 ```
 
 Or persist in `Dolphin.ini`:
@@ -119,7 +121,9 @@ over the port (mirrors `GDBSocket`):
 
 ```bash
 dolphin-emu-nogui -C Dolphin.General.DAPSocket=./dap.sock \
-  --exec ~/projects/ai/yolo/crowd-control/melee-iso/game.iso --platform headless
+  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/main.elf --platform headless
 ```
 
 ```ini
@@ -135,24 +139,36 @@ breakpoint is hit or the client explicitly pauses. Set
 ```bash
 dolphin-emu-nogui -C Dolphin.General.DAPSocket=./dap.sock \
   -C Dolphin.General.DAPStopOnEntry=false \
-  --exec ~/projects/ai/yolo/crowd-control/melee-iso/game.iso --platform headless
+  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/main.elf --platform headless
 ```
 
-**With a sidecar debug ELF** for DWARF 1.1 line info (imported after boot; code
-in memory must match the ELF link layout for line mappings to be correct):
+**Debug a decomp ELF with its corresponding ISO.** Both inputs are required for a
+disc-based game: the ISO supplies the disc bootstrap, ID, FST, OS state, and filesystem,
+while the ELF supplies the executable code, symbols, and embedded DWARF:
 
 ```bash
 dolphin-emu-nogui -C Dolphin.General.DAPPort=5678 \
-  --debug-elf /path/to/build/GALE01/main.elf \
-  --exec /path/to/GALE01.iso --platform headless
+  -C Dolphin.Core.DefaultISO=/path/to/GALE01.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/build/GALE01/main.elf --platform headless
 ```
 
-Equivalent config form for the ELF: `-C Dolphin.Debug.DwarfElf=/path/to/main.elf`.
+Dolphin ignores the DOL in the ISO as the program to execute and loads the specified
+ELF instead. This keeps runtime addresses synchronized with the ELF's DWARF. Do not use
+`--exec game.iso --debug-elf main.elf` for a separately linked decomp build: that executes
+the ISO's DOL and uses the ELF as metadata only, so its addresses are valid only when both
+executables have exactly the same link layout.
+
+The metadata-only sidecar mode remains available as `--debug-elf /path/to/main.elf` or
+`-C Dolphin.Debug.DwarfElf=/path/to/main.elf` when the running executable does match.
 For NonMatching decomp units, Melee `configure.py --debug` also generates
 `entrypoints.json` beside `main.elf`; pass `--debug-entrypoints` or rely on
 auto-discovery when the sibling file exists.
 
-**Execute a debug ELF directly** and use its embedded symbols and DWARF:
+**Execute a standalone debug ELF without a disc** for software that does not need a
+retail disc environment:
 
 ```bash
 dolphin-emu-nogui -C Dolphin.General.DAPPort=5678 \
@@ -258,10 +274,12 @@ cmake --build build --target tests
 
 When DWARF 1.1 line info (MWCC/CodeWarrior `.debug`+`.line` sections) is loaded,
 `stackTrace`, `loadedSources`, `source`, and `breakpointLocations` return real
-file:line mappings. Loading happens automatically when booting a debug ELF
-(`ElfReader::LoadSymbols`), programmatically via `Core::Debug::ImportDwarf` /
-`ImportDwarfFromElf`, or as a sidecar via `Dolphin.Debug.DwarfElf` (or
-`--debug-elf`). In the Qt UI: **Symbols → Load DWARF/Debug Info…**.
+file:line mappings. For a disc-based decomp workflow, boot the debug ELF as the
+executable and mount the ISO as the default disc, as shown above. Loading happens
+automatically from the executed ELF (`ElfReader::LoadSymbols`), programmatically via
+`Core::Debug::ImportDwarf` / `ImportDwarfFromElf`, or in metadata-only mode via
+`Dolphin.Debug.DwarfElf` (or `--debug-elf`). In the Qt UI: **Symbols → Load
+DWARF/Debug Info…**.
 
 The top stack frame also exposes `Locals` and `Globals` scopes. Supported MWCC
 DWARF 1.1 values include fundamental types, typedefs, pointers, fixed-size arrays,
