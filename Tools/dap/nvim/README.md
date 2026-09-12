@@ -89,8 +89,17 @@ To execute a doldecomp build directly with its embedded DWARF:
 return {
   dolphin = "/path/to/build/Binaries/dolphin-emu-nogui",
   program = "/path/to/melee/build/GALE01/main.elf",
+  disc = "/path/to/melee.iso",
+  source_paths = { "/path/to/melee/src", "/path/to/melee/extern/dolphin/src" },
+  enable_cheats = false,
 }
 ```
+
+When directly booting an ELF or DOL, optional `disc` mounts `Dolphin.Core.DefaultISO`
+and enables the disc bootstrap environment. Dolphin runs the disc apploader to establish
+the disc ID, FST, and OS state, then overwrites the retail executable image with the
+configured ELF or DOL so its memory layout and DWARF addresses remain authoritative.
+Set `enable_cheats = false` when codes saved for another executable layout must not run.
 
 | Config | Binary | Platform |
 |--------|--------|----------|
@@ -105,8 +114,10 @@ video backend. Optional `dolphin_gui` overrides the Qt binary path (defaults to
 ## Source paths / DWARF
 
 For real file:line stack traces, boot a debug ELF directly or load one as a
-`--debug-elf` sidecar for a disc/DOL. Source paths in DWARF must match your editor paths — open the decomp
-tree so `loadedSources` paths resolve (e.g. `src/melee/gm/foo.c`).
+`--debug-elf` sidecar for a disc/DOL. Set ordered `source_paths` roots when old
+MWCC DWARF reports only basenames. The integration tries a direct relative path,
+then a recursive basename lookup within each root. It does not guess when a root
+contains multiple matching files; use a narrower root in that case.
 
 ## Unix socket (Linux)
 

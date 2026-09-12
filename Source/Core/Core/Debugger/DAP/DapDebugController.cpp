@@ -243,8 +243,7 @@ void DapDebugController::StepSource(const bool step_over, const std::atomic<bool
   Core::CPUThreadGuard guard(m_system);
   const PowerPC::CoreMode old_mode = power_pc.GetMode();
   power_pc.SetMode(PowerPC::CoreMode::Interpreter);
-  const bool resume_watchpoint =
-      (state.Exceptions & EXCEPTION_FAKE_MEMCHECK_HIT) != 0;
+  const bool resume_watchpoint = (state.Exceptions & EXCEPTION_FAKE_MEMCHECK_HIT) != 0;
   power_pc.ClearSteppingMemcheckHit();
   power_pc.SetSteppingMemchecksEnabled(!resume_watchpoint);
   Common::ScopeGuard restore_mode{[&] {
@@ -265,12 +264,11 @@ void DapDebugController::StepSource(const bool step_over, const std::atomic<bool
     hit_breakpoint = power_pc.DidSteppingMemcheckHit() || power_pc.CheckBreakPoints();
   };
   const auto step_logical = [&] {
-    const u32 old_pc = state.pc;
     const UGeckoInstruction inst = PowerPC::MMU::HostRead_Instruction(guard, state.pc);
     if (!step_over || !inst.LK)
     {
       step_one();
-      return !step_over && inst.LK && state.pc != old_pc + 4;
+      return;
     }
 
     const u32 return_pc = state.pc + 4;
@@ -278,20 +276,18 @@ void DapDebugController::StepSource(const bool step_over, const std::atomic<bool
     {
       step_one();
     } while (can_continue() && state.pc != return_pc);
-    return false;
   };
 
-  bool entered_call = false;
   if (can_continue())
-    entered_call = step_logical();
-  while (start_line && can_continue() && !entered_call)
+    step_logical();
+  while (start_line && can_continue())
   {
     const std::optional<PPCSymbolDB::SourceLine> current_line =
         m_system.GetPPCSymbolDB().GetSourceLine(state.pc);
-    if (!current_line || current_line->file != start_line->file ||
-        current_line->line != start_line->line)
+    if (current_line &&
+        (current_line->file != start_line->file || current_line->line != start_line->line))
       break;
-    entered_call = step_logical();
+    step_logical();
   }
 }
 
@@ -311,8 +307,7 @@ void DapDebugController::StepOut(const std::atomic<bool>& cancelled,
 
   const PowerPC::CoreMode old_mode = power_pc.GetMode();
   power_pc.SetMode(PowerPC::CoreMode::Interpreter);
-  const bool resume_watchpoint =
-      (ppc_state.Exceptions & EXCEPTION_FAKE_MEMCHECK_HIT) != 0;
+  const bool resume_watchpoint = (ppc_state.Exceptions & EXCEPTION_FAKE_MEMCHECK_HIT) != 0;
   power_pc.ClearSteppingMemcheckHit();
   power_pc.SetSteppingMemchecksEnabled(!resume_watchpoint);
   Common::ScopeGuard restore_mode{[&] {
@@ -321,8 +316,8 @@ void DapDebugController::StepOut(const std::atomic<bool>& cancelled,
   }};
 
   const auto can_continue = [&] {
-    return !cancelled.load() && clock::now() < timeout &&
-           !power_pc.DidSteppingMemcheckHit() && !power_pc.CheckBreakPoints();
+    return !cancelled.load() && clock::now() < timeout && !power_pc.DidSteppingMemcheckHit() &&
+           !power_pc.CheckBreakPoints();
   };
   const auto step_one = [&] {
     power_pc.SingleStep();
@@ -571,12 +566,14 @@ namespace
 {
 constexpr u32 MAX_DEBUG_VALUE_DEPTH = 32;
 constexpr size_t MAX_DEBUG_CHILDREN = 1000;
+constexpr u32 MAX_DEBUG_STRING_PREVIEW = 256;
 
 const Core::Debug::Dwarf::Type* FindType(const Core::Debug::Dwarf::ParseResult& info,
                                          const u32 offset)
 {
-  const auto it = std::ranges::find(info.types, offset, &Core::Debug::Dwarf::Type::die_offset);
-  return it == info.types.end() ? nullptr : &*it;
+  const auto it = std::ranges::lower_bound(info.types, offset, {},
+                                           &Core::Debug::Dwarf::Type::die_offset);
+  return it == info.types.end() || it->die_offset != offset ? nullptr : &*it;
 }
 
 std::optional<u32> FundamentalSize(const u16 type)
@@ -721,6 +718,84 @@ DebugVariable UnavailableVariable(std::string name, std::string type)
   return {std::move(name), "<unavailable>", std::move(type), std::nullopt};
 }
 
+bool IsPlainCharType(const Core::Debug::Dwarf::ParseResult& info, Core::Debug::Dwarf::TypeRef ref,
+                     const u32 depth = 0)
+{
+  if (depth >= MAX_DEBUG_VALUE_DEPTH)
+    return false;
+  while (!ref.modifiers.empty() &&
+         (ref.modifiers.front() == Core::Debug::Dwarf::TypeModifier::Const ||
+          ref.modifiers.front() == Core::Debug::Dwarf::TypeModifier::Volatile))
+  {
+    ref.modifiers.erase(ref.modifiers.begin());
+  }
+  if (!ref.modifiers.empty())
+    return false;
+  if (const auto* fundamental = std::get_if<Core::Debug::Dwarf::FundamentalTypeRef>(&ref.type))
+    return fundamental->type == 1;
+  const auto* user = std::get_if<Core::Debug::Dwarf::UserTypeRef>(&ref.type);
+  const auto* type = user ? FindType(info, user->die_offset) : nullptr;
+  return type && type->kind == Core::Debug::Dwarf::TypeKind::Typedef &&
+         IsPlainCharType(info, type->referenced_type, depth + 1);
+}
+
+std::optional<std::string> FormatCharArray(const Core::CPUThreadGuard& guard,
+                                           const Core::Debug::Dwarf::ParseResult& info,
+                                           const Core::Debug::Dwarf::Type& type, const u32 address)
+{
+  if (!type.array_count || !IsPlainCharType(info, type.referenced_type))
+    return std::nullopt;
+  const auto* accessors = AddressSpace::GetAccessors(AddressSpace::Type::Effective);
+  if (!accessors)
+    return std::nullopt;
+
+  const u32 count = std::min(*type.array_count, MAX_DEBUG_STRING_PREVIEW);
+  std::string value{"\""};
+  bool terminated = false;
+  for (u32 i = 0; i < count; ++i)
+  {
+    if (address > std::numeric_limits<u32>::max() - i ||
+        !accessors->IsValidAddress(guard, address + i))
+    {
+      return std::nullopt;
+    }
+    const u8 byte = accessors->ReadU8(guard, address + i);
+    if (byte == 0)
+    {
+      terminated = true;
+      break;
+    }
+    switch (byte)
+    {
+    case '\\':
+      value += "\\\\";
+      break;
+    case '"':
+      value += "\\\"";
+      break;
+    case '\n':
+      value += "\\n";
+      break;
+    case '\r':
+      value += "\\r";
+      break;
+    case '\t':
+      value += "\\t";
+      break;
+    default:
+      if (byte >= 0x20 && byte <= 0x7e)
+        value += static_cast<char>(byte);
+      else
+        value += fmt::format("\\x{:02x}", byte);
+      break;
+    }
+  }
+  value += '"';
+  if (!terminated && *type.array_count > count)
+    value += "...";
+  return value;
+}
+
 DebugVariable MaterializeDebugValue(const Core::CPUThreadGuard& guard,
                                     const Core::Debug::Dwarf::ParseResult& info, std::string name,
                                     Core::Debug::Dwarf::TypeRef ref, std::optional<u32> address,
@@ -790,7 +865,10 @@ DebugVariable MaterializeDebugValue(const Core::CPUThreadGuard& guard,
   }
   if (!address || (type->kind == Core::Debug::Dwarf::TypeKind::Array && !type->array_count))
     return UnavailableVariable(std::move(name), display_type);
-  return {std::move(name), fmt::format("@ 0x{:08x}", *address), display_type,
+  const std::optional<std::string> char_array = type->kind == Core::Debug::Dwarf::TypeKind::Array ?
+                                                    FormatCharArray(guard, info, *type, *address) :
+                                                    std::nullopt;
+  return {std::move(name), char_array.value_or(fmt::format("@ 0x{:08x}", *address)), display_type,
           DebugValueContext{std::move(ref), *address, depth + 1}};
 }
 
@@ -836,7 +914,7 @@ std::optional<u32> TypeSize(const Core::Debug::Dwarf::ParseResult& info,
 std::vector<DebugVariable> DapDebugController::GetDebugVariables(const bool globals)
 {
   Core::CPUThreadGuard guard(m_system);
-  const auto& stored = m_system.GetPPCSymbolDB().GetDwarfDebugInfo();
+  const auto stored = m_system.GetPPCSymbolDB().GetDwarfDebugInfo();
   if (!stored)
     return {};
   const auto& state = m_system.GetPPCState();
@@ -874,7 +952,7 @@ std::vector<DebugVariable>
 DapDebugController::GetDebugVariableChildren(const DebugValueContext& context)
 {
   Core::CPUThreadGuard guard(m_system);
-  const auto& stored = m_system.GetPPCSymbolDB().GetDwarfDebugInfo();
+  const auto stored = m_system.GetPPCSymbolDB().GetDwarfDebugInfo();
   if (!stored || context.depth >= MAX_DEBUG_VALUE_DEPTH)
     return {};
   if (!context.type.modifiers.empty() ||
@@ -1129,9 +1207,8 @@ std::optional<SourceContent> DapDebugController::GetSource(const u32 base_addres
 
   const int first_line = std::max(start_line, 0);
   const auto add_lines_clamped = [](const int line, const int count) {
-    return line > std::numeric_limits<int>::max() - count ?
-               std::numeric_limits<int>::max() :
-               line + count;
+    return line > std::numeric_limits<int>::max() - count ? std::numeric_limits<int>::max() :
+                                                            line + count;
   };
   // DESNOTE(jbarber, 2026-07-21): DAP's `endLine` defaults to -1 when the
   // client means "through end of file/source". The previous form
@@ -1140,9 +1217,9 @@ std::optional<SourceContent> DapDebugController::GetSource(const u32 base_addres
   // negative end_line as "no upper bound" so the read loop runs to EOF or
   // the line_count cap (256) below, whichever comes first. The cap keeps
   // responses bounded; clients paging past it just send another request.
-  const int last_line = end_line < 0 ? std::numeric_limits<int>::max() :
-                                        (end_line > first_line ? end_line :
-                                                                 add_lines_clamped(first_line, 63));
+  const int last_line = end_line < 0 ?
+                            std::numeric_limits<int>::max() :
+                            (end_line > first_line ? end_line : add_lines_clamped(first_line, 63));
   // DESNOTE(jbarber, 2026-07-21): For the disassembly case below we bound
   // the result at 256 lines via `line_count`. The DWARF source-file path
   // above reads lines from disk in a `while (fgets)` loop -- the only
@@ -1239,9 +1316,8 @@ std::vector<BreakpointLocation> DapDebugController::GetBreakpointLocations(const
 
   const int first_line = std::max(start_line, 0);
   const auto add_lines_clamped = [](const int line, const int count) {
-    return line > std::numeric_limits<int>::max() - count ?
-               std::numeric_limits<int>::max() :
-               line + count;
+    return line > std::numeric_limits<int>::max() - count ? std::numeric_limits<int>::max() :
+                                                            line + count;
   };
   // DESNOTE(jbarber, 2026-07-21): DAP's `endLine` defaults to -1 meaning
   // "through end". Treat negative end_line as unbounded so we enumerate
@@ -1250,9 +1326,9 @@ std::vector<BreakpointLocation> DapDebugController::GetBreakpointLocations(const
   // pathological end_line (or an omitted one defaulting to INT_MAX)
   // doesn't spin the session thread for billions of GetLineAddress calls.
   constexpr int kMaxLocationEnumerations = 65536;
-  const int last_line = end_line < 0 ? std::numeric_limits<int>::max() :
-                                        (end_line >= first_line ? end_line :
-                                                                  add_lines_clamped(first_line, 63));
+  const int last_line = end_line < 0 ?
+                            std::numeric_limits<int>::max() :
+                            (end_line >= first_line ? end_line : add_lines_clamped(first_line, 63));
   const int capped_last =
       std::min(last_line, add_lines_clamped(first_line, kMaxLocationEnumerations - 1));
   const u64 line_count = static_cast<u64>(capped_last) - static_cast<u64>(first_line) + 1;

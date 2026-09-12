@@ -1,8 +1,8 @@
 // Copyright 2026 Dolphin Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <string_view>
 #include <limits>
+#include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -105,6 +105,9 @@ std::vector<u8> MakeTypedDebugSection()
   FinishDie(&bytes, pointer_member);
   PatchU32(&bytes, structure_sibling, static_cast<u32>(bytes.size()));
 
+  // MWCC emits four-byte padding DIEs between some declaration groups.
+  AppendU32(&bytes, 4);
+
   const size_t union_type = BeginDie(&bytes, 0x0017);
   AppendU16(&bytes, 0x0012);
   const size_t union_sibling = bytes.size();
@@ -153,9 +156,9 @@ std::vector<u8> MakeTypedDebugSection()
   AppendU16(&bytes, 0x0055);
   AppendU16(&bytes, 7);
   AppendU16(&bytes, 0x0023);
-  AppendU16(&bytes, 2);
+  AppendU16(&bytes, 5);
   bytes.push_back(0x01);
-  bytes.push_back(3);
+  AppendU32(&bytes, 3);
   FinishDie(&bytes, parameter);
 
   const size_t local = BeginDie(&bytes, 0x000c);
@@ -164,9 +167,9 @@ std::vector<u8> MakeTypedDebugSection()
   AppendU16(&bytes, 0x0072);
   AppendU32(&bytes, static_cast<u32>(structure));
   AppendU16(&bytes, 0x0023);
-  AppendU16(&bytes, 8);
+  AppendU16(&bytes, 11);
   bytes.push_back(0x02);
-  bytes.push_back(1);
+  AppendU32(&bytes, 1);
   bytes.push_back(0x04);
   AppendU32(&bytes, static_cast<u32>(-8));
   bytes.push_back(0x07);
@@ -348,7 +351,7 @@ TEST(DwarfReaderTest, ParseMultiCompileUnitSiblingChain)
   ASSERT_GE(result->lines.size(), 4U);
 }
 
-TEST(DwarfReaderTest, ParseTypedVariablesAndLeafSiblings)
+TEST(DwarfReaderTest, ParseTypedVariablesAcrossPaddingDiesAndLeafSiblings)
 {
   const std::vector<u8> debug = MakeTypedDebugSection();
   const auto result = Core::Debug::Dwarf::Parse(debug, {}, true);

@@ -483,11 +483,12 @@ bool CBoot::Load_BS2(Core::System& system, const std::string& boot_rom_filename)
   return true;
 }
 
-static void SetDefaultDisc(DVD::DVDInterface& dvd_interface)
+static const DiscIO::VolumeDisc* SetDefaultDisc(DVD::DVDInterface& dvd_interface)
 {
   const std::string default_iso = Config::Get(Config::MAIN_DEFAULT_ISO);
   if (!default_iso.empty())
-    SetDisc(dvd_interface, DiscIO::CreateDiscForCore(default_iso));
+    return SetDisc(dvd_interface, DiscIO::CreateDiscForCore(default_iso));
+  return nullptr;
 }
 
 static void CopyDefaultExceptionHandlers(Core::System& system)
@@ -551,36 +552,46 @@ bool CBoot::BootUp(Core::System& system, const Core::CPUThreadGuard& guard,
       if (!executable.reader->IsValid())
         return false;
 
-      SetDefaultDisc(system.GetDVDInterface());
+      const DiscIO::VolumeDisc* const default_disc = SetDefaultDisc(system.GetDVDInterface());
 
       auto& ppc_state = system.GetPPCState();
-
-      SetupMSR(system);
-      SetupHID(ppc_state, system.IsWii());
-      SetupBAT(system, system.IsWii());
-      CopyDefaultExceptionHandlers(system);
-
-      if (system.IsWii())
+      if (Config::Get(Config::MAIN_BOOT_EXECUTABLE_WITH_DEFAULT_DISC))
       {
-        // Set a value for the SP. It doesn't matter where this points to,
-        // as long as it is a valid location. This value is taken from a homebrew binary.
-        ppc_state.gpr[1] = 0x8004d4bc;
-
-        // Because there is no TMD to get the requested system (IOS) version from,
-        // we default to IOS58, which is the version used by the Homebrew Channel.
-        SetupWiiMemory(system, IOS::HLE::IOSC::ConsoleType::Retail);
-        system.GetIOS()->BootIOS(Titles::IOS(58));
-
-        // The Apploader writes an IOS-like version number into memory.
-        // Older versions of OSInit read it to check IOS compatibility.
-        constexpr u32 ADDR_IOS_VERSION = 0x3140;
-        constexpr u32 ADDR_APPLOADER_VERSION = 0x3188;
-        const u32 ios_version = system.GetMemory().Read_U32(ADDR_IOS_VERSION);
-        system.GetMemory().Write_U32(ios_version, ADDR_APPLOADER_VERSION);
+        if (!default_disc ||
+            !EmulatedBS2(system, guard, system.IsWii(), *default_disc, riivolution_patches))
+        {
+          return false;
+        }
       }
       else
       {
-        SetupGCMemory(system, guard);
+        SetupMSR(system);
+        SetupHID(ppc_state, system.IsWii());
+        SetupBAT(system, system.IsWii());
+        CopyDefaultExceptionHandlers(system);
+
+        if (system.IsWii())
+        {
+          // Set a value for the SP. It doesn't matter where this points to,
+          // as long as it is a valid location. This value is taken from a homebrew binary.
+          ppc_state.gpr[1] = 0x8004d4bc;
+
+          // Because there is no TMD to get the requested system (IOS) version from,
+          // we default to IOS58, which is the version used by the Homebrew Channel.
+          SetupWiiMemory(system, IOS::HLE::IOSC::ConsoleType::Retail);
+          system.GetIOS()->BootIOS(Titles::IOS(58));
+
+          // The Apploader writes an IOS-like version number into memory.
+          // Older versions of OSInit read it to check IOS compatibility.
+          constexpr u32 ADDR_IOS_VERSION = 0x3140;
+          constexpr u32 ADDR_APPLOADER_VERSION = 0x3188;
+          const u32 ios_version = system.GetMemory().Read_U32(ADDR_IOS_VERSION);
+          system.GetMemory().Write_U32(ios_version, ADDR_APPLOADER_VERSION);
+        }
+        else
+        {
+          SetupGCMemory(system, guard);
+        }
       }
 
       if (!executable.reader->LoadIntoMemory(system))
@@ -589,7 +600,8 @@ bool CBoot::BootUp(Core::System& system, const Core::CPUThreadGuard& guard,
         return false;
       }
 
-      AchievementManager::GetInstance().LoadGame(nullptr);
+      AchievementManager::GetInstance().LoadGame(
+          Config::Get(Config::MAIN_BOOT_EXECUTABLE_WITH_DEFAULT_DISC) ? default_disc : nullptr);
 
       ppc_state.pc = executable.reader->GetEntryPoint();
 

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -75,7 +76,7 @@ public:
   const std::vector<std::string>& GetSourceFiles() const;
   bool HasDenseLineInfoInRange(u32 start, u32 size) const;
   void SetDwarfDebugInfo(Core::Debug::Dwarf::ParseResult info);
-  std::optional<Core::Debug::Dwarf::ParseResult> GetDwarfDebugInfo() const;
+  std::shared_ptr<const Core::Debug::Dwarf::ParseResult> GetDwarfDebugInfo() const;
 
   void PrintCalls(u32 funcAddr) const;
   void PrintCallers(u32 funcAddr) const;
@@ -95,5 +96,5 @@ private:
 
   std::vector<std::string> m_source_files;
   std::map<u32, LineEntry> m_line_table;
-  std::optional<Core::Debug::Dwarf::ParseResult> m_dwarf_debug_info;
+  std::shared_ptr<const Core::Debug::Dwarf::ParseResult> m_dwarf_debug_info;
 };

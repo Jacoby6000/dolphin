@@ -285,17 +285,17 @@ Location ParseLocation(std::span<const u8> data, bool big_endian, bool member)
   }
   else if (atom == OP_REG)
   {
-    u8 reg = 0;
-    if (reader.ReadU8(&reg) && reader.empty())
+    u32 reg = 0;
+    if (reader.ReadU32(&reg) && reader.empty())
       return {LocationKind::Register, reg, 0};
   }
   else if (atom == OP_BASEREG)
   {
-    u8 reg = 0;
+    u32 reg = 0;
     u8 constant = 0;
     s32 offset = 0;
     u8 add = 0;
-    if (reader.ReadU8(&reg) && reader.ReadU8(&constant) && constant == OP_CONST &&
+    if (reader.ReadU32(&reg) && reader.ReadU8(&constant) && constant == OP_CONST &&
         reader.ReadS32(&offset) && reader.ReadU8(&add) && add == OP_ADD && reader.empty())
       return {LocationKind::BaseRegisterOffset, reg, offset};
   }
@@ -311,6 +311,11 @@ bool ParseDie(const u8* die_start, const u8* section_end, bool big_endian, DieIn
   ByteReader die_reader({die_start, remaining}, big_endian);
   if (!die_reader.ReadU32(&info->length))
     return false;
+  if (info->length == 4)
+  {
+    info->tag = TAG_padding;
+    return true;
+  }
   if (info->length < 6 || info->length > remaining)
     return false;
 
@@ -556,7 +561,12 @@ std::optional<ParseResult> Parse(std::span<const u8> debug_section,
     if (!ParseDie(current, section_end, big_endian, &unit_info))
       break;
 
-    if (unit_info.length <= 4 || unit_info.length < 6)
+    if (unit_info.tag == TAG_padding)
+    {
+      current += unit_info.length;
+      continue;
+    }
+    if (unit_info.length < 6)
       break;
 
     if (unit_info.tag != TAG_compile_unit)
@@ -602,7 +612,14 @@ std::optional<ParseResult> Parse(std::span<const u8> debug_section,
         break;
 
       DieInfo child_info;
-      if (!ParseDie(child, unit_end, big_endian, &child_info) || child_info.length < 6)
+      if (!ParseDie(child, unit_end, big_endian, &child_info))
+        break;
+      if (child_info.tag == TAG_padding)
+      {
+        child += child_info.length;
+        continue;
+      }
+      if (child_info.length < 6)
         break;
 
       const u32 die_offset = static_cast<u32>(child - debug_section.data());
@@ -656,13 +673,12 @@ std::optional<ParseResult> Parse(std::span<const u8> debug_section,
           if (type.kind == TypeKind::Structure || type.kind == TypeKind::Union)
           {
             Location location = ParseLocation(child_info.location, big_endian, true);
-            if (type.kind == TypeKind::Union &&
-                location.kind == LocationKind::Unavailable && child_info.location.empty())
+            if (type.kind == TypeKind::Union && location.kind == LocationKind::Unavailable &&
+                child_info.location.empty())
             {
               location = {LocationKind::MemberOffset, 0, 0};
             }
-            type.members.push_back(
-                {child_info.name, child_info.type, std::move(location)});
+            type.members.push_back({child_info.name, child_info.type, std::move(location)});
           }
           break;
         }
@@ -701,8 +717,7 @@ std::optional<ParseResult> Parse(std::span<const u8> debug_section,
           if (child_info.start_scope != 0 &&
               child_info.start_scope <= std::numeric_limits<u32>::max() - function_base)
           {
-            variable.low_pc =
-                std::max(variable.low_pc, function_base + child_info.start_scope);
+            variable.low_pc = std::max(variable.low_pc, function_base + child_info.start_scope);
           }
         }
         result.variables.push_back(std::move(variable));

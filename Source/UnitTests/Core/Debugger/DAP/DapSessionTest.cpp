@@ -220,8 +220,8 @@ TEST_F(DapSessionTest, InitializeAdvertisesCapabilities)
   const auto response = client.Receive();
   ASSERT_TRUE(response.has_value());
   ASSERT_TRUE(response->at("success").get<bool>());
-  const auto& caps =
-      response->at("body").get<picojson::object>().at("capabilities").get<picojson::object>();
+  const auto& caps = response->at("body").get<picojson::object>();
+  EXPECT_TRUE(caps.at("supportsConfigurationDoneRequest").get<bool>());
   EXPECT_TRUE(caps.at("supportsReadMemoryRequest").get<bool>());
   EXPECT_TRUE(caps.at("supportsWriteMemoryRequest").get<bool>());
   EXPECT_TRUE(caps.at("supportsDisassembleRequest").get<bool>());
@@ -981,6 +981,8 @@ TEST_F(DapSessionTest, FrameZeroScopesExposeExpandableDwarfVariablesAndExpireHan
   ASSERT_EQ(scopes.size(), 4U);
   EXPECT_EQ(scopes[2].get<picojson::object>().at("name").to_str(), "Locals");
   EXPECT_EQ(scopes[3].get<picojson::object>().at("name").to_str(), "Globals");
+  EXPECT_FALSE(scopes[2].get<picojson::object>().at("expensive").get<bool>());
+  EXPECT_FALSE(scopes[3].get<picojson::object>().at("expensive").get<bool>());
 
   client.Send(R"({
     "seq": 11, "type": "request", "command": "variables",
@@ -1383,6 +1385,25 @@ TEST_F(DapSessionTest, SetInstructionBreakpointsReplacesPreviousBreakpoints)
   auto& bps = Core::System::GetInstance().GetPowerPC().GetBreakPoints();
   EXPECT_FALSE(bps.IsAddressBreakPoint(0x80003100));
   EXPECT_TRUE(bps.IsAddressBreakPoint(0x80003200));
+
+  client.Send(R"({
+    "seq": 9,
+    "type": "request",
+    "command": "disconnect"
+  })");
+  (void)client.Receive();
+}
+
+TEST_F(DapSessionTest, FirstSessionClearsPersistedBreakpoints)
+{
+  auto& breakpoints = Core::System::GetInstance().GetPowerPC().GetBreakPoints();
+  breakpoints.Add(0x80003100);
+  ASSERT_TRUE(breakpoints.IsAddressBreakPoint(0x80003100));
+
+  TestClient client(m_client_fd());
+  Handshake(client);
+
+  EXPECT_FALSE(breakpoints.IsAddressBreakPoint(0x80003100));
 
   client.Send(R"({
     "seq": 9,
@@ -2136,8 +2157,7 @@ TEST_F(DapSessionTest, InitializeAdvertisesInjectionAndDetourCapabilities)
   const auto response = client.Receive();
   ASSERT_TRUE(response.has_value());
   ASSERT_TRUE(response->at("success").get<bool>());
-  const auto& caps =
-      response->at("body").get<picojson::object>().at("capabilities").get<picojson::object>();
+  const auto& caps = response->at("body").get<picojson::object>();
   EXPECT_TRUE(caps.at("supportsDolphinFindFreeMemory").get<bool>());
   EXPECT_TRUE(caps.at("supportsDolphinInjectCode").get<bool>());
   EXPECT_TRUE(caps.at("supportsDolphinDetour").get<bool>());

@@ -357,18 +357,34 @@ struct SetGameMetadata
     if (!executable.reader->IsValid())
       return false;
 
-    *region = DiscIO::Region::Unknown;
     system.SetIsWii(executable.reader->IsWii());
 
     // Strip the .elf/.dol file extension and directories before the name
     SplitPath(executable.path, nullptr, &config->m_debugger_game_id, nullptr);
 
-    // Set DOL/ELF game ID appropriately
-    std::string executable_path = executable.path;
-    constexpr char BACKSLASH = '\\';
-    constexpr char FORWARDSLASH = '/';
-    std::ranges::replace(executable_path, BACKSLASH, FORWARDSLASH);
-    config->SetRunningGameMetadata(SConfig::MakeGameID(PathToFileName(executable_path)));
+    if (Config::Get(Config::MAIN_BOOT_EXECUTABLE_WITH_DEFAULT_DISC))
+    {
+      const std::string default_iso = Config::Get(Config::MAIN_DEFAULT_ISO);
+      std::unique_ptr<DiscIO::VolumeDisc> disc = DiscIO::CreateDiscForCore(default_iso);
+      if (!disc)
+        return false;
+
+      *region = disc->GetRegion();
+      const bool disc_is_wii = disc->GetVolumeType() == DiscIO::Platform::WiiDisc;
+      if (disc_is_wii != system.IsWii())
+        return false;
+      config->SetRunningGameMetadata(*disc, disc->GetGamePartition());
+    }
+    else
+    {
+      *region = DiscIO::Region::Unknown;
+      // Set DOL/ELF game ID appropriately
+      std::string executable_path = executable.path;
+      constexpr char BACKSLASH = '\\';
+      constexpr char FORWARDSLASH = '/';
+      std::ranges::replace(executable_path, BACKSLASH, FORWARDSLASH);
+      config->SetRunningGameMetadata(SConfig::MakeGameID(PathToFileName(executable_path)));
+    }
 
     Host_TitleChanged();
 

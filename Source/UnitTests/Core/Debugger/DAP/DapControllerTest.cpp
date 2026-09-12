@@ -160,6 +160,50 @@ TEST_F(DapControllerTest, GetDebugVariablesFiltersLocalsByCurrentPc)
   ASSERT_EQ(controller.GetDebugVariables(true).size(), 2U);
 }
 
+TEST_F(DapControllerTest, CharArraysRenderAsEscapedStringsAndRemainExpandable)
+{
+  using namespace Core::Debug::Dwarf;
+  constexpr u32 char_array_offset = 0x300;
+  constexpr u32 escaped_array_offset = 0x301;
+  constexpr u32 int_array_offset = 0x302;
+  constexpr u32 text_address = DwarfTestFixture::kTypedDataAddress + 0x100;
+
+  ParseResult info;
+  info.types.push_back(
+      {char_array_offset, TypeKind::Array, {}, 11, TypeRef{FundamentalTypeRef{1}, {}}, {}, 11});
+  info.types.push_back(
+      {escaped_array_offset, TypeKind::Array, {}, 4, TypeRef{FundamentalTypeRef{1}, {}}, {}, 4});
+  info.types.push_back(
+      {int_array_offset, TypeKind::Array, {}, 8, TypeRef{FundamentalTypeRef{7}, {}}, {}, 2});
+  info.variables.push_back({"text",
+                            TypeRef{UserTypeRef{char_array_offset}, {}},
+                            {LocationKind::Address, text_address, 0},
+                            VariableKind::Global});
+  info.variables.push_back({"escaped",
+                            TypeRef{UserTypeRef{escaped_array_offset}, {}},
+                            {LocationKind::Address, text_address + 0x10, 0},
+                            VariableKind::Global});
+  info.variables.push_back({"numbers",
+                            TypeRef{UserTypeRef{int_array_offset}, {}},
+                            {LocationKind::Address, text_address + 0x20, 0},
+                            VariableKind::Global});
+  System().GetPPCSymbolDB().SetDwarfDebugInfo(std::move(info));
+
+  constexpr std::array<u8, 11> text{{'P', 'l', 'M', 'r', 'N', 'r', '.', 'd', 'a', 't', 0}};
+  constexpr std::array<u8, 4> escaped{{'A', '\n', '\\', '"'}};
+  System().GetMemory().CopyToEmu(text_address, text.data(), text.size());
+  System().GetMemory().CopyToEmu(text_address + 0x10, escaped.data(), escaped.size());
+
+  DAP::DapDebugController controller(System());
+  const auto globals = controller.GetDebugVariables(true);
+  ASSERT_EQ(globals.size(), 3U);
+  EXPECT_EQ(globals[0].value, "\"PlMrNr.dat\"");
+  EXPECT_EQ(globals[1].value, "\"A\\n\\\\\\\"\"");
+  EXPECT_EQ(globals[2].value, "@ 0x00004120");
+  ASSERT_TRUE(globals[0].children);
+  EXPECT_EQ(controller.GetDebugVariableChildren(*globals[0].children).size(), 11U);
+}
+
 TEST_F(DapControllerTest, NullDebugPointerIsNotExpandable)
 {
   System().GetPPCSymbolDB().SetDwarfDebugInfo(DwarfTestFixture::MakeTypedParseResult());
@@ -897,14 +941,37 @@ TEST_F(DapControllerTest, SourceStepIntoStopsAfterEnteringTakenCall)
   const std::array<u8, 4> callee{{0x60, 0x00, 0x00, 0x00}};
   System().GetMemory().CopyToEmu(TEST_ADDRESS, caller.data(), caller.size());
   System().GetMemory().CopyToEmu(TEST_ADDRESS + 0x40, callee.data(), callee.size());
-  const u32 file = System().GetPPCSymbolDB().AddSourceFile("step.c");
-  System().GetPPCSymbolDB().AddLineEntry(TEST_ADDRESS, file, 1);
+  auto& symbols = System().GetPPCSymbolDB();
+  const u32 file = symbols.AddSourceFile("step.c");
+  symbols.AddLineEntry(TEST_ADDRESS, file, 1);
+  symbols.AddLineEntry(TEST_ADDRESS + 0x40, file, 10);
   System().GetPPCState().pc = TEST_ADDRESS;
 
   std::atomic<bool> cancelled{false};
   DAP::DapDebugController controller(System());
   controller.StepSource(false, cancelled);
   EXPECT_EQ(System().GetPPCState().pc, TEST_ADDRESS + 0x40);
+}
+
+TEST_F(DapControllerTest, SourceStepIntoTraversesSourceLessCallee)
+{
+  const std::array<u8, 8> caller{{0x48, 0x00, 0x00, 0x41, 0x60, 0x00, 0x00, 0x00}};
+  const std::array<u8, 8> callee{{0x60, 0x00, 0x00, 0x00, 0x4e, 0x80, 0x00, 0x20}};
+  System().GetMemory().CopyToEmu(TEST_ADDRESS, caller.data(), caller.size());
+  System().GetMemory().CopyToEmu(TEST_ADDRESS + 0x40, callee.data(), callee.size());
+  auto& symbols = System().GetPPCSymbolDB();
+  const u32 file = symbols.AddSourceFile("step.c");
+  symbols.AddLineEntry(TEST_ADDRESS, file, 1);
+  symbols.AddLineEntry(TEST_ADDRESS + 4, file, 2);
+  Core::CPUThreadGuard guard(System());
+  symbols.AddKnownSymbol(guard, TEST_ADDRESS, caller.size(), "caller", "step.c");
+  symbols.AddKnownSymbol(guard, TEST_ADDRESS + 0x40, callee.size(), "callee", "asm.o");
+  System().GetPPCState().pc = TEST_ADDRESS;
+
+  std::atomic<bool> cancelled{false};
+  DAP::DapDebugController controller(System());
+  controller.StepSource(false, cancelled);
+  EXPECT_EQ(System().GetPPCState().pc, TEST_ADDRESS + 4);
 }
 
 TEST_F(DapControllerTest, SourceStepStopsAtCodeBreakpointBeforeLineChanges)
@@ -2343,8 +2410,7 @@ TEST_F(DapControllerTest, ExtremeSourceLineDoesNotWrapDisassemblyAddress)
 {
   DAP::DapDebugController controller(System());
   EXPECT_FALSE(controller.GetSource(TEST_ADDRESS, std::numeric_limits<int>::max(), -1));
-  EXPECT_TRUE(controller
-                  .GetBreakpointLocations(TEST_ADDRESS, std::numeric_limits<int>::max(), -1)
-                  .empty());
+  EXPECT_TRUE(
+      controller.GetBreakpointLocations(TEST_ADDRESS, std::numeric_limits<int>::max(), -1).empty());
 }
 }  // namespace

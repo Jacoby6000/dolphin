@@ -28,7 +28,6 @@
 #include "Common/HookableEvent.h"
 #include "Common/JsonUtil.h"
 #include "Common/Logging/Log.h"
-#include "Common/Version.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/Debugger/DAP/DapDebugController.h"
@@ -140,18 +139,12 @@ picojson::object MakeVariable(std::string_view name, u32 value)
   return variable;
 }
 
-// DESNOTE(jbarber, 2026-07-22): DAP supports multiple simultaneous client
-// sessions on the same core (see DAP.cpp AcceptLoop). Dolphin has one global
-// PPC BreakPoints / MemChecks store, so the teardown path that clears
-// debugger state on disconnect must NOT clobber breakpoints still in use by
-// other connected sessions. This counter is incremented when a Session
-// enters its Run loop and decremented when it exits; only the session that
-// observes the count reach zero (the last one out) calls ClearBreakpoints.
-// Front-loads the #57 fix (no stale state on exit) over the naive "wipe on
-// every disconnect" form that bugbot #59 flagged. Concurrent clients
-// installing breakpoints still clobber each other (one global store) -- that
-// is a documented architectural limitation in Tools/dap/README.md.
-std::atomic<int> s_active_session_count{0};
+// Dolphin has one global PPC BreakPoints / MemChecks store. Clear it when the
+// first DAP session enters so persisted GUI breakpoints from another executable
+// layout cannot contaminate this DAP lifetime, and when the last session exits.
+// Serialize both transitions with their clears so reconnect cannot race teardown.
+std::mutex s_session_lifetime_mutex;
+int s_active_session_count = 0;
 
 // DESNOTE(jbarber, 2026-07-22): MaybeFireEntryStop decides whether the core
 // continues or stays paused on entry/attach. Without a shared gate, each
@@ -230,15 +223,15 @@ public:
     if (!RunHandshake())
       return;
 
-    // DESNOTE(jbarber, 2026-07-22): Count this session so the teardown path
-    // knows whether other clients are still connected. Only the LAST session
-    // to exit clears the global breakpoint/memcheck stores -- otherwise a
-    // disconnecting client would wipe breakpoints still in use by a live
-    // session. Bugbot #59. Increment here (post-handshake) and decrement at
-    // every exit from this point. The only exit is the end of Run() (the
-    // main loop only returns on socket close or `disconnect`); if a future
-    // edit adds an early return, the decrement must precede it.
-    s_active_session_count.fetch_add(1);
+    {
+      std::lock_guard lock(s_session_lifetime_mutex);
+      if (s_active_session_count == 0)
+      {
+        m_controller.ClearBreakpoints();
+        m_controller.ClearFreezes();
+      }
+      ++s_active_session_count;
+    }
 
     // DESNOTE(jbarber, 2026-07-21): Construct the realtime-watch sampler here
     // (not in the ctor) so its dispatch lambda can capture a weak_ptr to this
@@ -325,42 +318,21 @@ public:
     m_step_cancelled.store(true);
     if (m_step_out_thread.joinable())
       m_step_out_thread.join();
-    // DESNOTE(jbarber, 2026-07-22): Clear debugger state this session
-    // installed in the global PPC BreakPoints / MemChecks stores, but ONLY
-    // if no other session is still connected -- otherwise we'd clobber
-    // breakpoints a live client is still using. Bugbot #59 refines the
-    // original #57 fix to handle the multi-client case. The decrement-
-    // and-test is atomic, so concurrent disconnects each see the correct
-    // count and at most one of them clears. Concurrent clients installing
-    // breakpoints still clobber each other (one global store) -- that is
-    // a documented architectural limitation in Tools/dap/README.md.
-    const bool is_last_session = (s_active_session_count.fetch_sub(1) - 1) == 0;
-    if (is_last_session)
     {
-      m_controller.ClearBreakpoints();
-      // ClearFreezes is redundant here (ClearBreakpoints wipes all memchecks
-      // including freeze memchecks), but explicit for documentation. The
-      // m_watch_to_freeze map is destroyed with the session.
-      m_controller.ClearFreezes();
-      // DESNOTE(jbarber, 2026-07-22): Reset the entry-stop decision flag so a
-      // future DAP re-init within the same process boot starts fresh -- the
-      // first session of the new DAP lifetime makes the continue/stay-paused
-      // decision again. Without this, a re-init'd DAP would silently skip
-      // MaybeFireEntryStop's continue/pause action because the flag is still
-      // set from the prior lifetime (sessions exited but the process didn't).
-      // Bugbot #67.
-      s_entry_stop_handled.store(false);
-    }
-    else
-    {
-      // DESNOTE(jbarber, 2026-07-26): Non-last session: remove only this
-      // session's own freezes so they don't outlive their owner. The global
-      // memcheck store is shared, so we can't Clear() without clobbering
-      // other sessions' state. RemoveFreeze targets the specific freeze
-      // memcheck by address, leaving other sessions' freezes intact.
-      // Bugbot #75.
-      for (const auto& [watch_id, freeze_id] : m_watch_to_freeze)
-        m_controller.RemoveFreeze(freeze_id);
+      std::lock_guard lock(s_session_lifetime_mutex);
+      if (--s_active_session_count == 0)
+      {
+        m_controller.ClearBreakpoints();
+        m_controller.ClearFreezes();
+        s_entry_stop_handled.store(false);
+      }
+      else
+      {
+        // A non-last session removes only its own freezes so it cannot clobber
+        // debugger state that another connected client still uses.
+        for (const auto& [watch_id, freeze_id] : m_watch_to_freeze)
+          m_controller.RemoveFreeze(freeze_id);
+      }
     }
   }
 
@@ -724,8 +696,7 @@ private:
       // A single atomic action preserves the client's latest intent. Separate
       // booleans could not distinguish continue-then-pause from
       // pause-then-continue and therefore applied the wrong final state.
-      const DeferredStepAction action =
-          m_deferred_step_action.exchange(DeferredStepAction::None);
+      const DeferredStepAction action = m_deferred_step_action.exchange(DeferredStepAction::None);
       if (action == DeferredStepAction::Pause)
       {
         // DESNOTE(jbarber, 2026-07-21): A user-initiated pause that
@@ -834,14 +805,10 @@ private:
     capabilities.emplace("supportsDolphinMemoryScan", true);
     capabilities.emplace("supportsDolphinPointerChain", true);
 
-    picojson::object server_info;
-    server_info.emplace("name", std::string("Dolphin DAP"));
-    server_info.emplace("version", std::string(Common::GetScmRevGitStr()));
-
-    picojson::object body;
-    body.emplace("capabilities", std::move(capabilities));
-    body.emplace("serverInfo", std::move(server_info));
-    return body;
+    // The initialize response body is the Capabilities object itself. Wrapping
+    // it in a `capabilities` property hides every advertised feature from
+    // standard clients such as nvim-dap, including configurationDone support.
+    return capabilities;
   }
 
   void HandleMessage(const std::string& message)
@@ -2555,10 +2522,7 @@ private:
     return scope;
   }
 
-  void ClearDebugValueHandles()
-  {
-    m_debug_value_handles.clear();
-  }
+  void ClearDebugValueHandles() { m_debug_value_handles.clear(); }
 
   picojson::object MakeScopes(const int frame_id)
   {

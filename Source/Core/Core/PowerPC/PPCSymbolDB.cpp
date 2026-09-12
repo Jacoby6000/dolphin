@@ -70,11 +70,12 @@ void PPCSymbolDB::ClearSourceLineInfo()
 
 void PPCSymbolDB::SetDwarfDebugInfo(Core::Debug::Dwarf::ParseResult info)
 {
+  std::ranges::sort(info.types, {}, &Core::Debug::Dwarf::Type::die_offset);
   std::lock_guard lock(m_mutex);
-  m_dwarf_debug_info = std::move(info);
+  m_dwarf_debug_info = std::make_shared<const Core::Debug::Dwarf::ParseResult>(std::move(info));
 }
 
-std::optional<Core::Debug::Dwarf::ParseResult> PPCSymbolDB::GetDwarfDebugInfo() const
+std::shared_ptr<const Core::Debug::Dwarf::ParseResult> PPCSymbolDB::GetDwarfDebugInfo() const
 {
   std::lock_guard lock(m_mutex);
   return m_dwarf_debug_info;
@@ -88,20 +89,35 @@ bool PPCSymbolDB::HasSourceLineInfo() const
 
 std::optional<PPCSymbolDB::SourceLine> PPCSymbolDB::GetSourceLine(u32 addr) const
 {
-  std::lock_guard lock(m_mutex);
-  if (m_line_table.empty())
-    return std::nullopt;
+  SourceLine source_line;
+  {
+    std::lock_guard lock(m_mutex);
+    if (m_line_table.empty())
+      return std::nullopt;
 
-  auto it = m_line_table.upper_bound(addr);
-  if (it == m_line_table.begin())
-    return std::nullopt;
+    auto it = m_line_table.upper_bound(addr);
+    if (it == m_line_table.begin())
+      return std::nullopt;
 
-  --it;
-  const LineEntry& entry = it->second;
-  if (entry.file_index >= m_source_files.size())
-    return std::nullopt;
+    --it;
+    const LineEntry& entry = it->second;
+    if (entry.file_index >= m_source_files.size())
+      return std::nullopt;
+    source_line = {it->first, m_source_files[entry.file_index], entry.line};
+  }
 
-  return SourceLine{it->first, m_source_files[entry.file_index], entry.line};
+  // A sparse line table applies until the next row only within its function.
+  // Without this boundary, source-less code inherits an unrelated preceding
+  // row and source stepping jumps through misleading files and line numbers.
+  const Common::Symbol* current_symbol = GetSymbolFromAddr(addr);
+  const Common::Symbol* line_symbol = GetSymbolFromAddr(source_line.address);
+  if ((current_symbol || line_symbol) &&
+      (!current_symbol || !line_symbol || current_symbol->address != line_symbol->address))
+  {
+    return std::nullopt;
+  }
+
+  return source_line;
 }
 
 std::optional<u32> PPCSymbolDB::GetLineAddress(std::string_view file, u32 line) const
