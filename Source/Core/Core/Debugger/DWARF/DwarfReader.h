@@ -25,6 +25,7 @@ struct Function
 struct LineEntry
 {
   u32 address = 0;
+  u32 file_index = 0;
   std::string file;
   u32 line = 0;
 };

@@ -280,7 +280,7 @@ std::string PPCDebugInterface::Disassemble(const Core::CPUThreadGuard* guard, u3
 {
   if (guard)
   {
-    if (!PowerPC::MMU::HostIsRAMAddress(*guard, address))
+    if (!PowerPC::MMU::HostIsInstructionRAMAddress(*guard, address))
     {
       return "(No RAM here)";
     }

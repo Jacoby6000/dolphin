@@ -427,7 +427,8 @@ bool ParseDie(const u8* die_start, const u8* section_end, bool big_endian, DieIn
 }
 
 bool ParseLineTable(std::span<const u8> line_section, u32 stmt_list_offset, u32 compile_unit_base,
-                    const std::string& file, bool big_endian, std::vector<LineEntry>* lines)
+                    u32 file_index, const std::string& file, bool big_endian,
+                    std::vector<LineEntry>* lines)
 {
   if (stmt_list_offset > line_section.size() || line_section.size() - stmt_list_offset < 8)
     return false;
@@ -470,6 +471,7 @@ bool ParseLineTable(std::span<const u8> line_section, u32 stmt_list_offset, u32 
     if (address_delta > std::numeric_limits<u32>::max() - base)
       continue;
     entry.address = base + address_delta;
+    entry.file_index = file_index;
     entry.file = file;
     entry.line = line_number;
     lines->push_back(std::move(entry));
@@ -576,13 +578,13 @@ std::optional<ParseResult> Parse(std::span<const u8> debug_section,
     }
 
     const std::string compile_unit_name = unit_info.name;
-    if (!compile_unit_name.empty())
-      result.files.push_back(compile_unit_name);
+    const u32 file_index = static_cast<u32>(result.files.size());
+    result.files.push_back(compile_unit_name);
 
     if (unit_info.has_stmt_list && !line_section.empty())
     {
-      ParseLineTable(line_section, unit_info.stmt_list_offset, unit_info.low_pc, compile_unit_name,
-                     big_endian, &result.lines);
+      ParseLineTable(line_section, unit_info.stmt_list_offset, unit_info.low_pc, file_index,
+                     compile_unit_name, big_endian, &result.lines);
     }
 
     const u32 unit_offset = static_cast<u32>(current - debug_section.data());

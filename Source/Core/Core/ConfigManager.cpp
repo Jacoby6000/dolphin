@@ -282,6 +282,7 @@ void SConfig::OnTitleDirectlyBooted(const Core::CPUThreadGuard& guard)
   auto& ppc_symbol_db = system.GetPPCSymbolDB();
 
   ppc_symbol_db.ClearSourceLineInfo();
+  ppc_symbol_db.SetSourcePaths(SplitString(Config::Get(Config::MAIN_DEBUG_SOURCE_PATHS), ';'));
 
   bool symbols_changed = false;
   if (ppc_symbol_db.LoadMapOnBoot(guard))

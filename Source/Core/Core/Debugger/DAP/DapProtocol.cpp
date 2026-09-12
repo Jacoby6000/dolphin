@@ -145,30 +145,34 @@ std::optional<u32> ResolveMemoryReference(const picojson::object& arguments)
   return Json::ParseHexAddress(*reference);
 }
 
-std::optional<u32> ResolveSourceReference(const picojson::object& arguments)
+std::optional<SourceReference> ResolveSourceReference(const picojson::object& arguments)
 {
-  if (const std::optional<s64> reference = ReadNumericFromJson<s64>(arguments, "sourceReference"))
-  {
-    // DESNOTE(jbarber, 2026-07-21): Reject negative or > u32-max reference
-    // values outright -- the previous form `static_cast<u32>(*reference)`
-    // wrapped an out-of-range s64 to a nonsense address, which `source` and
-    // `breakpointLocations` would then dereference as a code base. A negative
-    // sourceReference is also a DAP-protocol error (references are non-
-    // negative integers), so failing cleanly is correct.
-    if (*reference < 0 || *reference > static_cast<s64>(std::numeric_limits<u32>::max()))
+  const auto read_reference = [](const picojson::object& object) -> std::optional<SourceReference> {
+    const std::optional<SourceReference> reference =
+        ReadStrictUnsignedInteger<SourceReference>(object, "sourceReference");
+    if (!reference || *reference == 0 ||
+        *reference > MakeDisassemblySourceReference(std::numeric_limits<u32>::max()))
       return std::nullopt;
-    return static_cast<u32>(*reference);
-  }
+    return reference;
+  };
+
+  if (const std::optional<SourceReference> reference = read_reference(arguments))
+    return reference;
   const picojson::object* source = GetObject(arguments, "source");
   if (source == nullptr)
     return std::nullopt;
-  if (const std::optional<s64> reference = ReadNumericFromJson<s64>(*source, "sourceReference"))
+  if (const std::optional<SourceReference> reference = read_reference(*source))
+    return reference;
+  if (const picojson::object* adapter_data = GetObject(*source, "adapterData"))
   {
-    if (*reference < 0 || *reference > static_cast<s64>(std::numeric_limits<u32>::max()))
-      return std::nullopt;
-    return static_cast<u32>(*reference);
+    const std::optional<u32> source_id =
+        ReadStrictUnsignedInteger<u32>(*adapter_data, "dolphinSourceId");
+    if (source_id && *source_id > 0)
+      return *source_id;
   }
-  return ResolveSourceObjectBase(*source);
+  if (const std::optional<u32> base = ResolveSourceObjectBase(*source))
+    return MakeDisassemblySourceReference(*base);
+  return std::nullopt;
 }
 
 std::optional<DAP::MemoryScanDataType> ParseMemoryScanDataType(std::string_view type)
@@ -371,9 +375,13 @@ SetBreakpointsArguments ParseSetBreakpoints(const picojson::object& arguments)
         // Compute in 64-bit so a wildly-large `line` produces a non-resolvable
         // nullopt address rather than silently wrapping past u32 max and
         // installing a breakpoint at a nonsense PC.
-        const u64 effective = static_cast<u64>(*result.base) + static_cast<u64>(*line) * 4ull;
-        if (effective <= static_cast<u64>(std::numeric_limits<u32>::max()))
-          breakpoint.address = static_cast<u32>(effective);
+        if (*line > 0)
+        {
+          const u64 effective =
+              static_cast<u64>(*result.base) + (static_cast<u64>(*line) - 1ull) * 4ull;
+          if (effective <= static_cast<u64>(std::numeric_limits<u32>::max()))
+            breakpoint.address = static_cast<u32>(effective);
+        }
       }
     }
     else if (result.base)
@@ -523,18 +531,26 @@ GotoTargetsArguments ParseGotoTargets(const picojson::object& arguments)
 {
   GotoTargetsArguments result;
 
-  const std::optional<u32> base = ResolveSourceBase(arguments);
+  std::optional<u32> base;
+  if (const std::optional<SourceReference> reference = ResolveSourceReference(arguments))
+  {
+    base = DecodeDisassemblySourceReference(*reference);
+    if (!base && *reference <= std::numeric_limits<u32>::max())
+      base = static_cast<u32>(*reference);
+  }
   if (!base)
     return result;
 
   // DESNOTE(jbarber, 2026-07-03): Dolphin models a "source" as a code region
-  // anchored at a hex address, so a goto line resolves to base + line*4,
+  // anchored at a hex address, so a goto line resolves to base + (line-1)*4,
   // matching setBreakpoints' line handling. Compute in u64 so an absurd
   // `line` value yields an out-of-range address (left as nullopt) instead of
   // silently wrapping the source base to a destination that points elsewhere.
   const std::optional<u32> line = ReadNumericFromJson<u32>(arguments, "line");
-  const u64 line_value = static_cast<u64>(line.value_or(0));
-  const u64 effective = static_cast<u64>(*base) + line_value * 4ull;
+  if (!line || *line == 0)
+    return result;
+  result.line = static_cast<int>(*line);
+  const u64 effective = static_cast<u64>(*base) + (static_cast<u64>(*line) - 1ull) * 4ull;
   if (effective <= static_cast<u64>(std::numeric_limits<u32>::max()))
     result.address = static_cast<u32>(effective);
   return result;
@@ -563,7 +579,7 @@ std::optional<GotoArguments> ParseGoto(const picojson::object& arguments)
 SourceRequestArguments ParseSourceRequest(const picojson::object& arguments)
 {
   SourceRequestArguments result;
-  result.base = ResolveSourceReference(arguments);
+  result.source_reference = ResolveSourceReference(arguments);
   result.start_line = ReadNumericFromJson<int>(arguments, "startLine").value_or(0);
   if (const std::optional<int> end_line = ReadNumericFromJson<int>(arguments, "endLine"))
     result.end_line = *end_line;
@@ -573,7 +589,7 @@ SourceRequestArguments ParseSourceRequest(const picojson::object& arguments)
 BreakpointLocationsArguments ParseBreakpointLocations(const picojson::object& arguments)
 {
   BreakpointLocationsArguments result;
-  result.base = ResolveSourceReference(arguments);
+  result.source_reference = ResolveSourceReference(arguments);
   result.start_line = ReadNumericFromJson<int>(arguments, "line").value_or(0);
   if (const std::optional<int> end_line = ReadNumericFromJson<int>(arguments, "endLine"))
     result.end_line = *end_line;

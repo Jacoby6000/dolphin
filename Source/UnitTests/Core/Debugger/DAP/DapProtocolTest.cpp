@@ -546,7 +546,7 @@ TEST(DapProtocol, ParseSetBreakpointsResolvesLinesAgainstBase)
 {
   const auto args = ParseObjectOrDie(R"({
     "source": {"name": "0x80003000"},
-    "breakpoints": [{"line": 0}, {"line": 2}]
+    "breakpoints": [{"line": 1}, {"line": 3}]
   })");
   const auto parsed = Protocol::ParseSetBreakpoints(args);
   ASSERT_EQ(parsed.breakpoints.size(), 2u);
@@ -578,7 +578,7 @@ TEST(DapProtocol, ParseSetBreakpointsUsesPathWhenNameNotHex)
   EXPECT_EQ(*parsed.base, 0x80004000u);
   ASSERT_EQ(parsed.breakpoints.size(), 1u);
   ASSERT_TRUE(parsed.breakpoints[0].address.has_value());
-  EXPECT_EQ(*parsed.breakpoints[0].address, 0x80004004u);
+  EXPECT_EQ(*parsed.breakpoints[0].address, 0x80004000u);
 }
 
 TEST(DapProtocol, ParseSetBreakpointsExtractsCondition)
@@ -832,7 +832,8 @@ TEST(DapProtocol, ParseGotoTargetsResolvesSourceAndLine)
   })");
   const auto parsed = Protocol::ParseGotoTargets(message);
   ASSERT_TRUE(parsed.address.has_value());
-  EXPECT_EQ(*parsed.address, 0x80001008u);
+  EXPECT_EQ(*parsed.address, 0x80001004u);
+  EXPECT_EQ(parsed.line, 2);
 }
 
 TEST(DapProtocol, ParseGotoTargetsWithoutSourceIsUnresolved)
@@ -846,8 +847,7 @@ TEST(DapProtocol, ParseGotoTargetsWithoutLineUsesSourceBase)
 {
   const auto message = ParseObjectOrDie(R"({"source": {"name": "0x80001000"}})");
   const auto parsed = Protocol::ParseGotoTargets(message);
-  ASSERT_TRUE(parsed.address.has_value());
-  EXPECT_EQ(*parsed.address, 0x80001000u);
+  EXPECT_FALSE(parsed.address.has_value());
 }
 
 TEST(DapProtocol, ParseGotoExtractsThreadAndTarget)
@@ -868,15 +868,25 @@ TEST(DapProtocol, ParseGotoRejectsMissingTarget)
 TEST(DapProtocol, ParseSourceRequestFromSourceReference)
 {
   const auto message = ParseObjectOrDie(R"({
-    "sourceReference": 2147487744,
+    "sourceReference": 6442455040,
     "startLine": 2,
     "endLine": 3
   })");
   const auto parsed = Protocol::ParseSourceRequest(message);
-  ASSERT_TRUE(parsed.base.has_value());
-  EXPECT_EQ(*parsed.base, 0x80001000u);
+  ASSERT_TRUE(parsed.source_reference.has_value());
+  EXPECT_EQ(*parsed.source_reference, DAP::MakeDisassemblySourceReference(0x80001000u));
   EXPECT_EQ(parsed.start_line, 2);
   EXPECT_EQ(parsed.end_line, 3);
+}
+
+TEST(DapProtocol, DisassemblySourceReferencesArePositiveAndDisjointFromFileReferences)
+{
+  constexpr u32 address = 1;
+  constexpr DAP::SourceReference reference = DAP::MakeDisassemblySourceReference(address);
+  EXPECT_GT(reference, static_cast<DAP::SourceReference>(std::numeric_limits<u32>::max()));
+  EXPECT_NE(reference, 1u);
+  ASSERT_TRUE(DAP::DecodeDisassemblySourceReference(reference).has_value());
+  EXPECT_EQ(*DAP::DecodeDisassemblySourceReference(reference), address);
 }
 
 TEST(DapProtocol, ParseSourceRequestFromSourceObject)
@@ -886,10 +896,21 @@ TEST(DapProtocol, ParseSourceRequestFromSourceObject)
     "startLine": 1
   })");
   const auto parsed = Protocol::ParseSourceRequest(message);
-  ASSERT_TRUE(parsed.base.has_value());
-  EXPECT_EQ(*parsed.base, 0x80001000u);
+  ASSERT_TRUE(parsed.source_reference.has_value());
+  EXPECT_EQ(*parsed.source_reference, DAP::MakeDisassemblySourceReference(0x80001000u));
   EXPECT_EQ(parsed.start_line, 1);
   EXPECT_EQ(parsed.end_line, -1);
+}
+
+TEST(DapProtocol, ParseSourceRequestFromDolphinSourceIdentity)
+{
+  const auto message = ParseObjectOrDie(R"({
+    "source": {"adapterData": {"dolphinSourceId": 2}},
+    "startLine": 1
+  })");
+  const auto parsed = Protocol::ParseSourceRequest(message);
+  ASSERT_TRUE(parsed.source_reference.has_value());
+  EXPECT_EQ(*parsed.source_reference, 2U);
 }
 
 TEST(DapProtocol, ParseBreakpointLocationsResolvesLineRange)
@@ -900,8 +921,8 @@ TEST(DapProtocol, ParseBreakpointLocationsResolvesLineRange)
     "endLine": 3
   })");
   const auto parsed = Protocol::ParseBreakpointLocations(message);
-  ASSERT_TRUE(parsed.base.has_value());
-  EXPECT_EQ(*parsed.base, 0x80001000u);
+  ASSERT_TRUE(parsed.source_reference.has_value());
+  EXPECT_EQ(*parsed.source_reference, DAP::MakeDisassemblySourceReference(0x80001000u));
   EXPECT_EQ(parsed.start_line, 1);
   EXPECT_EQ(parsed.end_line, 3);
 }
@@ -910,7 +931,7 @@ TEST(DapProtocol, ParseBreakpointLocationsWithoutSourceIsUnresolved)
 {
   const auto message = ParseObjectOrDie(R"({"line": 1})");
   const auto parsed = Protocol::ParseBreakpointLocations(message);
-  EXPECT_FALSE(parsed.base.has_value());
+  EXPECT_FALSE(parsed.source_reference.has_value());
 }
 
 TEST(DapProtocol, ParseBreakpointLocationsResolvesSourceReference)
@@ -921,8 +942,8 @@ TEST(DapProtocol, ParseBreakpointLocationsResolvesSourceReference)
     "endLine": 5
   })");
   const auto parsed = Protocol::ParseBreakpointLocations(message);
-  ASSERT_TRUE(parsed.base.has_value());
-  EXPECT_EQ(*parsed.base, 1u);
+  ASSERT_TRUE(parsed.source_reference.has_value());
+  EXPECT_EQ(*parsed.source_reference, 1u);
   EXPECT_EQ(parsed.start_line, 2);
   EXPECT_EQ(parsed.end_line, 5);
 }

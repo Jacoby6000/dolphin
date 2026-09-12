@@ -30,6 +30,7 @@
 #include "Core/Debugger/DAP/DapFraming.h"
 #include "Core/Debugger/DAP/DapJson.h"
 #include "Core/Debugger/DAP/DapSession.h"
+#include "Core/Debugger/DAP/DapSource.h"
 #include "Core/Debugger/DAP/DapTransport.h"
 #include "Core/Debugger/DWARF/DwarfImport.h"
 #include "Core/HW/AddressSpace.h"
@@ -549,7 +550,7 @@ TEST_F(DapSessionTest, SetBreakpointsResolvesAgainstSourceBase)
     "command": "setBreakpoints",
     "arguments": {
       "source": {"name": "0x80003100"},
-      "breakpoints": [{"line": 0}, {"line": 1}]
+      "breakpoints": [{"line": 1}, {"line": 2}]
     }
   })");
   const auto response = client.Receive();
@@ -1088,6 +1089,11 @@ TEST_F(DapSessionTest, SetVariableUpdatesRegisterAndReturnsFormattedValue)
 
 TEST_F(DapSessionTest, ThreadsAndStackTraceReturnPpcState)
 {
+  {
+    Core::CPUThreadGuard guard(Core::System::GetInstance());
+    Core::System::GetInstance().GetPowerPC().GetSymbolDB().AddKnownSymbol(
+        guard, CODE_ADDRESS, 0x100, "main", "game.elf", Common::Symbol::Type::Function);
+  }
   auto& ppc_state = Core::System::GetInstance().GetPPCState();
   ppc_state.pc = CODE_ADDRESS;
   LR(ppc_state) = CODE_ADDRESS + 4;
@@ -1118,14 +1124,49 @@ TEST_F(DapSessionTest, ThreadsAndStackTraceReturnPpcState)
   const auto& stack_frames =
       stack_response->at("body").get<picojson::object>().at("stackFrames").get<picojson::array>();
   ASSERT_GE(stack_frames.size(), 1u);
-  EXPECT_EQ(stack_frames[0].get<picojson::object>().at("instructionPointerReference").to_str(),
-            "0x00003100");
+  const auto& stack_frame = stack_frames[0].get<picojson::object>();
+  EXPECT_EQ(stack_frame.at("instructionPointerReference").to_str(), "0x00003100");
+  EXPECT_EQ(stack_frame.at("source").get<picojson::object>().at("sourceReference").get<double>(),
+            static_cast<double>(DAP::MakeDisassemblySourceReference(CODE_ADDRESS)));
+  EXPECT_EQ(stack_frame.at("line").get<double>(), 1.0);
+  EXPECT_EQ(stack_frame.at("column").get<double>(), 1.0);
 
   client.Send(R"({
     "seq": 9,
     "type": "request",
     "command": "disconnect"
   })");
+  (void)client.Receive();
+}
+
+TEST_F(DapSessionTest, UnmappedHighAddressStackFrameOmitsSource)
+{
+  constexpr u32 address = 0x800052cc;
+  auto& ppc_state = Core::System::GetInstance().GetPPCState();
+  ppc_state.pc = address;
+  ppc_state.gpr[1] = 0;
+  LR(ppc_state) = 0;
+
+  TestClient client(m_client_fd());
+  Handshake(client);
+
+  client.Send(R"({
+    "seq": 3,
+    "type": "request",
+    "command": "stackTrace",
+    "arguments": {"threadId": 1}
+  })");
+  const auto response = client.Receive();
+  ASSERT_TRUE(response.has_value());
+  const auto& frames =
+      response->at("body").get<picojson::object>().at("stackFrames").get<picojson::array>();
+  ASSERT_EQ(frames.size(), 1u);
+  const auto& frame = frames[0].get<picojson::object>();
+  EXPECT_EQ(frame.count("source"), 0u);
+  EXPECT_EQ(frame.at("line").get<double>(), 1.0);
+  EXPECT_EQ(frame.at("column").get<double>(), 1.0);
+
+  client.Send(R"({"seq":9,"type":"request","command":"disconnect"})");
   (void)client.Receive();
 }
 
@@ -1451,7 +1492,7 @@ TEST_F(DapSessionTest, GotoTargetsThenGotoMovesPc)
     "seq": 3,
     "type": "request",
     "command": "gotoTargets",
-    "arguments": {"source": {"name": "0x00003100"}, "line": 1}
+    "arguments": {"source": {"name": "0x00003100"}, "line": 2}
   })");
   const auto targets_response = client.Receive();
   ASSERT_TRUE(targets_response.has_value());
@@ -1561,7 +1602,11 @@ TEST_F(DapSessionTest, LoadedSourcesReturnsFunctionSymbol)
   const auto& sources =
       response->at("body").get<picojson::object>().at("sources").get<picojson::array>();
   ASSERT_EQ(sources.size(), 1u);
-  EXPECT_EQ(sources[0].get<picojson::object>().at("name").to_str(), "game.elf");
+  const auto& source = sources[0].get<picojson::object>();
+  EXPECT_EQ(source.at("name").to_str(), "game.elf");
+  EXPECT_EQ(source.at("sourceReference").get<double>(),
+            static_cast<double>(DAP::MakeDisassemblySourceReference(CODE_ADDRESS)));
+  EXPECT_EQ(source.count("path"), 0u);
 
   client.Send(R"({
     "seq": 9,
@@ -1581,7 +1626,7 @@ TEST_F(DapSessionTest, SourceReturnsDisassembly)
     "type": "request",
     "command": "source",
     "arguments": {
-      "source": {"name": "0x00003100"},
+      "source": {"name": "0x00003100", "sourceReference": 4294979840},
       "startLine": 0,
       "endLine": 0
     }
@@ -1612,8 +1657,8 @@ TEST_F(DapSessionTest, BreakpointLocationsReturnsInstructionLines)
     "command": "breakpointLocations",
     "arguments": {
       "source": {"name": "0x00003100"},
-      "line": 0,
-      "endLine": 1
+      "line": 1,
+      "endLine": 2
     }
   })");
   const auto response = client.Receive();
@@ -1621,8 +1666,8 @@ TEST_F(DapSessionTest, BreakpointLocationsReturnsInstructionLines)
   const auto& breakpoints =
       response->at("body").get<picojson::object>().at("breakpoints").get<picojson::array>();
   ASSERT_EQ(breakpoints.size(), 2u);
-  EXPECT_EQ(breakpoints[0].get<picojson::object>().at("line").get<double>(), 0.0);
-  EXPECT_EQ(breakpoints[1].get<picojson::object>().at("line").get<double>(), 1.0);
+  EXPECT_EQ(breakpoints[0].get<picojson::object>().at("line").get<double>(), 1.0);
+  EXPECT_EQ(breakpoints[1].get<picojson::object>().at("line").get<double>(), 2.0);
 
   client.Send(R"({
     "seq": 9,
@@ -1657,7 +1702,9 @@ TEST_F(DapSessionTest, LoadedSourcesReturnsDwarfFileAfterImport)
   ASSERT_EQ(sources.size(), 1u);
   const auto& source = sources[0].get<picojson::object>();
   EXPECT_EQ(source.at("path").to_str(), DwarfTestFixture::kCompileUnitName);
-  EXPECT_EQ(source.at("sourceReference").get<double>(), 1.0);
+  EXPECT_EQ(source.count("sourceReference"), 0u);
+  EXPECT_EQ(source.at("adapterData").get<picojson::object>().at("dolphinSourceId").get<double>(),
+            1.0);
 
   client.Send(R"({
     "seq": 9,
@@ -1706,7 +1753,7 @@ TEST_F(DapSessionTest, BreakpointLocationsWithDwarfSourceReference)
   (void)client.Receive();
 }
 
-TEST_F(DapSessionTest, SetBreakpointsWithDwarfSourceReference)
+TEST_F(DapSessionTest, SetBreakpointsWithDwarfAdapterData)
 {
   {
     Core::CPUThreadGuard guard(Core::System::GetInstance());
@@ -1723,7 +1770,7 @@ TEST_F(DapSessionTest, SetBreakpointsWithDwarfSourceReference)
     "type": "request",
     "command": "setBreakpoints",
     "arguments": {
-      "source": {"sourceReference": 1},
+      "source": {"path": "/workspace/test.c", "adapterData": {"dolphinSourceId": 1}},
       "breakpoints": [{"line": 2}]
     }
   })");
@@ -1775,6 +1822,13 @@ TEST_F(DapSessionTest, StackTraceWithDwarfSourceLine)
   EXPECT_EQ(frame.at("line").get<double>(), 2.0);
   EXPECT_EQ(frame.at("source").get<picojson::object>().at("path").to_str(),
             DwarfTestFixture::kCompileUnitName);
+  EXPECT_EQ(frame.at("source")
+                .get<picojson::object>()
+                .at("adapterData")
+                .get<picojson::object>()
+                .at("dolphinSourceId")
+                .get<double>(),
+            1.0);
 
   client.Send(R"({
     "seq": 9,

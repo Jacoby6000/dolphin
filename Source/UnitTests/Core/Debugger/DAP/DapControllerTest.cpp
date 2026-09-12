@@ -18,6 +18,8 @@
 
 #include "../DWARF/DwarfTestFixture.h"
 #include "Common/CommonTypes.h"
+#include "Common/FileUtil.h"
+#include "Common/ScopeGuard.h"
 #include "Common/SymbolDB.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
@@ -592,10 +594,47 @@ TEST_F(DapControllerTest, ResolveSourceLineBreakpointUsesDwarfLineTable)
   EXPECT_EQ(*address, DwarfTestFixture::kLineTwoAddress);
 }
 
+TEST_F(DapControllerTest, ResolveSourceLineBreakpointDoesNotTreatDwarfFileHandleAsAddress)
+{
+  DAP::DapDebugController controller(System());
+  {
+    Core::CPUThreadGuard guard(System());
+    ASSERT_TRUE(Core::Debug::ImportDwarf(guard, System().GetPowerPC().GetSymbolDB(),
+                                         DwarfTestFixture::kDebugSection,
+                                         DwarfTestFixture::kLineSection));
+    System().GetPowerPC().GetSymbolDB().AddSourceFile("missing.c");
+  }
+
+  const DAP::SourceBreakpointContext context{.source_reference = 2};
+  EXPECT_FALSE(controller.ResolveSourceLineBreakpoint(context, 3));
+}
+
+TEST_F(DapControllerTest, ResolveSourceLineBreakpointRejectsAmbiguousBasename)
+{
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  const u32 first = symbol_db.AddSourceFileInstance("foo.c");
+  const u32 second = symbol_db.AddSourceFileInstance("foo.c");
+  symbol_db.AddLineEntry(TEST_ADDRESS, first, 7);
+  symbol_db.AddLineEntry(TEST_ADDRESS + 0x100, second, 7);
+  DAP::DapDebugController controller(System());
+
+  const DAP::SourceBreakpointContext ambiguous{.source_path = "/workspace/src/foo.c"};
+  EXPECT_FALSE(controller.ResolveSourceLineBreakpoint(ambiguous, 7));
+
+  const DAP::SourceBreakpointContext exact{.source_id = second + 1};
+  EXPECT_EQ(controller.ResolveSourceLineBreakpoint(exact, 7), TEST_ADDRESS + 0x100);
+
+  const DAP::SourceBreakpointContext handle{.source_reference = second + 1};
+  EXPECT_EQ(controller.ResolveSourceLineBreakpoint(handle, 7), TEST_ADDRESS + 0x100);
+  const auto locations = controller.GetBreakpointLocations(second + 1, 7, 7);
+  ASSERT_EQ(locations.size(), 1U);
+  EXPECT_EQ(locations[0].line, 7);
+}
+
 TEST_F(DapControllerTest, ResolveSourceLineBreakpointFallbackRejectsOverflowingLine)
 {
   // DESNOTE(jbarber, 2026-07-22): When DWARF line lookup fails, the fallback
-  // computes `*base + line * 4`. Computing in 32-bit would silently wrap
+  // computes `*base + (line - 1) * 4`. Computing in 32-bit would silently wrap
   // for a large `line` paired with a high base, installing a breakpoint at
   // a nonsense PC. The 64-bit guard returns nullopt instead so the
   // breakpoint is reported unresolved. Bugbot #63.
@@ -603,19 +642,16 @@ TEST_F(DapControllerTest, ResolveSourceLineBreakpointFallbackRejectsOverflowingL
   // base near the top of the 32-bit space; a line that pushes base+line*4
   // past u32 max should fail to resolve.
   const DAP::SourceBreakpointContext context{.source_name = "0xFFFFFFF0"};
-  const std::optional<u32> address = controller.ResolveSourceLineBreakpoint(context, 4u);
+  const std::optional<u32> address = controller.ResolveSourceLineBreakpoint(context, 5u);
   EXPECT_FALSE(address.has_value());
 }
 
 TEST_F(DapControllerTest, ResolveSourceLineBreakpointFallbackAcceptsBoundaryLine)
 {
-  // A line whose base+line*4 exactly equals u32 max should resolve.
-  // base = 0xFFFFFFFC, line = 3 -> 0xFFFFFFFC + 12 = 0x100000008 > u32 max,
-  // so this should NOT resolve. Pick base = 0xFFFFFFF0, line = 3 ->
-  // 0xFFFFFFF0 + 12 = 0xFFFFFFFC (in range).
+  // A line whose base+(line-1)*4 exactly equals the last aligned u32 should resolve.
   DAP::DapDebugController controller(System());
   const DAP::SourceBreakpointContext context{.source_name = "0xFFFFFFF0"};
-  const std::optional<u32> address = controller.ResolveSourceLineBreakpoint(context, 3u);
+  const std::optional<u32> address = controller.ResolveSourceLineBreakpoint(context, 4u);
   ASSERT_TRUE(address.has_value());
   EXPECT_EQ(*address, 0xFFFFFFFCu);
 }
@@ -913,6 +949,23 @@ TEST_F(DapControllerTest, SourceStepIntoAdvancesUntilLineChanges)
   DAP::DapDebugController controller(System());
   controller.StepSource(false, cancelled);
   EXPECT_EQ(System().GetPPCState().pc, TEST_ADDRESS + 8);
+}
+
+TEST_F(DapControllerTest, SourceStepIntoStopsWhenDuplicateFilenameIdentityChanges)
+{
+  const std::array<u8, 8> code{{0x60, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00}};
+  System().GetMemory().CopyToEmu(TEST_ADDRESS, code.data(), code.size());
+  auto& symbols = System().GetPPCSymbolDB();
+  const u32 first = symbols.AddSourceFileInstance("step.c");
+  const u32 second = symbols.AddSourceFileInstance("step.c");
+  symbols.AddLineEntry(TEST_ADDRESS, first, 1);
+  symbols.AddLineEntry(TEST_ADDRESS + 4, second, 1);
+  System().GetPPCState().pc = TEST_ADDRESS;
+
+  std::atomic<bool> cancelled{false};
+  DAP::DapDebugController controller(System());
+  controller.StepSource(false, cancelled);
+  EXPECT_EQ(System().GetPPCState().pc, TEST_ADDRESS + 4);
 }
 
 TEST_F(DapControllerTest, SourceNextStepsOverCallAndStopsAtNextLine)
@@ -1382,9 +1435,9 @@ TEST_F(DapControllerTest, GetLoadedSourcesListsFunctionSymbols)
   DAP::DapDebugController controller(System());
   const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
   ASSERT_EQ(sources.size(), 1u);
-  EXPECT_EQ(sources[0].source_reference, static_cast<int>(TEST_ADDRESS));
+  EXPECT_EQ(sources[0].source_reference, DAP::MakeDisassemblySourceReference(TEST_ADDRESS));
   EXPECT_EQ(sources[0].name, "game.elf");
-  EXPECT_EQ(sources[0].path, "0x00003100");
+  EXPECT_TRUE(sources[0].path.empty());
 }
 
 TEST_F(DapControllerTest, GetSourceReturnsDisassembly)
@@ -1393,7 +1446,7 @@ TEST_F(DapControllerTest, GetSourceReturnsDisassembly)
   System().GetMemory().CopyToEmu(TEST_ADDRESS, nop.data(), nop.size());
 
   DAP::DapDebugController controller(System());
-  const auto source = controller.GetSource(TEST_ADDRESS, 0, 0);
+  const auto source = controller.GetSource(DAP::MakeDisassemblySourceReference(TEST_ADDRESS), 0, 0);
   ASSERT_TRUE(source.has_value());
   EXPECT_EQ(source->mime_type, "text/x-disassembly");
   EXPECT_NE(source->content.find("nop"), std::string::npos);
@@ -1402,17 +1455,18 @@ TEST_F(DapControllerTest, GetSourceReturnsDisassembly)
 TEST_F(DapControllerTest, GetSourceRejectsInvalidBase)
 {
   DAP::DapDebugController controller(System());
-  EXPECT_FALSE(controller.GetSource(INVALID_ADDRESS, 0, 0).has_value());
+  EXPECT_FALSE(
+      controller.GetSource(DAP::MakeDisassemblySourceReference(INVALID_ADDRESS), 0, 0).has_value());
 }
 
 TEST_F(DapControllerTest, GetBreakpointLocationsStopsAtInvalidMemory)
 {
   DAP::DapDebugController controller(System());
   const std::vector<DAP::BreakpointLocation> locations =
-      controller.GetBreakpointLocations(TEST_ADDRESS, 0, 3);
+      controller.GetBreakpointLocations(DAP::MakeDisassemblySourceReference(TEST_ADDRESS), 1, 4);
   ASSERT_EQ(locations.size(), 4u);
-  EXPECT_EQ(locations[0].line, 0);
-  EXPECT_EQ(locations[3].line, 3);
+  EXPECT_EQ(locations[0].line, 1);
+  EXPECT_EQ(locations[3].line, 4);
 }
 
 TEST_F(DapControllerTest, GetStackTraceIncludesSourceForKnownSymbol)
@@ -1430,7 +1484,7 @@ TEST_F(DapControllerTest, GetStackTraceIncludesSourceForKnownSymbol)
   ASSERT_EQ(trace.frames.size(), 1u);
   ASSERT_TRUE(trace.frames[0].source_base.has_value());
   EXPECT_EQ(*trace.frames[0].source_base, TEST_ADDRESS);
-  EXPECT_EQ(trace.frames[0].source_line, 2);
+  EXPECT_EQ(trace.frames[0].source_line, 3);
 }
 
 TEST_F(DapControllerTest, RestartResetsPpcState)
@@ -1468,7 +1522,7 @@ TEST_F(DapControllerTest, ClearBreakpointsRemovesCodeAndDataBreakpoints)
   // UpdateSourceBreakpoints and UpdateInstructionBreakpoints merge: both
   // contribute to the global BreakPoints store via ReapplyCodeBreakpoints.
   const DAP::SourceBreakpointContext context{.source_name = "0x00003100"};
-  controller.UpdateSourceBreakpoints("test:1", context, {{.line = 0}});
+  controller.UpdateSourceBreakpoints("test:1", context, {{.line = 1}});
   controller.UpdateInstructionBreakpoints({{.address = TEST_ADDRESS + 0x100}});
   controller.SetDataBreakpoints({{.address = TEST_ADDRESS, .read = true, .write = true}});
 
@@ -1545,7 +1599,7 @@ TEST_F(DapControllerTest, GetLoadedSourcesListsDwarfFiles)
   const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
   ASSERT_EQ(sources.size(), 1u);
   EXPECT_EQ(sources[0].path, DwarfTestFixture::kCompileUnitName);
-  EXPECT_EQ(sources[0].source_reference, 1);
+  EXPECT_EQ(sources[0].source_reference, 0);
 }
 
 TEST_F(DapControllerTest, GetLoadedSourcesStripsPathToBasename)
@@ -1560,6 +1614,129 @@ TEST_F(DapControllerTest, GetLoadedSourcesStripsPathToBasename)
   ASSERT_EQ(sources.size(), 1u);
   EXPECT_EQ(sources[0].path, "src/melee/gm/gm_1BA8.c");
   EXPECT_EQ(sources[0].name, "gm_1BA8.c");
+}
+
+TEST_F(DapControllerTest, SourcePathsResolveDwarfSourcesToFullPaths)
+{
+  const std::string temp_dir = File::CreateTempDir();
+  ASSERT_FALSE(temp_dir.empty());
+  Common::ScopeGuard cleanup{[&temp_dir] { File::DeleteDirRecursively(temp_dir); }};
+  const std::string source_root = temp_dir + "/src";
+  const std::string source_path = source_root + "/melee/gm/gm_test.c";
+  ASSERT_TRUE(File::CreateFullPath(source_path));
+  ASSERT_TRUE(File::WriteStringToFile(source_path, "test line\n"));
+
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  symbol_db.AddSourceFile("melee/gm/gm_test.c");
+  symbol_db.AddLineEntry(TEST_ADDRESS, 0, 7);
+  System().GetPPCState().pc = TEST_ADDRESS;
+  LR(System().GetPPCState()) = 0;
+
+  DAP::DapDebugController controller(System());
+  symbol_db.SetSourcePaths({source_root});
+
+  const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
+  ASSERT_EQ(sources.size(), 1u);
+  EXPECT_EQ(sources[0].path, source_path);
+  EXPECT_EQ(sources[0].source_reference, 1u);
+
+  const DAP::StackTraceResult trace = controller.GetStackTrace();
+  ASSERT_EQ(trace.frames.size(), 1u);
+  EXPECT_EQ(trace.frames[0].source_file, source_path);
+  EXPECT_TRUE(controller.GetSource(1, 1, 1).has_value());
+
+  DAP::SourceBreakpointContext breakpoint;
+  breakpoint.source_path = source_path;
+  EXPECT_EQ(controller.ResolveSourceLineBreakpoint(breakpoint, 7), TEST_ADDRESS);
+}
+
+TEST_F(DapControllerTest, SourcePathsResolveSourcesImportedLater)
+{
+  const std::string temp_dir = File::CreateTempDir();
+  ASSERT_FALSE(temp_dir.empty());
+  Common::ScopeGuard cleanup{[&temp_dir] { File::DeleteDirRecursively(temp_dir); }};
+  const std::string source_root = temp_dir + "/src";
+  const std::string source_path = source_root + "/later.c";
+  ASSERT_TRUE(File::CreateFullPath(source_path));
+  ASSERT_TRUE(File::CreateEmptyFile(source_path));
+
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  symbol_db.SetSourcePaths({source_root});
+  symbol_db.AddSourceFile("later.c");
+  symbol_db.AddLineEntry(TEST_ADDRESS, 0, 1);
+
+  DAP::DapDebugController controller(System());
+  const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
+  ASSERT_EQ(sources.size(), 1u);
+  EXPECT_EQ(sources[0].path, source_path);
+}
+
+TEST_F(DapControllerTest, SourcePathsPreferTheFirstMatchingRoot)
+{
+  const std::string temp_dir = File::CreateTempDir();
+  ASSERT_FALSE(temp_dir.empty());
+  Common::ScopeGuard cleanup{[&temp_dir] { File::DeleteDirRecursively(temp_dir); }};
+  const std::string first_root = temp_dir + "/first";
+  const std::string second_root = temp_dir + "/second";
+  ASSERT_TRUE(File::CreateFullPath(first_root + "/duplicate.c"));
+  ASSERT_TRUE(File::CreateFullPath(second_root + "/duplicate.c"));
+  ASSERT_TRUE(File::CreateEmptyFile(first_root + "/duplicate.c"));
+  ASSERT_TRUE(File::CreateEmptyFile(second_root + "/duplicate.c"));
+
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  symbol_db.AddSourceFile("duplicate.c");
+  symbol_db.AddLineEntry(TEST_ADDRESS, 0, 1);
+
+  DAP::DapDebugController controller(System());
+  symbol_db.SetSourcePaths({"", first_root, second_root});
+  const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
+  ASSERT_EQ(sources.size(), 1u);
+  EXPECT_EQ(sources[0].path, first_root + "/duplicate.c");
+  EXPECT_EQ(sources[0].source_reference, 1u);
+}
+
+TEST_F(DapControllerTest, SourcePathsLeaveAmbiguousBasenamesWithinOneRootUnresolved)
+{
+  const std::string temp_dir = File::CreateTempDir();
+  ASSERT_FALSE(temp_dir.empty());
+  Common::ScopeGuard cleanup{[&temp_dir] { File::DeleteDirRecursively(temp_dir); }};
+  const std::string source_root = temp_dir + "/src";
+  ASSERT_TRUE(File::CreateFullPath(source_root + "/first/duplicate.c"));
+  ASSERT_TRUE(File::CreateFullPath(source_root + "/second/duplicate.c"));
+  ASSERT_TRUE(File::CreateEmptyFile(source_root + "/first/duplicate.c"));
+  ASSERT_TRUE(File::CreateEmptyFile(source_root + "/second/duplicate.c"));
+
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  symbol_db.AddSourceFile("duplicate.c");
+  symbol_db.AddLineEntry(TEST_ADDRESS, 0, 1);
+
+  DAP::DapDebugController controller(System());
+  symbol_db.SetSourcePaths({source_root});
+  const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
+  ASSERT_EQ(sources.size(), 1u);
+  EXPECT_EQ(sources[0].path, "duplicate.c");
+  EXPECT_EQ(sources[0].source_reference, 0u);
+}
+
+TEST_F(DapControllerTest, SourcePathsResolveWindowsStyleDwarfPaths)
+{
+  const std::string temp_dir = File::CreateTempDir();
+  ASSERT_FALSE(temp_dir.empty());
+  Common::ScopeGuard cleanup{[&temp_dir] { File::DeleteDirRecursively(temp_dir); }};
+  const std::string source_root = temp_dir + "/src";
+  const std::string source_path = source_root + "/melee/gm/gm_test.c";
+  ASSERT_TRUE(File::CreateFullPath(source_path));
+  ASSERT_TRUE(File::CreateEmptyFile(source_path));
+
+  auto& symbol_db = System().GetPowerPC().GetSymbolDB();
+  symbol_db.AddSourceFile(R"(C:\BUILD\MELEE\GM\GM_TEST.C)");
+  symbol_db.AddLineEntry(TEST_ADDRESS, 0, 1);
+
+  DAP::DapDebugController controller(System());
+  symbol_db.SetSourcePaths({source_root});
+  const std::vector<DAP::LoadedSource> sources = controller.GetLoadedSources();
+  ASSERT_EQ(sources.size(), 1u);
+  EXPECT_EQ(sources[0].path, source_path);
 }
 
 TEST_F(DapControllerTest, GetStackTraceUsesNearestPrecedingDwarfLine)

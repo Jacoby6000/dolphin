@@ -18,6 +18,7 @@
 
 local PROJECT_FILE = ".dolphin-dap.lua"
 local DAP_PORT_CONFIG = "Dolphin.General.DAPPort=%s"
+local SOURCE_PATHS_CONFIG = "Dolphin.Debug.SourcePaths=%s"
 local DOLPHIN_FILETYPES = { "c", "cpp" }
 
 local M = {}
@@ -202,6 +203,13 @@ local function build_launch_args(project, target, port)
     "-C",
     string.format(DAP_PORT_CONFIG, port),
   }
+
+  if #project.source_paths > 0 then
+    vim.list_extend(args, {
+      "-C",
+      string.format(SOURCE_PATHS_CONFIG, table.concat(project.source_paths, ";")),
+    })
+  end
 
   if project.disc and project.disc ~= "" and project.disc ~= project.program then
     vim.list_extend(args, {

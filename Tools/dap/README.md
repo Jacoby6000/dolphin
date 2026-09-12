@@ -13,8 +13,10 @@ For the per-operation request/response reference, see
   - [Standard requests](#standard-requests)
   - [Dolphin-specific custom requests](#dolphin-specific-custom-requests)
 - [Running the server](#running-the-server)
+- [Configuring a DAP client](#configuring-a-dap-client)
 - [Handshake test (no game required for transport check)](#handshake-test-no-game-required-for-transport-check)
-- [Neovim (lazy.nvim)](#neovim-lazynvim)
+- [Visual Studio Code](#visual-studio-code)
+- [Neovim](#neovim)
 - [Tests](#tests)
 - [Known limitations](#known-limitations)
 - [Source debugging with DWARF](#source-debugging-with-dwarf)
@@ -171,6 +173,33 @@ To let the game run immediately instead of pausing when the debugger connects, a
 The DAP client can override this setting with `stopOnEntry`. DAP and GDB are mutually
 exclusive, so do not enable both at the same time.
 
+## Configuring a DAP client
+
+Configure your editor or debugger as a DAP client that connects to a server. The client
+needs:
+
+- The host and TCP port, such as `127.0.0.1:5678`, or the Unix socket path.
+- An `attach` configuration when Dolphin was started separately.
+- A `launch` configuration when the client starts Dolphin with one of the commands from
+  [Running the server](#running-the-server).
+
+Client configuration formats differ, but the connection is equivalent to:
+
+```text
+adapter: server
+host: 127.0.0.1
+port: 5678
+request: attach
+```
+
+For source debugging, configure the client to find the source files named by the ELF's
+DWARF information. Older builds may contain only a filename rather than a complete path,
+so add the project's source directories to the client's source search path.
+
+The client should send standard DAP requests. Dolphin-specific memory watches, freezes,
+scans, and code injection require client support for the custom requests documented in
+[`capabilities.md`](capabilities.md).
+
 ## Handshake test (no game required for transport check)
 
 With Dolphin running and waiting for a client, send an `initialize` request:
@@ -189,10 +218,68 @@ PY
 
 Expect a JSON `response` with `"command":"initialize"` and `"success":true`.
 
-## Neovim (lazy.nvim)
+## Visual Studio Code
 
-See [`nvim/README.md`](nvim/README.md) for `nvim-dap` + `nvim-dap-ui` setup,
-`.dolphin-dap.lua` per-project config, and keymaps.
+Package and install the bundled connector:
+
+```bash
+cd /path/to/dolphin/Tools/dap/vscode
+npx @vscode/vsce package
+code --install-extension dolphin-dap-client-0.1.1.vsix
+```
+
+Code - OSS users should replace `code` with `code-oss`. The connector only registers the
+`dolphin` debugger type and connects the editor directly to Dolphin; it does not run LLDB
+or GDB.
+
+Start the NoGUI executable in a terminal with the debug ELF and matching ISO:
+
+```bash
+/path/to/dolphin-emu-nogui \
+  -C Dolphin.General.DAPPort=5678 \
+  -C Dolphin.Core.DefaultISO=/path/to/game.iso \
+  -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
+  --exec /path/to/main.elf \
+  --platform headless
+```
+
+Open the source project in VS Code and create `.vscode/launch.json`:
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Attach to Dolphin",
+      "type": "dolphin",
+      "request": "attach",
+      "host": "127.0.0.1",
+      "port": 5678,
+      "sourcePaths": [
+        "${workspaceFolder}/src",
+        "${workspaceFolder}/extern/dolphin/src"
+      ],
+      "stopOnEntry": true
+    }
+  ]
+}
+```
+
+Open **Run and Debug**, select **Attach to Dolphin**, and start debugging.
+
+`sourcePaths` lists ordered directories the connector uses to resolve relative and basename-only
+paths recorded by the ELF's DWARF data. Omit it when DWARF paths already identify readable files.
+Ambiguous basename matches within one root remain unresolved rather than selecting an arbitrary
+source file.
+
+The ISO supplies the disc environment, while Dolphin executes the ELF so its symbols and
+DWARF addresses match the running code. Build the source files you need to inspect without
+optimization for reliable stepping and locals.
+
+## Neovim
+
+See [`nvim/README.md`](nvim/README.md) for a portable `nvim-dap` setup and optional
+project configuration.
 
 ## Tests
 
@@ -247,6 +334,24 @@ wrong memory.
 
 Sidecar debug information can also be loaded with `Dolphin.Debug.DwarfElf` or
 **Symbols → Load DWARF/Debug Info…** in the Qt interface.
+
+### Source paths
+
+The optional global `Dolphin.Debug.SourcePaths` setting lets Dolphin resolve backend-provided
+source names to full host paths before exposing them to debuggers. Separate ordered roots with
+semicolons; the first root containing a unique best suffix match wins. For example:
+
+```bash
+dolphin-emu-nogui \
+  -C 'Dolphin.Debug.SourcePaths=/workspace/src;/workspace/extern/dolphin/src' \
+  --exec /path/to/main.elf \
+  --platform headless
+```
+
+The Neovim adapter passes its configured `source_paths` through this setting when it starts
+Dolphin. For an already running Dolphin instance, set `SourcePaths` in the `[Debug]` section of
+`Dolphin.ini` before booting the title. Source roots are shared by all debugger clients connected
+to that Dolphin process.
 
 ### Debug information limits
 

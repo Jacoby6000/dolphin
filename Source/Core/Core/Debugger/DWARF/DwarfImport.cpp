@@ -25,16 +25,7 @@ bool ApplyParseResult(const CPUThreadGuard& guard, PPCSymbolDB& symbol_db,
   std::vector<u32> file_indices;
   file_indices.reserve(parsed.files.size());
   for (const std::string& file : parsed.files)
-    file_indices.push_back(symbol_db.AddSourceFile(file));
-
-  auto file_index_for = [&](const std::string& file) -> u32 {
-    for (size_t i = 0; i < parsed.files.size(); ++i)
-    {
-      if (parsed.files[i] == file)
-        return file_indices[i];
-    }
-    return symbol_db.AddSourceFile(file);
-  };
+    file_indices.push_back(symbol_db.AddSourceFileInstance(file));
 
   for (const Dwarf::Function& function : parsed.functions)
   {
@@ -46,7 +37,10 @@ bool ApplyParseResult(const CPUThreadGuard& guard, PPCSymbolDB& symbol_db,
 
   for (const Dwarf::LineEntry& line : parsed.lines)
   {
-    symbol_db.AddLineEntry(line.address, file_index_for(line.file), line.line);
+    const u32 file_index = line.file_index < file_indices.size() ?
+                               file_indices[line.file_index] :
+                               symbol_db.AddSourceFile(line.file);
+    symbol_db.AddLineEntry(line.address, file_index, line.line);
   }
 
   symbol_db.Index();

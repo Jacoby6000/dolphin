@@ -4,6 +4,7 @@
 #include "Core/Debugger/DAP/DapSession.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <limits>
 #include <memory>
@@ -96,19 +97,36 @@ SourceBreakpointContext ParseSourceBreakpointContext(const picojson::object& arg
   SourceBreakpointContext context;
   if (const picojson::object* source = GetObject(arguments, "source"))
   {
-    if (const std::optional<int> source_reference =
-            ReadNumericFromJson<int>(*source, "sourceReference"))
+    if (const std::optional<double> source_reference =
+            ReadNumericFromJson<double>(*source, "sourceReference");
+        source_reference && std::isfinite(*source_reference) && *source_reference > 0 &&
+        std::floor(*source_reference) == *source_reference &&
+        *source_reference <=
+            static_cast<double>(MakeDisassemblySourceReference(std::numeric_limits<u32>::max())))
     {
-      context.source_reference = *source_reference;
+      context.source_reference = static_cast<SourceReference>(*source_reference);
     }
     context.source_name = ReadSourceString(*source, "name");
     context.source_path = ReadSourceString(*source, "path");
+    if (const picojson::object* adapter_data = GetObject(*source, "adapterData"))
+    {
+      if (const std::optional<double> source_id =
+              ReadNumericFromJson<double>(*adapter_data, "dolphinSourceId");
+          source_id && std::isfinite(*source_id) && *source_id > 0 &&
+          std::floor(*source_id) == *source_id &&
+          *source_id <= static_cast<double>(std::numeric_limits<u32>::max()))
+      {
+        context.source_id = static_cast<u32>(*source_id);
+      }
+    }
   }
   return context;
 }
 
 std::string MakeBreakpointSourceKey(const SourceBreakpointContext& context)
 {
+  if (context.source_id)
+    return fmt::format("source:{}", *context.source_id);
   if (context.source_reference && *context.source_reference > 0)
     return fmt::format("ref:{}", *context.source_reference);
 
@@ -1712,7 +1730,7 @@ private:
       // The address doubles as the target id so `goto` can resolve it statelessly.
       target.emplace("id", static_cast<double>(*arguments.address));
       target.emplace("label", Json::FormatAddress(*arguments.address));
-      target.emplace("line", 0.0);
+      target.emplace("line", static_cast<double>(arguments.line));
       target.emplace("instructionPointerReference", Json::FormatAddress(*arguments.address));
       targets.emplace_back(std::move(target));
     }
@@ -1768,9 +1786,17 @@ private:
     for (const LoadedSource& source : m_controller.GetLoadedSources())
     {
       picojson::object entry;
-      entry.emplace("sourceReference", static_cast<double>(source.source_reference));
+      if (source.source_reference > 0)
+        entry.emplace("sourceReference", static_cast<double>(source.source_reference));
+      if (source.source_id)
+      {
+        picojson::object adapter_data;
+        adapter_data.emplace("dolphinSourceId", static_cast<double>(*source.source_id));
+        entry.emplace("adapterData", std::move(adapter_data));
+      }
       entry.emplace("name", source.name);
-      entry.emplace("path", source.path);
+      if (!source.path.empty())
+        entry.emplace("path", source.path);
       sources.emplace_back(std::move(entry));
     }
 
@@ -1783,14 +1809,14 @@ private:
   {
     const Protocol::SourceRequestArguments arguments =
         Protocol::ParseSourceRequest(request.arguments);
-    if (!arguments.base)
+    if (!arguments.source_reference)
     {
       RespondError(request.seq, "source", "invalid source arguments");
       return;
     }
 
-    const std::optional<SourceContent> content =
-        m_controller.GetSource(*arguments.base, arguments.start_line, arguments.end_line);
+    const std::optional<SourceContent> content = m_controller.GetSource(
+        *arguments.source_reference, arguments.start_line, arguments.end_line);
     if (!content)
     {
       RespondError(request.seq, "source", "source unavailable");
@@ -1807,7 +1833,7 @@ private:
   {
     const Protocol::BreakpointLocationsArguments arguments =
         Protocol::ParseBreakpointLocations(request.arguments);
-    if (!arguments.base)
+    if (!arguments.source_reference)
     {
       RespondError(request.seq, "breakpointLocations", "invalid breakpointLocations arguments");
       return;
@@ -1815,7 +1841,7 @@ private:
 
     picojson::array breakpoints;
     for (const BreakpointLocation& location : m_controller.GetBreakpointLocations(
-             *arguments.base, arguments.start_line, arguments.end_line))
+             *arguments.source_reference, arguments.start_line, arguments.end_line))
     {
       picojson::object entry;
       entry.emplace("line", static_cast<double>(location.line));
@@ -2023,6 +2049,12 @@ private:
         const std::string name =
             slash != std::string::npos ? frame.source_file->substr(slash + 1) : *frame.source_file;
         source.emplace("name", name);
+        if (frame.source_id)
+        {
+          picojson::object adapter_data;
+          adapter_data.emplace("dolphinSourceId", static_cast<double>(*frame.source_id));
+          source.emplace("adapterData", std::move(adapter_data));
+        }
         entry.emplace("source", std::move(source));
         entry.emplace("line", static_cast<double>(frame.source_line));
       }
@@ -2030,15 +2062,16 @@ private:
       {
         picojson::object source;
         source.emplace("name", Json::FormatAddress(*frame.source_base));
-        source.emplace("path", Json::FormatAddress(*frame.source_base));
+        source.emplace("sourceReference",
+                       static_cast<double>(MakeDisassemblySourceReference(*frame.source_base)));
         entry.emplace("source", std::move(source));
         entry.emplace("line", static_cast<double>(frame.source_line));
       }
       else
       {
-        entry.emplace("line", 0.0);
+        entry.emplace("line", static_cast<double>(frame.source_line));
       }
-      entry.emplace("column", 0.0);
+      entry.emplace("column", 1.0);
       stack_frames.emplace_back(std::move(entry));
     }
 
