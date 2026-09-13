@@ -123,6 +123,7 @@ Use this mode for source-level debugging of a decomp build:
 ```bash
 dolphin-emu-nogui \
   -C Dolphin.General.DAPPort=5678 \
+  -C 'Dolphin.Debug.SourcePaths=/path/to/project/src;/path/to/project/extern/dolphin/src' \
   -C Dolphin.Core.DefaultISO=/path/to/game.iso \
   -C Dolphin.Core.BootExecutableWithDefaultDisc=true \
   --exec /path/to/main.elf \
@@ -137,6 +138,11 @@ Both files have a separate purpose:
 
 Because Dolphin executes the ELF, its addresses match its debug information. For a
 disc-based game, always provide both the ISO and ELF as shown above.
+
+`Dolphin.Debug.SourcePaths` contains semicolon-separated source roots used to resolve
+relative or basename-only paths in the ELF's DWARF data. Roots are checked in order;
+the first root with a unique best suffix match wins. Set it before booting the ELF.
+To persist it, set `SourcePaths` in the `[Debug]` section of `Dolphin.ini`.
 
 Source stepping and locals do not work reliably inside optimized source files
 (translation units).
@@ -191,10 +197,6 @@ host: 127.0.0.1
 port: 5678
 request: attach
 ```
-
-For source debugging, configure the client to find the source files named by the ELF's
-DWARF information. Older builds may contain only a filename rather than a complete path,
-so add the project's source directories to the client's source search path.
 
 The client should send standard DAP requests. Dolphin-specific memory watches, freezes,
 scans, and code injection require client support for the custom requests documented in
@@ -334,24 +336,6 @@ wrong memory.
 
 Sidecar debug information can also be loaded with `Dolphin.Debug.DwarfElf` or
 **Symbols → Load DWARF/Debug Info…** in the Qt interface.
-
-### Source paths
-
-The optional global `Dolphin.Debug.SourcePaths` setting lets Dolphin resolve backend-provided
-source names to full host paths before exposing them to debuggers. Separate ordered roots with
-semicolons; the first root containing a unique best suffix match wins. For example:
-
-```bash
-dolphin-emu-nogui \
-  -C 'Dolphin.Debug.SourcePaths=/workspace/src;/workspace/extern/dolphin/src' \
-  --exec /path/to/main.elf \
-  --platform headless
-```
-
-The Neovim adapter passes its configured `source_paths` through this setting when it starts
-Dolphin. For an already running Dolphin instance, set `SourcePaths` in the `[Debug]` section of
-`Dolphin.ini` before booting the title. Source roots are shared by all debugger clients connected
-to that Dolphin process.
 
 ### Debug information limits
 
